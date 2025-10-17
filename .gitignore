@@ -33,7 +33,7 @@ checkpoints/
 *.pt
 *.pth
 *.ckpt
-
+*.pdf
 # Datasets and large data directories
 Dataset/
 data/
