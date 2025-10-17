@@ -1,0 +1,68 @@
+# Python cache and artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter and notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Virtual environments
+.env
+.venv
+venv/
+env/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+
+# Logs
+logs/
+*.log
+
+# Checkpoints and models
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Datasets and large data directories
+Dataset/
+data/
+datasets/
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.npz
+*.npy
+
+# Results/outputs
+outputs/
+results/
+artifacts/
+
+# Local configs and secrets
+.env.local
+.env.*.local
+secrets.*
+*.secret
+*.key
+*.pem
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
