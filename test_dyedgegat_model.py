@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dyedgegat', 'src'))
 from src.data.dataloader import create_dataloaders
 from src.model.dyedgegat import DyEdgeGAT
 from src.config import cfg
+from src.data.column_config import MEASUREMENT_VARS, CONTROL_VARS
 
 
 def test_model():
@@ -30,9 +31,9 @@ def test_model():
     # ========== Step 1: Configuration ==========
     print("\n[1/6] Setting up configuration...")
     cfg.set_dataset_params(
-        n_nodes=28,      # 28 measurement sensors (2 flow sensors removed)
-        window_size=15,  # 15 timestep window
-        ocvar_dim=6      # 6 operating condition variables
+        n_nodes=len(MEASUREMENT_VARS),   # Full measurement set from column_config
+        window_size=15,                  # 15 timestep window
+        ocvar_dim=len(CONTROL_VARS)      # 6 operating condition set-points
     )
     cfg.validate()
     print(f"✅ Config: {cfg.dataset.n_nodes} nodes, window={cfg.dataset.window_size}, "
@@ -86,7 +87,7 @@ def test_model():
         decoder_norm_type='layer',
         recon_hidden_dim=16,
         num_recon_layers=1,
-        edge_aggr='dot',
+        edge_aggr='temp',
         act='relu',
         aug_control=True,
         flip_output=True,
@@ -225,4 +226,3 @@ if __name__ == "__main__":
         traceback.print_exc()
         print("=" * 80)
         sys.exit(1)
-

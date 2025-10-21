@@ -36,7 +36,7 @@ def main():
         feat_target_node=1,          # Reconstructing 1 variable per sensor
         feat_input_edge=1,           # Edge features are scalar attention values
         node_encoder_type='gru',
-        node_encoder_mode='univariate',  # Separate GRU per sensor
+        node_encoder_mode='univariate',  # Shared univariate GRU across sensors
         contr_encoder_type='gru',
         infer_temporal_edge=True,
         temp_edge_hid_dim=100,
@@ -62,7 +62,7 @@ def main():
         decoder_norm_type='layer',   # Changed to match paper
         recon_hidden_dim=16,
         num_recon_layers=1,
-        edge_aggr='dot',
+        edge_aggr='temp',
         act='relu',
         aug_control=True,
         flip_output=True,            # Default is now True (paper semantics)
@@ -128,7 +128,7 @@ def main():
         x_true=batch.x.unsqueeze(-1),  # [B*N, W, 1]
         x_recon=recon,
         edge_index=edge_index,
-        edge_weight=edge_weight.view(-1)
+        edge_weight=edge_weight
     )
     print(f"\nTopology-aware anomaly score (entire batch): {anomaly_score.item():.6f}")
     
@@ -137,7 +137,7 @@ def main():
         x_true=batch.x.unsqueeze(-1),
         x_recon=recon,
         edge_index=edge_index,
-        edge_weight=edge_weight.view(-1)
+        edge_weight=edge_weight
     )
     print(f"\nPer-sample anomaly scores:")
     for i, score in enumerate(sample_scores):
@@ -160,4 +160,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

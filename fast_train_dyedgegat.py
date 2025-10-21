@@ -14,7 +14,7 @@ import argparse
 import os
 import sys
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch_geometric.loader import DataLoader
@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dyedgegat"))
 
 from src.config import cfg
 from src.data.dataset import RefrigerationDataset
-from src.data.column_config import MEASUREMENT_VARS
+from src.data.column_config import MEASUREMENT_VARS, CONTROL_VARS
 from src.model.dyedgegat import DyEdgeGAT
 
 
@@ -95,7 +95,7 @@ def init_model(device: torch.device) -> DyEdgeGAT:
     cfg.set_dataset_params(
         n_nodes=len(MEASUREMENT_VARS),
         window_size=15,
-        ocvar_dim=6,
+        ocvar_dim=len(CONTROL_VARS),
     )
     cfg.device = str(device)
     cfg.validate()
@@ -131,7 +131,7 @@ def init_model(device: torch.device) -> DyEdgeGAT:
         decoder_norm_type="layer",
         recon_hidden_dim=16,
         num_recon_layers=1,
-        edge_aggr="dot",
+        edge_aggr="temp",
         act="relu",
         aug_control=True,
         flip_output=True,
@@ -201,18 +201,29 @@ def train_epoch(model, loader, optimizer, criterion, device) -> float:
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device) -> float:
+def evaluate(model, loader, criterion, device) -> Tuple[float, float]:
     model.eval()
     total_loss = 0.0
+    total_score = 0.0
     total_samples = 0
 
     for batch in loader:
-        loss = compute_recon_loss(model, batch, criterion, device)
+        batch = batch.to(device)
+        recon, edge_index, edge_attr = model(batch, return_graph=True)
+        target = batch.x.unsqueeze(-1)
+
+        loss = criterion(recon, target)
+        score = model.compute_topology_aware_anomaly_score(
+            target, recon, edge_index, edge_attr
+        )
+
         batch_size = batch.num_graphs
         total_loss += loss.item() * batch_size
+        total_score += score.item() * batch_size
         total_samples += batch_size
 
-    return total_loss / max(total_samples, 1)
+    denom = max(total_samples, 1)
+    return total_loss / denom, total_score / denom
 
 
 def main() -> None:
@@ -240,10 +251,13 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         start = time.time()
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss = evaluate(model, val_loader, criterion, device)
+        val_loss, val_score = evaluate(model, val_loader, criterion, device)
         elapsed = time.time() - start
 
-        print(f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} val_loss={val_loss:.6f} time={elapsed:.1f}s")
+        print(
+            f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} "
+            f"val_loss={val_loss:.6f} val_anom={val_score:.6f} time={elapsed:.1f}s"
+        )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -255,8 +269,11 @@ def main() -> None:
     else:
         print("\nWarning: No improvement over initial epoch.")
 
-    test_loss = evaluate(model, test_loader, criterion, device)
-    print(f"\nTest reconstruction loss on {args.test_file}: {test_loss:.6f}")
+    test_loss, test_score = evaluate(model, test_loader, criterion, device)
+    print(
+        f"\nTest results on {args.test_file}: "
+        f"recon_loss={test_loss:.6f} anomaly_score={test_score:.6f}"
+    )
     print("\nDone.")
 
 

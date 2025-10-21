@@ -9,7 +9,7 @@ import argparse
 import os
 import sys
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dyedgegat"))
 
 from src.config import cfg
 from src.data.dataloader import create_dataloaders
-from src.data.column_config import MEASUREMENT_VARS
+from src.data.column_config import MEASUREMENT_VARS, CONTROL_VARS
 from src.model.dyedgegat import DyEdgeGAT
 
 
@@ -78,7 +78,7 @@ def init_model(device: torch.device) -> DyEdgeGAT:
     cfg.set_dataset_params(
         n_nodes=len(MEASUREMENT_VARS),
         window_size=15,
-        ocvar_dim=6,
+        ocvar_dim=len(CONTROL_VARS),
     )
     cfg.device = str(device)
     cfg.validate()
@@ -114,7 +114,7 @@ def init_model(device: torch.device) -> DyEdgeGAT:
         decoder_norm_type="layer",
         recon_hidden_dim=16,
         num_recon_layers=1,
-        edge_aggr="dot",
+        edge_aggr="temp",
         act="relu",
         aug_control=True,
         flip_output=True,
@@ -155,26 +155,48 @@ def train_epoch(
 
 
 @torch.no_grad()
-def evaluate(model: DyEdgeGAT, loader: torch.utils.data.DataLoader, criterion: torch.nn.Module, device: torch.device) -> float:
+def evaluate(
+    model: DyEdgeGAT,
+    loader: torch.utils.data.DataLoader,
+    criterion: torch.nn.Module,
+    device: torch.device,
+) -> Tuple[float, float]:
     model.eval()
     running_loss = 0.0
+    running_score = 0.0
     sample_count = 0
 
     for batch in loader:
-        loss = compute_recon_loss(model, batch, criterion, device)
+        batch = batch.to(device)
+        recon, edge_index, edge_attr = model(batch, return_graph=True)
+        target = batch.x.unsqueeze(-1)
+
+        loss = criterion(recon, target)
+        score = model.compute_topology_aware_anomaly_score(
+            target, recon, edge_index, edge_attr
+        )
+
         batch_size = batch.num_graphs
         running_loss += loss.item() * batch_size
+        running_score += score.item() * batch_size
         sample_count += batch_size
 
-    return running_loss / max(sample_count, 1)
+    denom = max(sample_count, 1)
+    return running_loss / denom, running_score / denom
 
 
 @torch.no_grad()
-def evaluate_tests(model: DyEdgeGAT, loaders: Dict[str, torch.utils.data.DataLoader], criterion: torch.nn.Module, device: torch.device) -> Dict[str, float]:
-    scores = {}
+def evaluate_tests(
+    model: DyEdgeGAT,
+    loaders: Dict[str, torch.utils.data.DataLoader],
+    criterion: torch.nn.Module,
+    device: torch.device,
+) -> Dict[str, Dict[str, float]]:
+    metrics: Dict[str, Dict[str, float]] = {}
     for name, loader in loaders.items():
-        scores[name] = evaluate(model, loader, criterion, device)
-    return scores
+        loss, score = evaluate(model, loader, criterion, device)
+        metrics[name] = {"recon_loss": loss, "anomaly_score": score}
+    return metrics
 
 
 def main() -> None:
@@ -204,11 +226,14 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         start_time = time.time()
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss = evaluate(model, val_loader, criterion, device)
+        val_loss, val_score = evaluate(model, val_loader, criterion, device)
         elapsed = time.time() - start_time
 
         history.append((epoch, train_loss, val_loss))
-        print(f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} val_loss={val_loss:.6f} time={elapsed:.1f}s")
+        print(
+            f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} "
+            f"val_loss={val_loss:.6f} val_anom={val_score:.6f} time={elapsed:.1f}s"
+        )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -222,8 +247,11 @@ def main() -> None:
 
     print("\nEvaluating on test datasets...")
     test_scores = evaluate_tests(model, test_loaders, criterion, device)
-    for name, loss in test_scores.items():
-        print(f"  {name:30s}: recon_loss={loss:.6f}")
+    for name, metrics in test_scores.items():
+        print(
+            f"  {name:30s}: recon_loss={metrics['recon_loss']:.6f} "
+            f"anomaly_score={metrics['anomaly_score']:.6f}"
+        )
 
     if args.save_model:
         torch.save(best_state if best_state is not None else model.state_dict(), args.save_model)
