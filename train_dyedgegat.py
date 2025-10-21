@@ -9,9 +9,11 @@ import argparse
 import os
 import sys
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
+from torch_geometric.data import Batch
+from torch_geometric.nn import DataParallel as GeoDataParallel
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dyedgegat"))
 
@@ -43,15 +45,62 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="CUDA device index (e.g., 0, 1, 2). Requires --device cuda/auto with CUDA available.",
     )
+    parser.add_argument(
+        "--cuda-devices",
+        type=str,
+        default=None,
+        help="Comma separated CUDA device indices for multi-GPU training (e.g., '0,1').",
+    )
     parser.add_argument("--save-model", type=str, default=None, help="Optional path to save best model state_dict")
     return parser.parse_args()
 
 
-def resolve_device(device_flag: str, cuda_index: Optional[int]) -> torch.device:
+def parse_cuda_devices(cuda_devices: Optional[str]) -> Optional[List[int]]:
+    if not cuda_devices:
+        return None
+
+    parsed: List[int] = []
+    for token in cuda_devices.split(","):
+        stripped = token.strip()
+        if not stripped:
+            continue
+        if not stripped.lstrip("-").isdigit():
+            raise ValueError(f"Invalid CUDA device index '{token}'. Use comma-separated integers like '0,1'.")
+        parsed.append(int(stripped))
+
+    if not parsed:
+        raise ValueError("No valid CUDA device indices were parsed from --cuda-devices.")
+    return parsed
+
+
+def resolve_devices(
+    device_flag: str,
+    cuda_index: Optional[int],
+    cuda_devices: Optional[str],
+) -> Tuple[torch.device, Optional[List[int]]]:
+    multi_device_ids = parse_cuda_devices(cuda_devices)
+
+    if multi_device_ids is not None and cuda_index is not None:
+        raise ValueError("Use either --cuda-device or --cuda-devices, not both.")
+
+    if multi_device_ids is not None:
+        if device_flag == "cpu":
+            raise ValueError("--cuda-devices requires --device auto or cuda.")
+        if not torch.cuda.is_available():
+            raise RuntimeError("--cuda-devices specified but CUDA is not available.")
+
+        visible = torch.cuda.device_count()
+        for idx in multi_device_ids:
+            if idx < 0 or idx >= visible:
+                raise ValueError(f"Requested CUDA device {idx}, but only {visible} devices are visible.")
+
+        torch.cuda.set_device(multi_device_ids[0])
+        return torch.device(f"cuda:{multi_device_ids[0]}"), multi_device_ids
+
     if device_flag == "cpu":
         if cuda_index is not None:
             raise ValueError("A CUDA device index was provided but device='cpu'.")
-        return torch.device("cpu")
+        return torch.device("cpu"), None
     if device_flag == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but not available.")
@@ -59,19 +108,23 @@ def resolve_device(device_flag: str, cuda_index: Optional[int]) -> torch.device:
             if cuda_index < 0 or cuda_index >= torch.cuda.device_count():
                 raise ValueError(f"Requested CUDA device {cuda_index}, but only {torch.cuda.device_count()} devices are visible.")
             torch.cuda.set_device(cuda_index)
-            return torch.device(f"cuda:{cuda_index}")
-        return torch.device("cuda")
+            return torch.device(f"cuda:{cuda_index}"), None
+        return torch.device("cuda"), None
     # auto
     if torch.cuda.is_available():
         if cuda_index is not None:
             if cuda_index < 0 or cuda_index >= torch.cuda.device_count():
                 raise ValueError(f"Requested CUDA device {cuda_index}, but only {torch.cuda.device_count()} devices are visible.")
             torch.cuda.set_device(cuda_index)
-            return torch.device(f"cuda:{cuda_index}")
-        return torch.device("cuda")
+            return torch.device(f"cuda:{cuda_index}"), None
+        return torch.device("cuda"), None
     if cuda_index is not None:
         raise ValueError("CUDA device index specified but CUDA is not available.")
-    return torch.device("cpu")
+    return torch.device("cpu"), None
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return getattr(model, "module", model)
 
 
 def init_model(device: torch.device) -> DyEdgeGAT:
@@ -122,12 +175,40 @@ def init_model(device: torch.device) -> DyEdgeGAT:
     return model.to(device)
 
 
-def compute_recon_loss(model: DyEdgeGAT, batch: torch.Tensor, criterion: torch.nn.Module, device: torch.device) -> torch.Tensor:
-    batch = batch.to(device)
-    recon = model(batch)
-    target = batch.x.unsqueeze(-1)
+def forward_model(
+    model: torch.nn.Module,
+    batch,
+    device: torch.device,
+    *,
+    return_graph: bool = False,
+):
+    if hasattr(model, "module"):
+        if isinstance(batch, (list, tuple)):
+            data_list = list(batch)
+        else:
+            data_list = [batch]
+        batch_obj = Batch.from_data_list(data_list).to(device)
+        if return_graph:
+            outputs = model.module(batch_obj, return_graph=True)
+        else:
+            outputs = model(data_list)
+        return outputs, batch_obj
+
+    batch_obj = batch.to(device)
+    outputs = model(batch_obj, return_graph=return_graph)
+    return outputs, batch_obj
+
+
+def compute_recon_loss(
+    model: torch.nn.Module,
+    batch,
+    criterion: torch.nn.Module,
+    device: torch.device,
+) -> Tuple[torch.Tensor, Batch]:
+    recon, batch_obj = forward_model(model, batch, device, return_graph=False)
+    target = batch_obj.x.unsqueeze(-1)
     loss = criterion(recon, target)
-    return loss
+    return loss, batch_obj
 
 
 def train_epoch(
@@ -141,13 +222,13 @@ def train_epoch(
     running_loss = 0.0
     sample_count = 0
 
-    for batch in loader:
+    for raw_batch in loader:
         optimizer.zero_grad(set_to_none=True)
-        loss = compute_recon_loss(model, batch, criterion, device)
+        loss, batch_obj = compute_recon_loss(model, raw_batch, criterion, device)
         loss.backward()
         optimizer.step()
 
-        batch_size = batch.num_graphs
+        batch_size = batch_obj.num_graphs
         running_loss += loss.item() * batch_size
         sample_count += batch_size
 
@@ -162,21 +243,23 @@ def evaluate(
     device: torch.device,
 ) -> Tuple[float, float]:
     model.eval()
+    base_model = unwrap_model(model)
     running_loss = 0.0
     running_score = 0.0
     sample_count = 0
 
-    for batch in loader:
-        batch = batch.to(device)
-        recon, edge_index, edge_attr = model(batch, return_graph=True)
-        target = batch.x.unsqueeze(-1)
+    for raw_batch in loader:
+        (recon, edge_index, edge_attr), batch_obj = forward_model(
+            model, raw_batch, device, return_graph=True
+        )
+        target = batch_obj.x.unsqueeze(-1)
 
         loss = criterion(recon, target)
-        score = model.compute_topology_aware_anomaly_score(
+        score = base_model.compute_topology_aware_anomaly_score(
             target, recon, edge_index, edge_attr
         )
 
-        batch_size = batch.num_graphs
+        batch_size = batch_obj.num_graphs
         running_loss += loss.item() * batch_size
         running_score += score.item() * batch_size
         sample_count += batch_size
@@ -201,12 +284,18 @@ def evaluate_tests(
 
 def main() -> None:
     args = parse_args()
-    device = resolve_device(args.device, args.cuda_device)
+    device, device_ids = resolve_devices(args.device, args.cuda_device, args.cuda_devices)
     print("=" * 80)
     print(f"Training DyEdgeGAT on device: {device}")
+    use_data_list_loader = bool(device_ids and len(device_ids) > 1)
+    if use_data_list_loader:
+        print(f"Using multiple CUDA devices: {device_ids}")
     print("=" * 80)
 
     model = init_model(device)
+    if use_data_list_loader:
+        model = GeoDataParallel(model, device_ids=device_ids)
+    base_model = unwrap_model(model)
     criterion = torch.nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
@@ -217,6 +306,7 @@ def main() -> None:
         val_stride=args.val_stride,
         data_dir=args.data_dir,
         num_workers=0,
+        use_data_list_loader=use_data_list_loader,
     )
 
     best_val_loss = float("inf")
@@ -237,10 +327,10 @@ def main() -> None:
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_state = {k: v.cpu().clone() for k, v in base_model.state_dict().items()}
 
     if best_state is not None:
-        model.load_state_dict(best_state)
+        base_model.load_state_dict(best_state)
         print(f"\nBest validation loss: {best_val_loss:.6f}")
     else:
         print("\nWarning: No improvement over initial epoch.")
@@ -254,7 +344,8 @@ def main() -> None:
         )
 
     if args.save_model:
-        torch.save(best_state if best_state is not None else model.state_dict(), args.save_model)
+        state_to_save = best_state if best_state is not None else base_model.state_dict()
+        torch.save(state_to_save, args.save_model)
         print(f"\nSaved model checkpoint to: {args.save_model}")
 
     print("\nTraining complete.")

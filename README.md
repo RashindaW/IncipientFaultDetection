@@ -41,3 +41,10 @@ When constructing the full feature tensor for the model:
 3. Remember to drop or fill `Unnamed: 161` because it is often constant/NaN.
 
 This mapping should make it easier to move from the reduced test subset to the full CO₂ dataset without renaming columns later.
+
+## Multi-GPU Training
+- Use `--cuda-devices` with either training script to pick one or more CUDA GPUs for PyTorch Geometric `DataParallel` (comma-separated ids, e.g. `--cuda-devices 0,1`).
+- The first id in the list becomes the primary device; additional ids enable multi-GPU training automatically.
+- `--cuda-device` remains available for selecting a single GPU, and `--device cpu` forces CPU execution.
+- When multiple ids are provided the dataloaders automatically switch to `DataListLoader`, so no manual dataset tweaks are needed.
+- Example: `python train_dyedgegat.py --epochs 20 --batch-size 128 --cuda-devices 0,1,2` trains across three GPUs.
