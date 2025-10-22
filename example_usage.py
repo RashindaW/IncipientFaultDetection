@@ -19,7 +19,7 @@ def main():
     cfg.set_dataset_params(
         n_nodes=17,        # Number of sensor nodes
         window_size=15,    # Sliding window size
-        ocvar_dim=4        # Operating condition variables (control inputs)
+        ocvar_dim=6        # Operating condition variables (control inputs)
     )
     cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     

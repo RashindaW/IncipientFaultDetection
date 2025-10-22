@@ -17,9 +17,12 @@ import time
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
+from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as TorchDDP
+from torch.utils.data.distributed import DistributedSampler
 from torch_geometric.data import Batch
-from torch_geometric.loader import DataLoader, DataListLoader
-from torch_geometric.nn import DataParallel as GeoDataParallel
+from torch_geometric.loader import DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dyedgegat"))
 
@@ -66,6 +69,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Comma separated CUDA device indices for multi-GPU training (e.g., '0,1').",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=2,
+        help="Number of DataLoader worker processes per rank.",
+    )
+    parser.add_argument(
+        "--use-amp",
+        action="store_true",
+        help="Enable torch.cuda.amp automatic mixed precision.",
+    )
+    parser.add_argument(
+        "--dist-backend",
+        type=str,
+        default="nccl",
+        choices=["nccl", "gloo", "mpi"],
+        help="Distributed backend when launched with torchrun.",
+    )
     return parser.parse_args()
 
 
@@ -87,6 +108,31 @@ def parse_cuda_devices(cuda_devices: Optional[str]) -> Optional[List[int]]:
     return parsed
 
 
+def init_distributed_mode(backend: str) -> Tuple[bool, int, int, int]:
+    if not dist.is_available():
+        return False, 0, 1, 0
+
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        return False, 0, 1, 0
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed mode requires CUDA to be available.")
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend=backend)
+
+    return True, rank, world_size, local_rank
+
+
+def cleanup_distributed(distributed: bool) -> None:
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
 def resolve_devices(
     device_flag: str,
     cuda_index: Optional[int],
@@ -94,22 +140,15 @@ def resolve_devices(
 ) -> Tuple[torch.device, Optional[List[int]]]:
     multi_device_ids = parse_cuda_devices(cuda_devices)
 
-    if multi_device_ids is not None and cuda_index is not None:
-        raise ValueError("Use either --cuda-device or --cuda-devices, not both.")
-
     if multi_device_ids is not None:
-        if device_flag == "cpu":
-            raise ValueError("--cuda-devices requires --device auto or cuda.")
-        if not torch.cuda.is_available():
-            raise RuntimeError("--cuda-devices specified but CUDA is not available.")
-
-        visible = torch.cuda.device_count()
-        for idx in multi_device_ids:
-            if idx < 0 or idx >= visible:
-                raise ValueError(f"Requested CUDA device {idx}, but only {visible} devices are visible.")
-
-        torch.cuda.set_device(multi_device_ids[0])
-        return torch.device(f"cuda:{multi_device_ids[0]}"), multi_device_ids
+        if cuda_index is not None:
+            raise ValueError("Use either --cuda-device or --cuda-devices, not both.")
+        if len(multi_device_ids) > 1:
+            raise ValueError(
+                "Multi-GPU with --cuda-devices is no longer supported. Launch with torchrun for distributed training."
+            )
+        cuda_index = multi_device_ids[0]
+        multi_device_ids = None
 
     if device_flag == "cpu":
         if cuda_index is not None:
@@ -189,13 +228,20 @@ def init_model(device: torch.device) -> DyEdgeGAT:
         aug_control=True,
         flip_output=True,
     )
+    for module in model.modules():
+        if isinstance(module, torch.nn.GRU):
+            module.flatten_parameters = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+
     return model.to(device)
 
 
 def build_dataloaders(
     args: argparse.Namespace,
     *,
-    use_data_list_loader: bool = False,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    num_workers: int = 0,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     train_dataset = RefrigerationDataset(
         data_files=args.train_files,
@@ -224,12 +270,39 @@ def build_dataloaders(
         normalization_stats=norm_stats,
     )
 
-    loader_cls = DataListLoader if use_data_list_loader else DataLoader
-    pin_memory = torch.cuda.is_available() and not use_data_list_loader
+    if distributed:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+        test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+    else:
+        train_sampler = val_sampler = test_sampler = None
 
-    train_loader = loader_cls(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=pin_memory)
-    val_loader = loader_cls(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=pin_memory)
-    test_loader = loader_cls(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=pin_memory)
+    pin_memory = torch.cuda.is_available()
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=test_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
     return train_loader, val_loader, test_loader
 
 
@@ -240,16 +313,9 @@ def forward_model(
     *,
     return_graph: bool = False,
 ):
-    if hasattr(model, "module"):
-        if isinstance(batch, (list, tuple)):
-            data_list = list(batch)
-        else:
-            data_list = [batch]
-        batch_obj = Batch.from_data_list(data_list).to(device)
-        if return_graph:
-            outputs = model.module(batch_obj, return_graph=True)
-        else:
-            outputs = model(data_list)
+    if isinstance(model, TorchDDP):
+        batch_obj = batch.to(device)
+        outputs = model(batch_obj, return_graph=return_graph)
         return outputs, batch_obj
 
     batch_obj = batch.to(device)
@@ -264,26 +330,56 @@ def compute_recon_loss(model: torch.nn.Module, batch, criterion, device) -> Tupl
     return loss, batch_obj
 
 
-def train_epoch(model, loader, optimizer, criterion, device) -> float:
+def train_epoch(
+    model,
+    loader,
+    optimizer,
+    criterion,
+    device,
+    *,
+    distributed: bool = False,
+    scaler: Optional[GradScaler] = None,
+    amp_enabled: bool = False,
+) -> float:
     model.train()
     total_loss = 0.0
     total_samples = 0
 
     for raw_batch in loader:
         optimizer.zero_grad(set_to_none=True)
-        loss, batch_obj = compute_recon_loss(model, raw_batch, criterion, device)
-        loss.backward()
-        optimizer.step()
+        with autocast("cuda", enabled=amp_enabled):
+            loss, batch_obj = compute_recon_loss(model, raw_batch, criterion, device)
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         batch_size = batch_obj.num_graphs
-        total_loss += loss.item() * batch_size
+        total_loss += loss.detach().item() * batch_size
         total_samples += batch_size
 
-    return total_loss / max(total_samples, 1)
+    totals = torch.tensor([total_loss, total_samples], device=device, dtype=torch.float64)
+    if distributed:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+
+    loss_sum, sample_sum = totals.tolist()
+    return float(loss_sum / max(sample_sum, 1.0))
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, loader, criterion, device) -> Tuple[float, float]:
+def evaluate(
+    model: torch.nn.Module,
+    loader,
+    criterion,
+    device,
+    *,
+    distributed: bool = False,
+    amp_enabled: bool = False,
+) -> Tuple[float, float]:
     model.eval()
     base_model = unwrap_model(model)
     total_loss = 0.0
@@ -291,83 +387,143 @@ def evaluate(model: torch.nn.Module, loader, criterion, device) -> Tuple[float, 
     total_samples = 0
 
     for raw_batch in loader:
-        (recon, edge_index, edge_attr), batch_obj = forward_model(
-            model, raw_batch, device, return_graph=True
-        )
-        target = batch_obj.x.unsqueeze(-1)
+        with autocast("cuda", enabled=amp_enabled):
+            (recon, edge_index, edge_attr), batch_obj = forward_model(
+                model, raw_batch, device, return_graph=True
+            )
+            target = batch_obj.x.unsqueeze(-1)
+            loss = criterion(recon, target)
 
-        loss = criterion(recon, target)
         score = base_model.compute_topology_aware_anomaly_score(
             target, recon, edge_index, edge_attr
         )
 
         batch_size = batch_obj.num_graphs
-        total_loss += loss.item() * batch_size
+        total_loss += loss.detach().item() * batch_size
         total_score += score.item() * batch_size
         total_samples += batch_size
 
-    denom = max(total_samples, 1)
-    return total_loss / denom, total_score / denom
+    totals = torch.tensor([total_loss, total_score, total_samples], device=device, dtype=torch.float64)
+    if distributed:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+
+    loss_sum, score_sum, sample_sum = totals.tolist()
+    denom = max(sample_sum, 1.0)
+    return float(loss_sum / denom), float(score_sum / denom)
 
 
 def main() -> None:
     args = parse_args()
-    device, device_ids = resolve_devices(args.device, args.cuda_device, args.cuda_devices)
+    distributed, rank, world_size, local_rank = init_distributed_mode(args.dist_backend)
+    is_main_process = (not distributed) or rank == 0
 
-    print("=" * 80)
-    print("FAST DYEDGEGAT TRAINING")
-    print("=" * 80)
-    print(f"Train files: {args.train_files}")
-    print(f"Val file  : {args.val_file}")
-    print(f"Test file : {args.test_file}")
-    print(f"Device    : {device}")
-    use_data_list_loader = bool(device_ids and len(device_ids) > 1)
-    if use_data_list_loader:
-        print(f"Using multiple CUDA devices: {device_ids}")
-    print("=" * 80)
+    try:
+        if distributed:
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device, _ = resolve_devices(args.device, args.cuda_device, args.cuda_devices)
 
-    model = init_model(device)
-    if use_data_list_loader:
-        model = GeoDataParallel(model, device_ids=device_ids)
-    base_model = unwrap_model(model)
-    criterion = torch.nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        if device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
 
-    train_loader, val_loader, test_loader = build_dataloaders(
-        args,
-        use_data_list_loader=use_data_list_loader,
-    )
+        if is_main_process:
+            print("=" * 80)
+            print("FAST DYEDGEGAT TRAINING")
+            print("=" * 80)
+            print(f"Train files: {args.train_files}")
+            print(f"Val file  : {args.val_file}")
+            print(f"Test file : {args.test_file}")
+            if distributed:
+                print(f"Distributed across {world_size} GPUs")
+            else:
+                print(f"Device    : {device}")
+            print("=" * 80)
 
-    best_val_loss = float("inf")
-    best_state = None
+        model = init_model(device)
+        if distributed:
+            model = TorchDDP(
+                model,
+                device_ids=[device.index],
+                output_device=device.index,
+                find_unused_parameters=True,
+            )
 
-    for epoch in range(1, args.epochs + 1):
-        start = time.time()
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss, val_score = evaluate(model, val_loader, criterion, device)
-        elapsed = time.time() - start
+        base_model = unwrap_model(model)
+        criterion = torch.nn.MSELoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
-        print(
-            f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} "
-            f"val_loss={val_loss:.6f} val_anom={val_score:.6f} time={elapsed:.1f}s"
+        scaler = GradScaler("cuda") if args.use_amp and device.type == "cuda" else None
+        amp_enabled = scaler is not None
+
+        train_loader, val_loader, test_loader = build_dataloaders(
+            args,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            num_workers=args.num_workers,
         )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_state = {k: v.cpu().clone() for k, v in base_model.state_dict().items()}
+        best_val_loss = float("inf")
+        best_state = None
 
-    if best_state is not None:
-        base_model.load_state_dict(best_state)
-        print(f"\nBest validation loss: {best_val_loss:.6f}")
-    else:
-        print("\nWarning: No improvement over initial epoch.")
+        for epoch in range(1, args.epochs + 1):
+            if distributed and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+                train_loader.sampler.set_epoch(epoch)
 
-    test_loss, test_score = evaluate(model, test_loader, criterion, device)
-    print(
-        f"\nTest results on {args.test_file}: "
-        f"recon_loss={test_loss:.6f} anomaly_score={test_score:.6f}"
-    )
-    print("\nDone.")
+            start = time.time()
+            train_loss = train_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+                distributed=distributed,
+                scaler=scaler,
+                amp_enabled=amp_enabled,
+            )
+            val_loss, val_score = evaluate(
+                model,
+                val_loader,
+                criterion,
+                device,
+                distributed=distributed,
+                amp_enabled=amp_enabled,
+            )
+            elapsed = time.time() - start
+
+            if is_main_process:
+                print(
+                    f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} "
+                    f"val_loss={val_loss:.6f} val_anom={val_score:.6f} time={elapsed:.1f}s"
+                )
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {k: v.cpu().clone() for k, v in base_model.state_dict().items()}
+
+        if best_state is not None:
+            base_model.load_state_dict(best_state)
+            if is_main_process:
+                print(f"\nBest validation loss: {best_val_loss:.6f}")
+        elif is_main_process:
+            print("\nWarning: No improvement over initial epoch.")
+
+        test_loss, test_score = evaluate(
+            model,
+            test_loader,
+            criterion,
+            device,
+            distributed=distributed,
+            amp_enabled=amp_enabled,
+        )
+        if is_main_process:
+            print(
+                f"\nTest results on {args.test_file}: "
+                f"recon_loss={test_loss:.6f} anomaly_score={test_score:.6f}"
+            )
+            print("\nDone.")
+    finally:
+        cleanup_distributed(distributed)
 
 
 if __name__ == "__main__":

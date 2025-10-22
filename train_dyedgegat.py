@@ -12,8 +12,10 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
+from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as TorchDDP
 from torch_geometric.data import Batch
-from torch_geometric.nn import DataParallel as GeoDataParallel
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dyedgegat"))
 
@@ -52,6 +54,24 @@ def parse_args() -> argparse.Namespace:
         help="Comma separated CUDA device indices for multi-GPU training (e.g., '0,1').",
     )
     parser.add_argument("--save-model", type=str, default=None, help="Optional path to save best model state_dict")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="Number of DataLoader worker processes per rank.",
+    )
+    parser.add_argument(
+        "--use-amp",
+        action="store_true",
+        help="Enable torch.cuda.amp automatic mixed precision.",
+    )
+    parser.add_argument(
+        "--dist-backend",
+        type=str,
+        default="nccl",
+        choices=["nccl", "gloo", "mpi"],
+        help="Distributed backend to use when launched with torchrun.",
+    )
     return parser.parse_args()
 
 
@@ -73,6 +93,31 @@ def parse_cuda_devices(cuda_devices: Optional[str]) -> Optional[List[int]]:
     return parsed
 
 
+def init_distributed_mode(backend: str) -> Tuple[bool, int, int, int]:
+    if not dist.is_available():
+        return False, 0, 1, 0
+
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        return False, 0, 1, 0
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed mode requires CUDA to be available.")
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend=backend)
+
+    return True, rank, world_size, local_rank
+
+
+def cleanup_distributed(distributed: bool) -> None:
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
 def resolve_devices(
     device_flag: str,
     cuda_index: Optional[int],
@@ -80,22 +125,15 @@ def resolve_devices(
 ) -> Tuple[torch.device, Optional[List[int]]]:
     multi_device_ids = parse_cuda_devices(cuda_devices)
 
-    if multi_device_ids is not None and cuda_index is not None:
-        raise ValueError("Use either --cuda-device or --cuda-devices, not both.")
-
     if multi_device_ids is not None:
-        if device_flag == "cpu":
-            raise ValueError("--cuda-devices requires --device auto or cuda.")
-        if not torch.cuda.is_available():
-            raise RuntimeError("--cuda-devices specified but CUDA is not available.")
-
-        visible = torch.cuda.device_count()
-        for idx in multi_device_ids:
-            if idx < 0 or idx >= visible:
-                raise ValueError(f"Requested CUDA device {idx}, but only {visible} devices are visible.")
-
-        torch.cuda.set_device(multi_device_ids[0])
-        return torch.device(f"cuda:{multi_device_ids[0]}"), multi_device_ids
+        if cuda_index is not None:
+            raise ValueError("Use either --cuda-device or --cuda-devices, not both.")
+        if len(multi_device_ids) > 1:
+            raise ValueError(
+                "Multi-GPU with --cuda-devices is no longer supported. Launch with torchrun for distributed training."
+            )
+        cuda_index = multi_device_ids[0]
+        multi_device_ids = None
 
     if device_flag == "cpu":
         if cuda_index is not None:
@@ -172,6 +210,12 @@ def init_model(device: torch.device) -> DyEdgeGAT:
         aug_control=True,
         flip_output=True,
     )
+    # Disable cuDNN weight flattening before transferring to device to avoid
+    # CUDNN_STATUS_BAD_PARAM in multi-process setups.
+    for module in model.modules():
+        if isinstance(module, torch.nn.GRU):
+            module.flatten_parameters = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+
     return model.to(device)
 
 
@@ -182,16 +226,9 @@ def forward_model(
     *,
     return_graph: bool = False,
 ):
-    if hasattr(model, "module"):
-        if isinstance(batch, (list, tuple)):
-            data_list = list(batch)
-        else:
-            data_list = [batch]
-        batch_obj = Batch.from_data_list(data_list).to(device)
-        if return_graph:
-            outputs = model.module(batch_obj, return_graph=True)
-        else:
-            outputs = model(data_list)
+    if isinstance(model, TorchDDP):
+        batch_obj = batch.to(device)
+        outputs = model(batch_obj, return_graph=return_graph)
         return outputs, batch_obj
 
     batch_obj = batch.to(device)
@@ -217,6 +254,10 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     criterion: torch.nn.Module,
     device: torch.device,
+    *,
+    distributed: bool = False,
+    scaler: Optional[GradScaler] = None,
+    amp_enabled: bool = False,
 ) -> float:
     model.train()
     running_loss = 0.0
@@ -224,15 +265,27 @@ def train_epoch(
 
     for raw_batch in loader:
         optimizer.zero_grad(set_to_none=True)
-        loss, batch_obj = compute_recon_loss(model, raw_batch, criterion, device)
-        loss.backward()
-        optimizer.step()
+        with autocast("cuda", enabled=amp_enabled):
+            loss, batch_obj = compute_recon_loss(model, raw_batch, criterion, device)
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         batch_size = batch_obj.num_graphs
-        running_loss += loss.item() * batch_size
+        running_loss += loss.detach().item() * batch_size
         sample_count += batch_size
 
-    return running_loss / max(sample_count, 1)
+    totals = torch.tensor([running_loss, sample_count], device=device, dtype=torch.float64)
+    if distributed:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+
+    total_loss, total_samples = totals.tolist()
+    return float(total_loss / max(total_samples, 1.0))
 
 
 @torch.no_grad()
@@ -241,6 +294,9 @@ def evaluate(
     loader: torch.utils.data.DataLoader,
     criterion: torch.nn.Module,
     device: torch.device,
+    *,
+    distributed: bool = False,
+    amp_enabled: bool = False,
 ) -> Tuple[float, float]:
     model.eval()
     base_model = unwrap_model(model)
@@ -249,23 +305,29 @@ def evaluate(
     sample_count = 0
 
     for raw_batch in loader:
-        (recon, edge_index, edge_attr), batch_obj = forward_model(
-            model, raw_batch, device, return_graph=True
-        )
-        target = batch_obj.x.unsqueeze(-1)
+        with autocast("cuda", enabled=amp_enabled):
+            (recon, edge_index, edge_attr), batch_obj = forward_model(
+                model, raw_batch, device, return_graph=True
+            )
+            target = batch_obj.x.unsqueeze(-1)
+            loss = criterion(recon, target)
 
-        loss = criterion(recon, target)
         score = base_model.compute_topology_aware_anomaly_score(
             target, recon, edge_index, edge_attr
         )
 
         batch_size = batch_obj.num_graphs
-        running_loss += loss.item() * batch_size
+        running_loss += loss.detach().item() * batch_size
         running_score += score.item() * batch_size
         sample_count += batch_size
 
-    denom = max(sample_count, 1)
-    return running_loss / denom, running_score / denom
+    totals = torch.tensor([running_loss, running_score, sample_count], device=device, dtype=torch.float64)
+    if distributed:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+
+    total_loss, total_score, total_samples = totals.tolist()
+    denom = max(total_samples, 1.0)
+    return float(total_loss / denom), float(total_score / denom)
 
 
 @torch.no_grad()
@@ -274,81 +336,147 @@ def evaluate_tests(
     loaders: Dict[str, torch.utils.data.DataLoader],
     criterion: torch.nn.Module,
     device: torch.device,
+    *,
+    distributed: bool = False,
+    amp_enabled: bool = False,
 ) -> Dict[str, Dict[str, float]]:
     metrics: Dict[str, Dict[str, float]] = {}
     for name, loader in loaders.items():
-        loss, score = evaluate(model, loader, criterion, device)
+        loss, score = evaluate(
+            model,
+            loader,
+            criterion,
+            device,
+            distributed=distributed,
+            amp_enabled=amp_enabled,
+        )
         metrics[name] = {"recon_loss": loss, "anomaly_score": score}
     return metrics
 
 
 def main() -> None:
     args = parse_args()
-    device, device_ids = resolve_devices(args.device, args.cuda_device, args.cuda_devices)
-    print("=" * 80)
-    print(f"Training DyEdgeGAT on device: {device}")
-    use_data_list_loader = bool(device_ids and len(device_ids) > 1)
-    if use_data_list_loader:
-        print(f"Using multiple CUDA devices: {device_ids}")
-    print("=" * 80)
+    distributed, rank, world_size, local_rank = init_distributed_mode(args.dist_backend)
+    is_main_process = (not distributed) or rank == 0
 
-    model = init_model(device)
-    if use_data_list_loader:
-        model = GeoDataParallel(model, device_ids=device_ids)
-    base_model = unwrap_model(model)
-    criterion = torch.nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    try:
+        if distributed:
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device, _ = resolve_devices(args.device, args.cuda_device, args.cuda_devices)
 
-    train_loader, val_loader, test_loaders = create_dataloaders(
-        window_size=cfg.dataset.window_size,
-        batch_size=args.batch_size,
-        train_stride=args.train_stride,
-        val_stride=args.val_stride,
-        data_dir=args.data_dir,
-        num_workers=0,
-        use_data_list_loader=use_data_list_loader,
-    )
+        if device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
 
-    best_val_loss = float("inf")
-    best_state = None
-    history = []
+        if is_main_process:
+            print("=" * 80)
+            if distributed:
+                print(f"Training DyEdgeGAT with DistributedDataParallel on {world_size} GPUs")
+            else:
+                print(f"Training DyEdgeGAT on device: {device}")
+            print("=" * 80)
 
-    for epoch in range(1, args.epochs + 1):
-        start_time = time.time()
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss, val_score = evaluate(model, val_loader, criterion, device)
-        elapsed = time.time() - start_time
+        model = init_model(device)
 
-        history.append((epoch, train_loss, val_loss))
-        print(
-            f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} "
-            f"val_loss={val_loss:.6f} val_anom={val_score:.6f} time={elapsed:.1f}s"
+        if distributed:
+            model = TorchDDP(
+                model,
+                device_ids=[device.index],
+                output_device=device.index,
+                find_unused_parameters=True,
+            )
+
+        base_model = unwrap_model(model)
+        criterion = torch.nn.MSELoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+        scaler = GradScaler("cuda") if args.use_amp and device.type == "cuda" else None
+        amp_enabled = scaler is not None
+
+        train_loader, val_loader, test_loaders = create_dataloaders(
+            window_size=cfg.dataset.window_size,
+            batch_size=args.batch_size,
+            train_stride=args.train_stride,
+            val_stride=args.val_stride,
+            data_dir=args.data_dir,
+            num_workers=args.num_workers,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
         )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_state = {k: v.cpu().clone() for k, v in base_model.state_dict().items()}
+        best_val_loss = float("inf")
+        best_state = None
 
-    if best_state is not None:
-        base_model.load_state_dict(best_state)
-        print(f"\nBest validation loss: {best_val_loss:.6f}")
-    else:
-        print("\nWarning: No improvement over initial epoch.")
+        for epoch in range(1, args.epochs + 1):
+            if distributed and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+                train_loader.sampler.set_epoch(epoch)
 
-    print("\nEvaluating on test datasets...")
-    test_scores = evaluate_tests(model, test_loaders, criterion, device)
-    for name, metrics in test_scores.items():
-        print(
-            f"  {name:30s}: recon_loss={metrics['recon_loss']:.6f} "
-            f"anomaly_score={metrics['anomaly_score']:.6f}"
+            start_time = time.time()
+            train_loss = train_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+                distributed=distributed,
+                scaler=scaler,
+                amp_enabled=amp_enabled,
+            )
+            val_loss, val_score = evaluate(
+                model,
+                val_loader,
+                criterion,
+                device,
+                distributed=distributed,
+                amp_enabled=amp_enabled,
+            )
+            elapsed = time.time() - start_time
+
+            if is_main_process:
+                print(
+                    f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} "
+                    f"val_loss={val_loss:.6f} val_anom={val_score:.6f} time={elapsed:.1f}s"
+                )
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {k: v.cpu().clone() for k, v in base_model.state_dict().items()}
+
+        if best_state is not None:
+            base_model.load_state_dict(best_state)
+            if is_main_process:
+                print(f"\nBest validation loss: {best_val_loss:.6f}")
+        elif is_main_process:
+            print("\nWarning: No improvement over initial epoch.")
+
+        if is_main_process:
+            print("\nEvaluating on test datasets...")
+
+        test_scores = evaluate_tests(
+            model,
+            test_loaders,
+            criterion,
+            device,
+            distributed=distributed,
+            amp_enabled=amp_enabled,
         )
 
-    if args.save_model:
-        state_to_save = best_state if best_state is not None else base_model.state_dict()
-        torch.save(state_to_save, args.save_model)
-        print(f"\nSaved model checkpoint to: {args.save_model}")
+        if is_main_process:
+            for name, metrics in test_scores.items():
+                print(
+                    f"  {name:30s}: recon_loss={metrics['recon_loss']:.6f} "
+                    f"anomaly_score={metrics['anomaly_score']:.6f}"
+                )
 
-    print("\nTraining complete.")
+            if args.save_model:
+                state_to_save = best_state if best_state is not None else base_model.state_dict()
+                torch.save(state_to_save, args.save_model)
+                print(f"\nSaved model checkpoint to: {args.save_model}")
+
+            print("\nTraining complete.")
+    finally:
+        cleanup_distributed(distributed)
 
 
 if __name__ == "__main__":

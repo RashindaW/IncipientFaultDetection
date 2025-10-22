@@ -43,8 +43,13 @@ When constructing the full feature tensor for the model:
 This mapping should make it easier to move from the reduced test subset to the full CO₂ dataset without renaming columns later.
 
 ## Multi-GPU Training
-- Use `--cuda-devices` with either training script to pick one or more CUDA GPUs for PyTorch Geometric `DataParallel` (comma-separated ids, e.g. `--cuda-devices 0,1`).
-- The first id in the list becomes the primary device; additional ids enable multi-GPU training automatically.
-- `--cuda-device` remains available for selecting a single GPU, and `--device cpu` forces CPU execution.
-- When multiple ids are provided the dataloaders automatically switch to `DataListLoader`, so no manual dataset tweaks are needed.
-- Example: `python train_dyedgegat.py --epochs 20 --batch-size 128 --cuda-devices 0,1,2` trains across three GPUs.
+- Multi-GPU execution now relies on PyTorch DistributedDataParallel. Launch the scripts with `torchrun --nproc_per_node=<num_gpus>`; each process owns one GPU and runs its own DataLoader pipeline.
+- Pick a specific set of GPUs with `CUDA_VISIBLE_DEVICES`. Example (per-GPU batch size of 128, AMP enabled, 4 workers per rank):
+  ```bash
+  CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
+      train_dyedgegat.py --epochs 20 --batch-size 128 \
+      --num-workers 4 --use-amp
+  ```
+- `--cuda-device` remains for single-GPU selection when you run the script directly (without torchrun). `--cuda-devices` accepts only one id and will otherwise raise.
+- `--dist-backend` defaults to `nccl`; switch to `gloo` only when running on CPU.
+- The reported batch size is per process. Increase it to fully utilize the additional memory each GPU now owns.

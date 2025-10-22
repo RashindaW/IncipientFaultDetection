@@ -33,7 +33,7 @@ def test_model():
     cfg.set_dataset_params(
         n_nodes=len(MEASUREMENT_VARS),   # Full measurement set from column_config
         window_size=15,                  # 15 timestep window
-        ocvar_dim=len(CONTROL_VARS)      # 6 operating condition set-points
+        ocvar_dim=len(CONTROL_VARS)      # Six operating-condition channels retained
     )
     cfg.validate()
     print(f"✅ Config: {cfg.dataset.n_nodes} nodes, window={cfg.dataset.window_size}, "
