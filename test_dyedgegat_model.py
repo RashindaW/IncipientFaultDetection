@@ -13,6 +13,8 @@ import torch
 import sys
 import os
 
+WINDOW_SIZE = 60
+
 # Add both paths for proper imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dyedgegat'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dyedgegat', 'src'))
@@ -31,9 +33,9 @@ def test_model():
     # ========== Step 1: Configuration ==========
     print("\n[1/6] Setting up configuration...")
     cfg.set_dataset_params(
-        n_nodes=len(MEASUREMENT_VARS),   # Full measurement set from column_config
-        window_size=15,                  # 15 timestep window
-        ocvar_dim=len(CONTROL_VARS)      # Six operating-condition channels retained
+        n_nodes=len(MEASUREMENT_VARS),
+        window_size=WINDOW_SIZE,
+        ocvar_dim=len(CONTROL_VARS)
     )
     cfg.validate()
     print(f"✅ Config: {cfg.dataset.n_nodes} nodes, window={cfg.dataset.window_size}, "

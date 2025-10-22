@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-stride", type=int, default=10, help="Stride for training windows")
     parser.add_argument("--val-stride", type=int, default=20, help="Stride for validation windows")
     parser.add_argument("--test-stride", type=int, default=20, help="Stride for test windows")
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=60,
+        help="Temporal window size (number of timesteps) for sliding windows.",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Optimizer learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="AdamW weight decay")
     parser.add_argument("--data-dir", type=str, default="Dataset", help="Directory containing CSV files")
@@ -183,10 +189,10 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return getattr(model, "module", model)
 
 
-def init_model(device: torch.device) -> DyEdgeGAT:
+def init_model(device: torch.device, window_size: int) -> DyEdgeGAT:
     cfg.set_dataset_params(
         n_nodes=len(MEASUREMENT_VARS),
-        window_size=15,
+        window_size=window_size,
         ocvar_dim=len(CONTROL_VARS),
     )
     cfg.device = str(device)
@@ -439,7 +445,7 @@ def main() -> None:
                 print(f"Device    : {device}")
             print("=" * 80)
 
-        model = init_model(device)
+        model = init_model(device, args.window_size)
         if distributed:
             model = TorchDDP(
                 model,

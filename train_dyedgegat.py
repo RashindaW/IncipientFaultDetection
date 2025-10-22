@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for training")
     parser.add_argument("--train-stride", type=int, default=1, help="Sliding window stride for training dataset")
     parser.add_argument("--val-stride", type=int, default=5, help="Sliding window stride for validation/test datasets")
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=60,
+        help="Temporal window size (number of timesteps) for sliding windows.",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Optimizer learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay (L2 regularization)")
     parser.add_argument("--data-dir", type=str, default="Dataset", help="Directory containing CSV files")
@@ -54,6 +60,17 @@ def parse_args() -> argparse.Namespace:
         help="Comma separated CUDA device indices for multi-GPU training (e.g., '0,1').",
     )
     parser.add_argument("--save-model", type=str, default=None, help="Optional path to save best model state_dict")
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Skip training and only run evaluation using a checkpoint.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Checkpoint path to load before evaluation or to warm-start training.",
+    )
     parser.add_argument(
         "--num-workers",
         type=int,
@@ -165,10 +182,10 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return getattr(model, "module", model)
 
 
-def init_model(device: torch.device) -> DyEdgeGAT:
+def init_model(device: torch.device, window_size: int) -> DyEdgeGAT:
     cfg.set_dataset_params(
         n_nodes=len(MEASUREMENT_VARS),
-        window_size=15,
+        window_size=window_size,
         ocvar_dim=len(CONTROL_VARS),
     )
     cfg.device = str(device)
@@ -356,6 +373,8 @@ def evaluate_tests(
 
 def main() -> None:
     args = parse_args()
+    if args.eval_only and not args.checkpoint:
+        raise ValueError("--eval-only requires --checkpoint to be specified.")
     distributed, rank, world_size, local_rank = init_distributed_mode(args.dist_backend)
     is_main_process = (not distributed) or rank == 0
 
@@ -370,13 +389,28 @@ def main() -> None:
 
         if is_main_process:
             print("=" * 80)
+            mode_desc = "Evaluating" if args.eval_only else "Training"
             if distributed:
-                print(f"Training DyEdgeGAT with DistributedDataParallel on {world_size} GPUs")
+                print(f"{mode_desc} DyEdgeGAT with DistributedDataParallel on {world_size} GPUs")
             else:
-                print(f"Training DyEdgeGAT on device: {device}")
+                print(f"{mode_desc} DyEdgeGAT on device: {device}")
             print("=" * 80)
 
-        model = init_model(device)
+        model = init_model(device, args.window_size)
+
+        if args.checkpoint:
+            if not os.path.isfile(args.checkpoint):
+                raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+            checkpoint = torch.load(args.checkpoint, map_location=device)
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                checkpoint = checkpoint["state_dict"]
+            load_result = model.load_state_dict(checkpoint, strict=False)
+            if is_main_process:
+                print(f"Loaded checkpoint from {args.checkpoint}")
+                if load_result.missing_keys:
+                    print(f"  Missing keys: {load_result.missing_keys}")
+                if load_result.unexpected_keys:
+                    print(f"  Unexpected keys: {load_result.unexpected_keys}")
 
         if distributed:
             model = TorchDDP(
@@ -408,49 +442,70 @@ def main() -> None:
         best_val_loss = float("inf")
         best_state = None
 
-        for epoch in range(1, args.epochs + 1):
-            if distributed and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
-                train_loader.sampler.set_epoch(epoch)
+        if not args.eval_only:
+            for epoch in range(1, args.epochs + 1):
+                if distributed and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+                    train_loader.sampler.set_epoch(epoch)
 
-            start_time = time.time()
-            train_loss = train_epoch(
-                model,
-                train_loader,
-                optimizer,
-                criterion,
-                device,
-                distributed=distributed,
-                scaler=scaler,
-                amp_enabled=amp_enabled,
-            )
-            val_loss, val_score = evaluate(
-                model,
-                val_loader,
-                criterion,
-                device,
-                distributed=distributed,
-                amp_enabled=amp_enabled,
-            )
-            elapsed = time.time() - start_time
-
-            if is_main_process:
-                print(
-                    f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} "
-                    f"val_loss={val_loss:.6f} val_anom={val_score:.6f} time={elapsed:.1f}s"
+                start_time = time.time()
+                train_loss = train_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    criterion,
+                    device,
+                    distributed=distributed,
+                    scaler=scaler,
+                    amp_enabled=amp_enabled,
                 )
+                val_loss, val_score = evaluate(
+                    model,
+                    val_loader,
+                    criterion,
+                    device,
+                    distributed=distributed,
+                    amp_enabled=amp_enabled,
+                )
+                elapsed = time.time() - start_time
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_state = {k: v.cpu().clone() for k, v in base_model.state_dict().items()}
+                if is_main_process:
+                    print(
+                        f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} "
+                        f"val_loss={val_loss:.6f} val_anom={val_score:.6f} time={elapsed:.1f}s"
+                    )
 
-        if best_state is not None:
-            base_model.load_state_dict(best_state)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_state = {k: v.cpu().clone() for k, v in base_model.state_dict().items()}
+
+            if best_state is not None:
+                base_model.load_state_dict(best_state)
+                if is_main_process:
+                    print(f"\nBest validation loss: {best_val_loss:.6f}")
+            elif is_main_process:
+                print("\nWarning: No improvement over initial epoch.")
+
+            if is_main_process and args.save_model:
+                state_to_save = best_state if best_state is not None else base_model.state_dict()
+                torch.save(state_to_save, args.save_model)
+                print(f"\nSaved model checkpoint to: {args.save_model}")
+        else:
             if is_main_process:
-                print(f"\nBest validation loss: {best_val_loss:.6f}")
-        elif is_main_process:
-            print("\nWarning: No improvement over initial epoch.")
+                print("\nEvaluation-only mode: skipping training loop.")
+
+        val_summary_loss, val_summary_score = evaluate(
+            model,
+            criterion,
+            device,
+            distributed=distributed,
+            amp_enabled=amp_enabled,
+        )
 
         if is_main_process:
+            print(
+                f"\nValidation summary -> recon_loss={val_summary_loss:.6f} "
+                f"anomaly_score={val_summary_score:.6f}"
+            )
             print("\nEvaluating on test datasets...")
 
         test_scores = evaluate_tests(
@@ -469,12 +524,10 @@ def main() -> None:
                     f"anomaly_score={metrics['anomaly_score']:.6f}"
                 )
 
-            if args.save_model:
-                state_to_save = best_state if best_state is not None else base_model.state_dict()
-                torch.save(state_to_save, args.save_model)
-                print(f"\nSaved model checkpoint to: {args.save_model}")
-
-            print("\nTraining complete.")
+            if args.eval_only:
+                print("\nEvaluation complete.")
+            else:
+                print("\nTraining complete.")
     finally:
         cleanup_distributed(distributed)
 
