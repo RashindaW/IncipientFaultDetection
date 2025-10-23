@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-stride", type=int, default=1, help="Sliding window stride for training dataset")
     parser.add_argument("--val-stride", type=int, default=5, help="Sliding window stride for validation/test datasets")
     parser.add_argument(
+        "--test-stride",
+        type=int,
+        default=None,
+        help="Optional sliding window stride for test datasets (defaults to --val-stride).",
+    )
+    parser.add_argument(
         "--window-size",
         type=int,
         default=60,
@@ -427,11 +433,14 @@ def main() -> None:
         scaler = GradScaler("cuda") if args.use_amp and device.type == "cuda" else None
         amp_enabled = scaler is not None
 
+        effective_test_stride = args.test_stride if args.test_stride is not None else args.val_stride
+
         train_loader, val_loader, test_loaders = create_dataloaders(
             window_size=cfg.dataset.window_size,
             batch_size=args.batch_size,
             train_stride=args.train_stride,
             val_stride=args.val_stride,
+            test_stride=effective_test_stride,
             data_dir=args.data_dir,
             num_workers=args.num_workers,
             distributed=distributed,
@@ -495,6 +504,7 @@ def main() -> None:
 
         val_summary_loss, val_summary_score = evaluate(
             model,
+            val_loader,
             criterion,
             device,
             distributed=distributed,
