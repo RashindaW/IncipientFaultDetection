@@ -33,9 +33,9 @@ def test_model():
     # ========== Step 1: Configuration ==========
     print("\n[1/6] Setting up configuration...")
     cfg.set_dataset_params(
-        n_nodes=len(MEASUREMENT_VARS),
+        n_nodes=len(MEASUREMENT_VARS),  # 142 nodes (measurement sensors)
         window_size=WINDOW_SIZE,
-        ocvar_dim=len(CONTROL_VARS)
+        ocvar_dim=len(CONTROL_VARS)  # 10 control variables
     )
     cfg.validate()
     print(f"✅ Config: {cfg.dataset.n_nodes} nodes, window={cfg.dataset.window_size}, "

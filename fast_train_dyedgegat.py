@@ -191,9 +191,9 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 def init_model(device: torch.device, window_size: int) -> DyEdgeGAT:
     cfg.set_dataset_params(
-        n_nodes=len(MEASUREMENT_VARS),
+        n_nodes=len(MEASUREMENT_VARS),  # 142 nodes (measurement sensors)
         window_size=window_size,
-        ocvar_dim=len(CONTROL_VARS),
+        ocvar_dim=len(CONTROL_VARS),  # 10 control variables
     )
     cfg.device = str(device)
     cfg.validate()
