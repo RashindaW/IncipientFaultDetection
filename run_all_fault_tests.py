@@ -16,15 +16,10 @@ STRIDE = 1
 BATCH_SIZE = 64
 NUM_WORKERS = 4
 
-# All fault datasets
-FAULTS = [
-    "Fault1_DisplayCaseDoorOpen",
-    "Fault2_IceAccumulation",
-    "Fault3_EvapValveFailure",
-    "Fault4_MTEvapFanFailure",
-    "Fault5_CondAPBlock",
-    "Fault6_MTEvapAPBlock",
-]
+from dyedgegat.src.data.column_config import FAULT_FILES
+
+# All fault datasets (auto-discovered from column config)
+FAULTS = sorted(FAULT_FILES.keys())
 
 
 def main():
@@ -45,6 +40,10 @@ def main():
     print("=" * 50)
     print()
     
+    base_env = os.environ.copy()
+    if "CUDA_VISIBLE_DEVICES" not in base_env or not base_env["CUDA_VISIBLE_DEVICES"]:
+        base_env["CUDA_VISIBLE_DEVICES"] = "1,2,3"
+    
     # Process each fault dataset
     for i, fault in enumerate(FAULTS, 1):
         print(f"[{i}/{len(FAULTS)}] Processing: {fault}")
@@ -63,7 +62,7 @@ def main():
         ]
         
         try:
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True, env=base_env)
             print(f"\n✓ Completed: {fault}\n")
         except subprocess.CalledProcessError as e:
             print(f"\n✗ Failed: {fault}")
@@ -94,4 +93,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

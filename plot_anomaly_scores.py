@@ -261,6 +261,11 @@ def main() -> None:
     data_files = resolve_dataset_files(args.dataset)
     dataset = build_dataset(data_files, args)
 
+    if args.device in ("auto", "cuda") and args.cuda_device is None:
+        # Avoid GPU 0 when not explicitly requested by the user.
+        if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+            os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
+
     device, _ = resolve_devices(args.device, args.cuda_device, None)
     amp_enabled = args.use_amp and device.type == "cuda"
 

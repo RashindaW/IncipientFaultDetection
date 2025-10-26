@@ -30,6 +30,7 @@ from src.config import cfg
 from src.data.dataset import RefrigerationDataset
 from src.data.column_config import MEASUREMENT_VARS, CONTROL_VARS
 from src.model.dyedgegat import DyEdgeGAT
+from src.utils.checkpoint import EpochCheckpointManager
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +57,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--val-file", type=str, default="BaselineTestB.csv", help="CSV file for validation")
     parser.add_argument("--test-file", type=str, default="Fault1_DisplayCaseDoorOpen.csv", help="CSV file for testing")
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="Directory to store per-epoch checkpoints and metrics CSV.",
+    )
     parser.add_argument(
         "--device",
         type=str,
@@ -471,6 +478,11 @@ def main() -> None:
 
         best_val_loss = float("inf")
         best_state = None
+        checkpoint_manager = None
+
+        if is_main_process and args.checkpoint_dir:
+            checkpoint_manager = EpochCheckpointManager(args.checkpoint_dir, prefix="dyedgegat")
+            print(f"\nSaving per-epoch checkpoints to: {checkpoint_manager.run_path}")
 
         for epoch in range(1, args.epochs + 1):
             if distributed and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
@@ -502,6 +514,16 @@ def main() -> None:
                     f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} "
                     f"val_loss={val_loss:.6f} val_anom={val_score:.6f} time={elapsed:.1f}s"
                 )
+                if checkpoint_manager is not None:
+                    checkpoint_path = checkpoint_manager.save_epoch(
+                        epoch=epoch,
+                        model=base_model,
+                        train_loss=train_loss,
+                        val_loss=val_loss,
+                        val_anom=val_score,
+                        elapsed_time=elapsed,
+                    )
+                    print(f"  ↳ checkpoint saved: {checkpoint_path.name}")
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
