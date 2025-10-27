@@ -74,6 +74,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate a line plot for the selected sequences (default: heatmap + CSV).",
     )
+    parser.add_argument(
+        "--dataset-suffix",
+        type=str,
+        default="",
+        help="Optional suffix appended to dataset filenames before '.csv' (e.g., '_1min').",
+    )
     return parser.parse_args()
 
 
@@ -100,12 +106,24 @@ def build_dataset(
     data_files: List[str],
     args: argparse.Namespace,
 ) -> RefrigerationDataset:
-    print(f"\nLoading evaluation dataset ({len(data_files)} file(s)):")
-    for f in data_files:
+    def apply_suffix(file_list: List[str]) -> List[str]:
+        if not args.dataset_suffix:
+            return list(file_list)
+        suffixed: List[str] = []
+        for name in file_list:
+            root, ext = os.path.splitext(name)
+            suffixed.append(f"{root}{args.dataset_suffix}{ext}")
+        return suffixed
+
+    eval_files = apply_suffix(data_files)
+    train_files = apply_suffix(BASELINE_FILES["train"])
+
+    print(f"\nLoading evaluation dataset ({len(eval_files)} file(s)):")
+    for f in eval_files:
         print(f"  - {f}")
 
     train_dataset = RefrigerationDataset(
-        data_files=BASELINE_FILES["train"],
+        data_files=train_files,
         window_size=args.window_size,
         stride=max(1, args.stride),
         data_dir=args.data_dir,
@@ -114,7 +132,7 @@ def build_dataset(
     norm_stats = train_dataset.get_normalization_stats()
 
     eval_dataset = RefrigerationDataset(
-        data_files=data_files,
+        data_files=eval_files,
         window_size=args.window_size,
         stride=args.stride,
         data_dir=args.data_dir,
