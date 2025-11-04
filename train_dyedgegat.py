@@ -27,6 +27,7 @@ from src.utils.checkpoint import EpochCheckpointManager
 
 
 def parse_args() -> argparse.Namespace:
+    available_datasets = list_adapter_keys()
     parser = argparse.ArgumentParser(description="Train DyEdgeGAT on refrigeration dataset")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for training")
@@ -49,9 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-key",
         type=str,
-        default="co2",
-        choices=list_adapter_keys(),
-        help="Dataset adapter to use (e.g., 'co2', 'co2_1min').",
+        choices=available_datasets,
+        help=f"Dataset adapter to use. Available: {', '.join(available_datasets)}.",
     )
     parser.add_argument(
         "--data-dir",
@@ -114,7 +114,12 @@ def parse_args() -> argparse.Namespace:
         choices=["nccl", "gloo", "mpi"],
         help="Distributed backend to use when launched with torchrun.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.dataset_key is None:
+        parser.error(
+            f"--dataset-key is required. Available adapters: {', '.join(available_datasets)}"
+        )
+    return args
 
 
 def parse_cuda_devices(cuda_devices: Optional[str]) -> Optional[List[int]]:
@@ -453,7 +458,7 @@ def main() -> None:
             if not args.eval_only:
                 print(f"Checkpoint root: {checkpoint_root_path}")
             if save_model_path is not None:
-                print(f"Final model will be saved to: {save_model_path}")
+                print(f"Final model will be saved to: {save_model_path.as_posix()}")
             print("=" * 80)
 
         if args.checkpoint:
@@ -566,7 +571,7 @@ def main() -> None:
             if is_main_process and save_model_path is not None:
                 state_to_save = best_state if best_state is not None else base_model.state_dict()
                 torch.save(state_to_save, save_model_path)
-                print(f"\nSaved model checkpoint to: {save_model_path}")
+                print(f"\nSaved model checkpoint to: {save_model_path.as_posix()}")
         else:
             if is_main_process:
                 print("\nEvaluation-only mode: skipping training loop.")

@@ -9,9 +9,11 @@ This script tests the complete DyEdgeGAT pipeline:
 5. Anomaly scoring
 """
 
-import torch
-import sys
+import argparse
 import os
+import sys
+
+import torch
 
 WINDOW_SIZE = 60
 
@@ -19,27 +21,60 @@ WINDOW_SIZE = 60
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dyedgegat'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dyedgegat', 'src'))
 
-from datasets import get_adapter
+from datasets import get_adapter, list_adapter_keys
 from src.model.dyedgegat import DyEdgeGAT
 from src.config import cfg
 
-DATASET_KEY = "co2"
+
+def parse_args() -> argparse.Namespace:
+    dataset_keys = list_adapter_keys()
+    parser = argparse.ArgumentParser(description="Quick DyEdgeGAT pipeline test")
+    parser.add_argument(
+        "--dataset-key",
+        type=str,
+        choices=dataset_keys,
+        help=f"Dataset adapter to test (available: {', '.join(dataset_keys)}).",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Optional override for dataset directory (defaults to adapter recommendation).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="Mini-batch size for this quick validation run.",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=100,
+        help="Stride applied to train/val/test loaders during the check.",
+    )
+    args = parser.parse_args()
+    if args.dataset_key is None:
+        parser.error(
+            f"--dataset-key is required. Available adapters: {', '.join(dataset_keys)}"
+        )
+    return args
 
 
-def test_model():
+def test_model(args: argparse.Namespace) -> None:
     print("=" * 80)
     print(" " * 25 + "DYEDGEGAT MODEL TEST")
     print("=" * 80)
     
     # ========== Step 1: Configuration ==========
     print("\n[1/6] Setting up configuration...")
-    adapter = get_adapter(DATASET_KEY)
+    adapter = get_adapter(args.dataset_key)
     adapter.ensure("testing")
-    data_dir = adapter.get_default_data_dir()
+    data_dir = args.data_dir or adapter.get_default_data_dir()
     if data_dir is None:
         raise ValueError(
-            f"Dataset adapter '{DATASET_KEY}' does not define a default data directory. "
-            "Please set DATASET_KEY or pass --data-dir when invoking this script."
+            f"Dataset adapter '{args.dataset_key}' does not define a default data directory. "
+            "Please provide --data-dir."
         )
     control_var_names = adapter.get_control_variables(data_dir)
     cfg.set_dataset_params(
@@ -55,10 +90,10 @@ def test_model():
     print("\n[2/6] Creating dataloaders...")
     train_loader, val_loader, test_loaders = adapter.create_dataloaders(
         window_size=cfg.dataset.window_size,
-        batch_size=4,  # Small batch for testing
-        train_stride=100,  # Large stride for quick test
-        val_stride=100,
-        test_stride=100,
+        batch_size=args.batch_size,
+        train_stride=args.stride,
+        val_stride=args.stride,
+        test_stride=args.stride,
         data_dir=data_dir,
         num_workers=0,
     )
@@ -206,6 +241,11 @@ def test_model():
     print("✅ Configuration: OK")
     print("✅ Data loading: OK")
     print("✅ Model initialization: OK")
+
+
+if __name__ == "__main__":
+    arguments = parse_args()
+    test_model(arguments)
     print("✅ Forward pass: OK")
     print("✅ Loss computation: OK")
     print("✅ Backward pass: OK")

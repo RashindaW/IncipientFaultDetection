@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Iterable, List, Optional
 
 import pandas as pd
@@ -121,14 +122,24 @@ def parse_args() -> argparse.Namespace:
         help="Convert normalized values back to original scale using dataset statistics.",
     )
     parser.add_argument(
+        "--output-root",
+        default="outputs/plotly",
+        help="Directory where run outputs are organised (default: outputs/plotly).",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="Optional run name used to create a unique subdirectory under --output-root.",
+    )
+    parser.add_argument(
         "--output-html",
         default=None,
-        help="Optional path to write the Plotly HTML file (defaults to outputs/plotly/...html).",
+        help="Optional explicit HTML output path or directory (overrides run directory).",
     )
     parser.add_argument(
         "--output-csv",
         default=None,
-        help="Optional path to write the aggregated time-series CSV.",
+        help="Optional explicit CSV output path or directory (overrides run directory).",
     )
     parser.add_argument(
         "--anomaly-only",
@@ -448,6 +459,15 @@ def main() -> None:
 
     multi_dataset = len(dataset_keys) > 1
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.run_name:
+        run_name = args.run_name
+    else:
+        run_name = f"{args.dataset_key}_{Path(args.checkpoint).stem}_{timestamp}"
+    run_root = Path(args.output_root) / run_name
+    run_root.mkdir(parents=True, exist_ok=True)
+    print(f"Output run dir   : {run_root}")
+
     if args.output_html:
         html_candidate = Path(args.output_html)
         if html_candidate.suffix and multi_dataset:
@@ -460,7 +480,7 @@ def main() -> None:
             base_html_dir = html_candidate
     else:
         html_override = None
-        base_html_dir = Path("outputs/plotly")
+        base_html_dir = run_root
 
     if args.output_csv:
         csv_candidate = Path(args.output_csv)
@@ -474,7 +494,7 @@ def main() -> None:
             base_csv_dir = csv_candidate
     else:
         csv_override = None
-        base_csv_dir = base_html_dir
+        base_csv_dir = run_root
 
     label_for_naming = sensor_name if include_values else "anomaly_score"
     safe_sensor = label_for_naming.replace("/", "_").replace(" ", "_")
@@ -517,7 +537,7 @@ def main() -> None:
             html_path = html_override
             html_path.parent.mkdir(parents=True, exist_ok=True)
         else:
-            html_dir = base_html_dir if not multi_dataset else base_html_dir / dataset_key
+            html_dir = base_html_dir / dataset_key if html_override is None or multi_dataset else base_html_dir
             html_dir.mkdir(parents=True, exist_ok=True)
             safe_dataset = dataset_key.replace("/", "_").replace(" ", "_")
             html_path = html_dir / f"{safe_dataset}_{safe_sensor}_{file_suffix}.html"
@@ -530,7 +550,7 @@ def main() -> None:
             csv_path = csv_override
             csv_path.parent.mkdir(parents=True, exist_ok=True)
         else:
-            csv_dir = base_csv_dir if not multi_dataset else base_csv_dir / dataset_key
+            csv_dir = base_csv_dir / dataset_key if csv_override is None or multi_dataset else base_csv_dir
             csv_dir.mkdir(parents=True, exist_ok=True)
             safe_dataset = dataset_key.replace("/", "_").replace(" ", "_")
             csv_path = csv_dir / f"{safe_dataset}_{safe_sensor}_{file_suffix}.csv"

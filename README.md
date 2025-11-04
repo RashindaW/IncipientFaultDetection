@@ -131,8 +131,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run --nproc_per_node=4 
 
 Run it after training to sanity-check a checkpoint:
 ```bash
-python test_dyedgegat_model.py
+python test_dyedgegat_model.py --dataset-key co2
 ```
+Optional flags: `--data-dir` to point at a non-default location, `--batch-size` and `--stride` to tweak runtime.
 Key behaviour:
 - Uses the `co2` adapter (`data/co2/raw`) by default; edit `DATASET_KEY` inside the script to target other adapters.
 - Loads `cfg.dataset` with the measurement/control variable definitions from `dyedgegat/src/data/column_config.py`.
@@ -154,9 +155,7 @@ python plot_reconstruction_plotly.py \
     --sensor T-MTcase-LIQ \
     --denormalize
 ```
-Outputs:
-- `outputs/plotly/baseline_T-MTcase-LIQ_reconstruction.html`
-- `outputs/plotly/baseline_T-MTcase-LIQ_reconstruction.csv`
+Outputs are grouped under `outputs/plotly/<run>/<dataset>/...` where `<run>` defaults to a timestamped name derived from the dataset key and checkpoint. You can provide `--run-name` to customise it or `--output-root` to relocate the entire tree.
 
 ### 4.2 Sweep All Faults + Baseline
 Use `--include-all-faults` to process baseline plus every defined fault in `column_config.py`. The script saves per-dataset files under `outputs/plotly/<dataset>/`.
@@ -182,6 +181,11 @@ python plot_reconstruction_plotly.py \
 ```
 - Sensor selection is not required.
 - Each HTML/CSV file is suffixed with `_anomaly`.
+
+Useful options:
+- `--run-name myexperiment` – fixed subdirectory name under `outputs/plotly/`.
+- `--output-root /tmp/plots` – write the entire run elsewhere.
+- `--output-html` / `--output-csv` – override specific paths for HTML or CSV artefacts.
 
 ### 4.4 Useful Flags
 - `--datasets fault1 fault3` – process specific dataset keys.
