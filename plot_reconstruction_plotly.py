@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""
+Load a DyEdgeGAT checkpoint, run inference, and visualize original vs reconstructed
+sensor readings alongside anomaly scores using Plotly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+from typing import Iterable, List, Optional
+
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import torch
+from torch.amp import autocast
+from torch_geometric.loader import DataLoader
+
+from train_dyedgegat import forward_model, init_model, resolve_devices, unwrap_model
+from dyedgegat.src.data.dataset import RefrigerationDataset, get_control_variable_names
+from dyedgegat.src.data.column_config import (
+    BASELINE_FILES,
+    FAULT_FILES,
+    MEASUREMENT_VARS,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Plot original vs reconstructed sensor values and anomaly scores "
+            "with Plotly for a DyEdgeGAT checkpoint."
+        )
+    )
+    parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint (.pt).")
+    parser.add_argument(
+        "--data-dir",
+        default="Dataset",
+        help="Root directory containing the CSV files.",
+    )
+    parser.add_argument(
+        "--dataset",
+        default="baseline",
+        help="Dataset to evaluate (baseline, val, train, or specific fault key). "
+        "Ignored when --datasets or --include-all-faults is supplied.",
+    )
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=None,
+        help="Optional list of dataset keys to process. Overrides --dataset.",
+    )
+    parser.add_argument(
+        "--include-all-faults",
+        action="store_true",
+        help="Process baseline plus all defined fault datasets.",
+    )
+    parser.add_argument(
+        "--dataset-suffix",
+        default="",
+        help="Optional suffix appended to dataset filenames before '.csv' (e.g., '_1min').",
+    )
+    parser.add_argument(
+        "--sensor",
+        default=MEASUREMENT_VARS[0],
+        help="Measurement variable name to plot.",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=60,
+        help="Sliding window length used for the dataset and model.",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="Stride applied when generating evaluation windows.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size for inference DataLoader.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="Number of worker processes for the DataLoader.",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Computation device preference.",
+    )
+    parser.add_argument(
+        "--cuda-device",
+        type=int,
+        default=None,
+        help="Explicit CUDA device index when using --device cuda/auto.",
+    )
+    parser.add_argument(
+        "--use-amp",
+        action="store_true",
+        help="Enable mixed precision (CUDA only).",
+    )
+    parser.add_argument(
+        "--max-windows",
+        type=int,
+        default=None,
+        help="Limit the number of evaluation windows processed (useful for quick previews).",
+    )
+    parser.add_argument(
+        "--denormalize",
+        action="store_true",
+        help="Convert normalized values back to original scale using dataset statistics.",
+    )
+    parser.add_argument(
+        "--output-html",
+        default=None,
+        help="Optional path to write the Plotly HTML file (defaults to outputs/plotly/...html).",
+    )
+    parser.add_argument(
+        "--output-csv",
+        default=None,
+        help="Optional path to write the aggregated time-series CSV.",
+    )
+    parser.add_argument(
+        "--anomaly-only",
+        action="store_true",
+        help="Plot only anomaly scores over time (omit actual/reconstructed series).",
+    )
+    return parser.parse_args()
+
+
+def resolve_dataset_files(dataset_key: str) -> List[str]:
+    key = dataset_key.lower()
+    if key in ("baseline", "val"):
+        return BASELINE_FILES["val"]
+    if key == "train":
+        return BASELINE_FILES["train"]
+    if dataset_key in FAULT_FILES:
+        return [FAULT_FILES[dataset_key]]
+    for fault_name, fault_file in FAULT_FILES.items():
+        if fault_name.lower() == key:
+            return [fault_file]
+    raise ValueError(
+        f"Unknown dataset '{dataset_key}'. Valid options: 'train', 'baseline', 'val', "
+        f"or one of {list(FAULT_FILES.keys())}"
+    )
+
+
+def apply_suffix(file_list: Iterable[str], suffix: str) -> List[str]:
+    if not suffix:
+        return list(file_list)
+    suffixed: List[str] = []
+    for name in file_list:
+        root, ext = os.path.splitext(name)
+        suffixed.append(f"{root}{suffix}{ext}")
+    return suffixed
+
+
+def build_dataset(
+    dataset_key: str,
+    args: argparse.Namespace,
+    norm_stats,
+) -> RefrigerationDataset:
+    eval_files = apply_suffix(resolve_dataset_files(dataset_key), args.dataset_suffix)
+
+    print(f"\nLoading evaluation dataset '{dataset_key}' ({len(eval_files)} file(s)):")
+    for f in eval_files:
+        print(f"  - {f}")
+    eval_dataset = RefrigerationDataset(
+        data_files=eval_files,
+        window_size=args.window_size,
+        stride=max(1, args.stride),
+        data_dir=args.data_dir,
+        normalize=True,
+        normalization_stats=norm_stats,
+    )
+    return eval_dataset
+
+
+def gather_time_series(
+    model: torch.nn.Module,
+    dataset: RefrigerationDataset,
+    loader: DataLoader,
+    device: torch.device,
+    amp_enabled: bool,
+    sensor_index: Optional[int],
+    max_windows: Optional[int],
+    include_values: bool,
+) -> pd.DataFrame:
+    base_model = unwrap_model(model)
+    records: List[dict] = []
+    sample_counter = 0
+
+    model.eval()
+    with torch.no_grad():
+        for raw_batch in loader:
+            batch_size = raw_batch.num_graphs
+            sample_indices = range(sample_counter, sample_counter + batch_size)
+            sample_counter += batch_size
+
+            with autocast("cuda", enabled=amp_enabled):
+                (recon, edge_index, edge_attr), batch_obj = forward_model(
+                    model,
+                    raw_batch,
+                    device,
+                    return_graph=True,
+                )
+                target = batch_obj.x.unsqueeze(-1)
+
+            per_timestep = base_model.compute_anomaly_scores_per_timestep(
+                target, recon, edge_index, edge_attr
+            ).detach().cpu()
+
+            if include_values and sensor_index is not None:
+                target_np = target.detach().cpu().numpy()
+                recon_np = recon.detach().cpu().numpy()
+                window = dataset.window_size
+                n_nodes = dataset.n_measurement_vars
+                target_np = target_np.reshape(batch_size, n_nodes, window, -1).squeeze(-1)
+                recon_np = recon_np.reshape(batch_size, n_nodes, window, -1).squeeze(-1)
+
+            for local_idx, sample_idx in enumerate(sample_indices):
+                window_start, window_end = dataset.windows[sample_idx]
+                window_timestamps = (
+                    dataset.data.iloc[window_start:window_end]["Timestamp"]
+                    .reset_index(drop=True)
+                )
+                anomaly_series = per_timestep[local_idx].numpy()
+
+                if include_values and sensor_index is not None:
+                    actual_series = target_np[local_idx, sensor_index]
+                    recon_series = recon_np[local_idx, sensor_index]
+                for step_idx, ts in enumerate(window_timestamps):
+                    entry = {
+                        "timestamp": ts,
+                        "sample_id": sample_idx,
+                        "timestep_index": step_idx,
+                        "anomaly_score": float(anomaly_series[step_idx]),
+                    }
+                    if include_values and sensor_index is not None:
+                        entry["actual"] = float(actual_series[step_idx])
+                        entry["reconstructed"] = float(recon_series[step_idx])
+                    records.append(entry)
+
+                if max_windows is not None and (sample_idx + 1) >= max_windows:
+                    break
+
+            if max_windows is not None and sample_counter >= max_windows:
+                break
+
+    if not records:
+        raise RuntimeError("No data collected; check dataset, stride, and max_windows settings.")
+
+    df = pd.DataFrame.from_records(records)
+    df.sort_values(["timestamp", "sample_id", "timestep_index"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def aggregate_by_timestamp(
+    df: pd.DataFrame,
+    denormalize: bool,
+    dataset: RefrigerationDataset,
+    sensor_index: Optional[int],
+    include_values: bool,
+) -> pd.DataFrame:
+    if include_values and sensor_index is not None:
+        grouped = df.groupby("timestamp", as_index=False)[["actual", "reconstructed", "anomaly_score"]].mean()
+    else:
+        grouped = df.groupby("timestamp", as_index=False)[["anomaly_score"]].mean()
+
+    if denormalize and include_values and sensor_index is not None:
+        mean = dataset.measurement_mean[sensor_index]
+        std = dataset.measurement_std[sensor_index]
+        grouped["actual"] = grouped["actual"] * std + mean
+        grouped["reconstructed"] = grouped["reconstructed"] * std + mean
+
+    return grouped
+
+
+def build_plot(
+    timeseries: pd.DataFrame,
+    sensor_name: str,
+    dataset_label: str,
+    include_values: bool,
+) -> go.Figure:
+    if include_values:
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(
+            go.Scatter(
+                x=timeseries["timestamp"],
+                y=timeseries["actual"],
+                name="Actual",
+                mode="lines",
+            ),
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=timeseries["timestamp"],
+                y=timeseries["reconstructed"],
+                name="Reconstructed",
+                mode="lines",
+            ),
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=timeseries["timestamp"],
+                y=timeseries["anomaly_score"],
+                name="Anomaly Score",
+                mode="lines",
+                line=dict(color="firebrick", dash="dot"),
+            ),
+            secondary_y=True,
+        )
+
+        title = f"{dataset_label} – {sensor_name}"
+        fig.update_layout(
+            title=title,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            hovermode="x unified",
+        )
+        fig.update_xaxes(title_text="Timestamp")
+        fig.update_yaxes(title_text="Sensor Value", secondary_y=False)
+        fig.update_yaxes(title_text="Anomaly Score", secondary_y=True)
+    else:
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=timeseries["timestamp"],
+                y=timeseries["anomaly_score"],
+                name="Anomaly Score",
+                mode="lines",
+                line=dict(color="firebrick"),
+            )
+        )
+        title = f"{dataset_label} – Anomaly Score"
+        fig.update_layout(
+            title=title,
+            hovermode="x unified",
+        )
+        fig.update_xaxes(title_text="Timestamp")
+        fig.update_yaxes(title_text="Anomaly Score")
+    return fig
+
+
+def main() -> None:
+    args = parse_args()
+
+    include_values = not args.anomaly_only
+    if include_values:
+        if args.sensor not in MEASUREMENT_VARS:
+            raise ValueError(
+                f"Sensor '{args.sensor}' not found in MEASUREMENT_VARS. "
+                f"Available sensors include: {MEASUREMENT_VARS[:5]}..."
+            )
+        sensor_index = MEASUREMENT_VARS.index(args.sensor)
+    else:
+        sensor_index = None
+        if args.denormalize:
+            print("Warning: --denormalize has no effect when --anomaly-only is set.")
+
+    dataset_keys: List[str] = []
+    if args.include_all_faults:
+        dataset_keys.append("baseline")
+        dataset_keys.extend(sorted(FAULT_FILES.keys()))
+    if args.datasets:
+        dataset_keys.extend(args.datasets)
+    if not dataset_keys:
+        dataset_keys.append(args.dataset)
+
+    seen = set()
+    ordered_keys: List[str] = []
+    for key in dataset_keys:
+        if key not in seen:
+            ordered_keys.append(key)
+            seen.add(key)
+    dataset_keys = ordered_keys
+
+    train_files = apply_suffix(BASELINE_FILES["train"], args.dataset_suffix)
+    print(f"\nLoading training dataset for normalization ({len(train_files)} file(s)):")
+    for f in train_files:
+        print(f"  - {f}")
+    train_dataset = RefrigerationDataset(
+        data_files=train_files,
+        window_size=args.window_size,
+        stride=max(1, args.stride),
+        data_dir=args.data_dir,
+        normalize=True,
+    )
+    norm_stats = train_dataset.get_normalization_stats()
+    del train_dataset
+
+    if args.device in ("auto", "cuda") and args.cuda_device is None:
+        if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+            os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
+
+    device, _ = resolve_devices(args.device, args.cuda_device, None)
+    amp_enabled = args.use_amp and device.type == "cuda"
+
+    control_var_names = get_control_variable_names(args.data_dir)
+    model = init_model(device, args.window_size, len(control_var_names))
+
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        checkpoint = checkpoint["state_dict"]
+    missing = model.load_state_dict(checkpoint, strict=False)
+    if missing.missing_keys:
+        print(f"Missing keys when loading checkpoint: {missing.missing_keys}")
+    if missing.unexpected_keys:
+        print(f"Unexpected keys when loading checkpoint: {missing.unexpected_keys}")
+
+    multi_dataset = len(dataset_keys) > 1
+
+    if args.output_html:
+        html_candidate = Path(args.output_html)
+        if html_candidate.suffix and multi_dataset:
+            raise ValueError("--output-html must be a directory when processing multiple datasets.")
+        if html_candidate.suffix:
+            html_override = html_candidate
+            base_html_dir = html_candidate.parent
+        else:
+            html_override = None
+            base_html_dir = html_candidate
+    else:
+        html_override = None
+        base_html_dir = Path("outputs/plotly")
+
+    if args.output_csv:
+        csv_candidate = Path(args.output_csv)
+        if csv_candidate.suffix and multi_dataset:
+            raise ValueError("--output-csv must be a directory when processing multiple datasets.")
+        if csv_candidate.suffix:
+            csv_override = csv_candidate
+            base_csv_dir = csv_candidate.parent
+        else:
+            csv_override = None
+            base_csv_dir = csv_candidate
+    else:
+        csv_override = None
+        base_csv_dir = base_html_dir
+
+    label_for_naming = args.sensor if include_values else "anomaly_score"
+    safe_sensor = label_for_naming.replace("/", "_").replace(" ", "_")
+
+    file_suffix = "reconstruction" if include_values else "anomaly"
+
+    for dataset_key in dataset_keys:
+        print(f"\n=== Processing dataset: {dataset_key} ===")
+        dataset = build_dataset(dataset_key, args, norm_stats)
+
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+
+        print("Collecting reconstruction time series...")
+        raw_df = gather_time_series(
+            model=model,
+            dataset=dataset,
+            loader=loader,
+            device=device,
+            amp_enabled=amp_enabled,
+            sensor_index=sensor_index,
+            max_windows=args.max_windows,
+            include_values=include_values,
+        )
+
+        timeseries = aggregate_by_timestamp(
+            raw_df,
+            denormalize=args.denormalize,
+            dataset=dataset,
+            sensor_index=sensor_index,
+            include_values=include_values,
+        )
+
+        if html_override and not multi_dataset:
+            html_path = html_override
+            html_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            html_dir = base_html_dir if not multi_dataset else base_html_dir / dataset_key
+            html_dir.mkdir(parents=True, exist_ok=True)
+            safe_dataset = dataset_key.replace("/", "_").replace(" ", "_")
+            html_path = html_dir / f"{safe_dataset}_{safe_sensor}_{file_suffix}.html"
+
+        fig = build_plot(timeseries, label_for_naming, dataset_key, include_values)
+        fig.write_html(str(html_path), include_plotlyjs="cdn")
+        print(f"Saved Plotly visualization to {html_path}")
+
+        if csv_override and not multi_dataset:
+            csv_path = csv_override
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            csv_dir = base_csv_dir if not multi_dataset else base_csv_dir / dataset_key
+            csv_dir.mkdir(parents=True, exist_ok=True)
+            safe_dataset = dataset_key.replace("/", "_").replace(" ", "_")
+            csv_path = csv_dir / f"{safe_dataset}_{safe_sensor}_{file_suffix}.csv"
+
+        timeseries.to_csv(csv_path, index=False)
+        print(f"Wrote aggregated time-series data to {csv_path}")
+
+
+if __name__ == "__main__":
+    main()

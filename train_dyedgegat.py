@@ -21,7 +21,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dyedgegat"))
 
 from src.config import cfg
 from src.data.dataloader import create_dataloaders
-from src.data.column_config import MEASUREMENT_VARS, CONTROL_VARS
+from src.data.dataset import get_control_variable_names
+from src.data.column_config import MEASUREMENT_VARS
 from src.model.dyedgegat import DyEdgeGAT
 from src.utils.checkpoint import EpochCheckpointManager
 
@@ -195,11 +196,11 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return getattr(model, "module", model)
 
 
-def init_model(device: torch.device, window_size: int) -> DyEdgeGAT:
+def init_model(device: torch.device, window_size: int, ocvar_dim: int) -> DyEdgeGAT:
     cfg.set_dataset_params(
         n_nodes=len(MEASUREMENT_VARS),  # 142 nodes (measurement sensors)
         window_size=window_size,
-        ocvar_dim=len(CONTROL_VARS),  # 10 control variables
+        ocvar_dim=ocvar_dim,
     )
     cfg.device = str(device)
     cfg.validate()
@@ -409,7 +410,8 @@ def main() -> None:
                 print(f"{mode_desc} DyEdgeGAT on device: {device}")
             print("=" * 80)
 
-        model = init_model(device, args.window_size)
+        control_var_names = get_control_variable_names(args.data_dir)
+        model = init_model(device, args.window_size, len(control_var_names))
 
         if args.checkpoint:
             if not os.path.isfile(args.checkpoint):

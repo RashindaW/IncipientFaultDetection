@@ -20,9 +20,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dyedgegat'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dyedgegat', 'src'))
 
 from src.data.dataloader import create_dataloaders
+from src.data.dataset import get_control_variable_names
 from src.model.dyedgegat import DyEdgeGAT
 from src.config import cfg
-from src.data.column_config import MEASUREMENT_VARS, CONTROL_VARS
+from src.data.column_config import MEASUREMENT_VARS
 
 
 def test_model():
@@ -32,10 +33,12 @@ def test_model():
     
     # ========== Step 1: Configuration ==========
     print("\n[1/6] Setting up configuration...")
+    data_dir = 'Dataset'
+    control_var_names = get_control_variable_names(data_dir)
     cfg.set_dataset_params(
         n_nodes=len(MEASUREMENT_VARS),  # 142 nodes (measurement sensors)
         window_size=WINDOW_SIZE,
-        ocvar_dim=len(CONTROL_VARS)  # 10 control variables
+        ocvar_dim=len(control_var_names)  # Control variables (may include time encodings)
     )
     cfg.validate()
     print(f"✅ Config: {cfg.dataset.n_nodes} nodes, window={cfg.dataset.window_size}, "
@@ -48,7 +51,7 @@ def test_model():
         batch_size=4,  # Small batch for testing
         train_stride=100,  # Large stride for quick test
         val_stride=100,
-        data_dir='Dataset',
+        data_dir=data_dir,
         num_workers=0,
     )
     print(f"✅ DataLoaders created:")
