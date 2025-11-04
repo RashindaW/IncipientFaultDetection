@@ -38,6 +38,7 @@ checkpoints/
 Dataset/
 data/
 datasets/
+TEP\ dataset/
 *.csv
 *.tsv
 *.parquet
@@ -65,4 +66,3 @@ build/
 dist/
 *.egg-info/
 *.egg
-
