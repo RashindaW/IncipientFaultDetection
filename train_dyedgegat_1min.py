@@ -8,10 +8,15 @@ Usage:
 from train_dyedgegat import main as _main
 
 
-def _ensure_data_dir_arg(default_path: str = "Dataset_1min") -> None:
+def _ensure_dataset_args(
+    default_key: str = "co2_1min",
+    default_path: str = "data/co2/1min",
+) -> None:
     import sys
 
     argv = sys.argv
+    if not any(token == "--dataset-key" or token.startswith("--dataset-key=") for token in argv[1:]):
+        argv.extend(["--dataset-key", default_key])
     for token in argv[1:]:
         if token == "--data-dir":
             return
@@ -24,7 +29,7 @@ def _ensure_data_dir_arg(default_path: str = "Dataset_1min") -> None:
 def main() -> None:
     # Delegate to the standard training entrypoint while overriding the default dataset path
     # when the caller does not explicitly provide one.
-    _ensure_data_dir_arg()
+    _ensure_dataset_args()
     _main()
 
 

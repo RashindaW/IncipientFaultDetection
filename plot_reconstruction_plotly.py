@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Iterable, List, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -19,12 +19,7 @@ from torch.amp import autocast
 from torch_geometric.loader import DataLoader
 
 from train_dyedgegat import forward_model, init_model, resolve_devices, unwrap_model
-from dyedgegat.src.data.dataset import RefrigerationDataset, get_control_variable_names
-from dyedgegat.src.data.column_config import (
-    BASELINE_FILES,
-    FAULT_FILES,
-    MEASUREMENT_VARS,
-)
+from datasets import get_adapter, list_adapter_keys
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,9 +31,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint (.pt).")
     parser.add_argument(
+        "--dataset-key",
+        default="co2",
+        choices=list_adapter_keys(),
+        help="Dataset adapter to use for loading data (e.g., 'co2', 'co2_1min').",
+    )
+    parser.add_argument(
         "--data-dir",
-        default="Dataset",
-        help="Root directory containing the CSV files.",
+        default=None,
+        help="Override dataset directory (adapter default used when omitted).",
     )
     parser.add_argument(
         "--dataset",
@@ -64,8 +65,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--sensor",
-        default=MEASUREMENT_VARS[0],
-        help="Measurement variable name to plot.",
+        default=None,
+        help="Measurement variable name to plot (defaults to the first channel of the dataset).",
     )
     parser.add_argument(
         "--window-size",
@@ -137,23 +138,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_dataset_files(dataset_key: str) -> List[str]:
-    key = dataset_key.lower()
-    if key in ("baseline", "val"):
-        return BASELINE_FILES["val"]
-    if key == "train":
-        return BASELINE_FILES["train"]
-    if dataset_key in FAULT_FILES:
-        return [FAULT_FILES[dataset_key]]
-    for fault_name, fault_file in FAULT_FILES.items():
-        if fault_name.lower() == key:
-            return [fault_file]
-    raise ValueError(
-        f"Unknown dataset '{dataset_key}'. Valid options: 'train', 'baseline', 'val', "
-        f"or one of {list(FAULT_FILES.keys())}"
-    )
-
-
 def apply_suffix(file_list: Iterable[str], suffix: str) -> List[str]:
     if not suffix:
         return list(file_list)
@@ -165,20 +149,42 @@ def apply_suffix(file_list: Iterable[str], suffix: str) -> List[str]:
 
 
 def build_dataset(
+    adapter,
     dataset_key: str,
     args: argparse.Namespace,
-    norm_stats,
-) -> RefrigerationDataset:
-    eval_files = apply_suffix(resolve_dataset_files(dataset_key), args.dataset_suffix)
+    data_dir: str,
+) -> any:
+    dataset_cls = adapter.dataset_cls
+    if dataset_cls is None:
+        raise NotImplementedError(
+            f"Dataset adapter '{adapter.key}' does not yet provide a dataset implementation."
+        )
 
-    print(f"\nLoading evaluation dataset '{dataset_key}' ({len(eval_files)} file(s)):")
-    for f in eval_files:
+    eval_sources = apply_suffix(adapter.resolve_split_files(dataset_key), args.dataset_suffix)
+    train_sources = apply_suffix(adapter.resolve_split_files("train"), args.dataset_suffix)
+
+    print(f"\nLoading training dataset for normalization ({len(train_sources)} file(s)):")
+    for f in train_sources:
         print(f"  - {f}")
-    eval_dataset = RefrigerationDataset(
-        data_files=eval_files,
+    train_dataset = dataset_cls(
+        data_files=train_sources,
         window_size=args.window_size,
         stride=max(1, args.stride),
-        data_dir=args.data_dir,
+        data_dir=data_dir,
+        normalize=True,
+    )
+    norm_stats = train_dataset.get_normalization_stats()
+    del train_dataset
+
+    print(f"\nLoading evaluation dataset '{dataset_key}' ({len(eval_sources)} file(s)):")
+    for f in eval_sources:
+        print(f"  - {f}")
+
+    eval_dataset = dataset_cls(
+        data_files=eval_sources,
+        window_size=args.window_size,
+        stride=max(1, args.stride),
+        data_dir=data_dir,
         normalize=True,
         normalization_stats=norm_stats,
     )
@@ -187,7 +193,7 @@ def build_dataset(
 
 def gather_time_series(
     model: torch.nn.Module,
-    dataset: RefrigerationDataset,
+    dataset,
     loader: DataLoader,
     device: torch.device,
     amp_enabled: bool,
@@ -268,7 +274,7 @@ def gather_time_series(
 def aggregate_by_timestamp(
     df: pd.DataFrame,
     denormalize: bool,
-    dataset: RefrigerationDataset,
+    dataset,
     sensor_index: Optional[int],
     include_values: bool,
 ) -> pd.DataFrame:
@@ -356,15 +362,42 @@ def build_plot(
 def main() -> None:
     args = parse_args()
 
+    adapter = get_adapter(args.dataset_key)
+    adapter.ensure("plotting")
+    data_dir = args.data_dir or adapter.get_default_data_dir()
+    if data_dir is None:
+        raise ValueError(
+            f"Dataset adapter '{args.dataset_key}' does not define a default data directory; "
+            "specify one with --data-dir."
+        )
+
+    print(f"Dataset adapter : {adapter.key}")
+    print(f"Data directory  : {data_dir}")
+
+    measurement_vars = list(adapter.measurement_vars)
+    if not measurement_vars:
+        print(
+            f"Warning: dataset adapter '{adapter.key}' does not expose measurement variables. "
+            "Plotting of reconstructed sensor values will be unavailable."
+        )
+
     include_values = not args.anomaly_only
     if include_values:
-        if args.sensor not in MEASUREMENT_VARS:
+        if not measurement_vars:
             raise ValueError(
-                f"Sensor '{args.sensor}' not found in MEASUREMENT_VARS. "
-                f"Available sensors include: {MEASUREMENT_VARS[:5]}..."
+                f"Dataset '{adapter.key}' does not define measurement variables; "
+                "use --anomaly-only instead."
             )
-        sensor_index = MEASUREMENT_VARS.index(args.sensor)
+        sensor_name = args.sensor or measurement_vars[0]
+        if sensor_name not in measurement_vars:
+            preview = ", ".join(measurement_vars[:5]) + ("..." if len(measurement_vars) > 5 else "")
+            raise ValueError(
+                f"Sensor '{sensor_name}' not found in dataset '{adapter.key}'. "
+                f"Available examples: {preview}"
+            )
+        sensor_index = measurement_vars.index(sensor_name)
     else:
+        sensor_name = args.sensor
         sensor_index = None
         if args.denormalize:
             print("Warning: --denormalize has no effect when --anomaly-only is set.")
@@ -372,7 +405,10 @@ def main() -> None:
     dataset_keys: List[str] = []
     if args.include_all_faults:
         dataset_keys.append("baseline")
-        dataset_keys.extend(sorted(FAULT_FILES.keys()))
+        fault_keys = adapter.list_fault_keys()
+        if not fault_keys:
+            print(f"Warning: dataset '{adapter.key}' does not define fault splits; skipping include-all-faults.")
+        dataset_keys.extend(fault_keys)
     if args.datasets:
         dataset_keys.extend(args.datasets)
     if not dataset_keys:
@@ -386,20 +422,6 @@ def main() -> None:
             seen.add(key)
     dataset_keys = ordered_keys
 
-    train_files = apply_suffix(BASELINE_FILES["train"], args.dataset_suffix)
-    print(f"\nLoading training dataset for normalization ({len(train_files)} file(s)):")
-    for f in train_files:
-        print(f"  - {f}")
-    train_dataset = RefrigerationDataset(
-        data_files=train_files,
-        window_size=args.window_size,
-        stride=max(1, args.stride),
-        data_dir=args.data_dir,
-        normalize=True,
-    )
-    norm_stats = train_dataset.get_normalization_stats()
-    del train_dataset
-
     if args.device in ("auto", "cuda") and args.cuda_device is None:
         if not os.environ.get("CUDA_VISIBLE_DEVICES"):
             os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
@@ -407,8 +429,13 @@ def main() -> None:
     device, _ = resolve_devices(args.device, args.cuda_device, None)
     amp_enabled = args.use_amp and device.type == "cuda"
 
-    control_var_names = get_control_variable_names(args.data_dir)
-    model = init_model(device, args.window_size, len(control_var_names))
+    control_var_names = adapter.get_control_variables(data_dir)
+    model = init_model(
+        device,
+        args.window_size,
+        len(control_var_names),
+        adapter.measurement_count(),
+    )
 
     checkpoint = torch.load(args.checkpoint, map_location=device)
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
@@ -449,14 +476,14 @@ def main() -> None:
         csv_override = None
         base_csv_dir = base_html_dir
 
-    label_for_naming = args.sensor if include_values else "anomaly_score"
+    label_for_naming = sensor_name if include_values else "anomaly_score"
     safe_sensor = label_for_naming.replace("/", "_").replace(" ", "_")
 
     file_suffix = "reconstruction" if include_values else "anomaly"
 
     for dataset_key in dataset_keys:
         print(f"\n=== Processing dataset: {dataset_key} ===")
-        dataset = build_dataset(dataset_key, args, norm_stats)
+        dataset = build_dataset(adapter, dataset_key, args, data_dir)
 
         loader = DataLoader(
             dataset,

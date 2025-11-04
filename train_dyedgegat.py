@@ -9,6 +9,7 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -20,9 +21,7 @@ from torch_geometric.data import Batch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dyedgegat"))
 
 from src.config import cfg
-from src.data.dataloader import create_dataloaders
-from src.data.dataset import get_control_variable_names
-from src.data.column_config import MEASUREMENT_VARS
+from datasets import get_adapter, list_adapter_keys
 from src.model.dyedgegat import DyEdgeGAT
 from src.utils.checkpoint import EpochCheckpointManager
 
@@ -47,7 +46,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Optimizer learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay (L2 regularization)")
-    parser.add_argument("--data-dir", type=str, default="Dataset", help="Directory containing CSV files")
+    parser.add_argument(
+        "--dataset-key",
+        type=str,
+        default="co2",
+        choices=list_adapter_keys(),
+        help="Dataset adapter to use (e.g., 'co2', 'co2_1min').",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Override dataset directory (defaults to adapter recommendation).",
+    )
     parser.add_argument(
         "--device",
         type=str,
@@ -196,9 +207,9 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return getattr(model, "module", model)
 
 
-def init_model(device: torch.device, window_size: int, ocvar_dim: int) -> DyEdgeGAT:
+def init_model(device: torch.device, window_size: int, ocvar_dim: int, n_nodes: int) -> DyEdgeGAT:
     cfg.set_dataset_params(
-        n_nodes=len(MEASUREMENT_VARS),  # 142 nodes (measurement sensors)
+        n_nodes=n_nodes,
         window_size=window_size,
         ocvar_dim=ocvar_dim,
     )
@@ -401,17 +412,49 @@ def main() -> None:
         if device.type == "cuda":
             torch.backends.cudnn.benchmark = True
 
+        adapter = get_adapter(args.dataset_key)
+        adapter.ensure("training")
+        data_dir = args.data_dir or adapter.get_default_data_dir()
+        if data_dir is None:
+            raise ValueError(
+                f"Dataset adapter '{args.dataset_key}' does not define a default data directory; "
+                "please supply --data-dir."
+            )
+
+        control_var_names = adapter.get_control_variables(data_dir)
+        model = init_model(
+            device,
+            args.window_size,
+            len(control_var_names),
+            adapter.measurement_count(),
+        )
+
+        checkpoint_root = args.checkpoint_dir or os.path.join("checkpoints", adapter.key)
+        checkpoint_root_path = Path(checkpoint_root).expanduser().resolve()
+        if args.save_model:
+            save_model_path: Optional[Path] = Path(args.save_model).expanduser().resolve()
+        elif not args.eval_only:
+            save_model_path = checkpoint_root_path / f"dyedgegat_{adapter.key}_best.pt"
+        else:
+            save_model_path = None
+        if save_model_path is not None:
+            save_model_path.parent.mkdir(parents=True, exist_ok=True)
+
         if is_main_process:
             print("=" * 80)
             mode_desc = "Evaluating" if args.eval_only else "Training"
             if distributed:
-                print(f"{mode_desc} DyEdgeGAT with DistributedDataParallel on {world_size} GPUs")
+                print(
+                    f"{mode_desc} DyEdgeGAT ({args.dataset_key}) with DistributedDataParallel on {world_size} GPUs"
+                )
             else:
-                print(f"{mode_desc} DyEdgeGAT on device: {device}")
+                print(f"{mode_desc} DyEdgeGAT ({args.dataset_key}) on device: {device}")
+            print(f"Data directory: {data_dir}")
+            if not args.eval_only:
+                print(f"Checkpoint root: {checkpoint_root_path}")
+            if save_model_path is not None:
+                print(f"Final model will be saved to: {save_model_path}")
             print("=" * 80)
-
-        control_var_names = get_control_variable_names(args.data_dir)
-        model = init_model(device, args.window_size, len(control_var_names))
 
         if args.checkpoint:
             if not os.path.isfile(args.checkpoint):
@@ -444,13 +487,13 @@ def main() -> None:
 
         effective_test_stride = args.test_stride if args.test_stride is not None else args.val_stride
 
-        train_loader, val_loader, test_loaders = create_dataloaders(
+        train_loader, val_loader, test_loaders = adapter.create_dataloaders(
             window_size=cfg.dataset.window_size,
             batch_size=args.batch_size,
             train_stride=args.train_stride,
             val_stride=args.val_stride,
             test_stride=effective_test_stride,
-            data_dir=args.data_dir,
+            data_dir=data_dir,
             num_workers=args.num_workers,
             distributed=distributed,
             rank=rank,
@@ -462,8 +505,10 @@ def main() -> None:
         checkpoint_manager = None
 
         if not args.eval_only:
-            if is_main_process and args.checkpoint_dir:
-                checkpoint_manager = EpochCheckpointManager(args.checkpoint_dir, prefix="dyedgegat")
+            checkpoint_manager = EpochCheckpointManager(
+                str(checkpoint_root_path), prefix=f"dyedgegat_{args.dataset_key}"
+            )
+            if is_main_process:
                 print(f"\nSaving per-epoch checkpoints to: {checkpoint_manager.run_path}")
 
             for epoch in range(1, args.epochs + 1):
@@ -518,10 +563,10 @@ def main() -> None:
             elif is_main_process:
                 print("\nWarning: No improvement over initial epoch.")
 
-            if is_main_process and args.save_model:
+            if is_main_process and save_model_path is not None:
                 state_to_save = best_state if best_state is not None else base_model.state_dict()
-                torch.save(state_to_save, args.save_model)
-                print(f"\nSaved model checkpoint to: {args.save_model}")
+                torch.save(state_to_save, save_model_path)
+                print(f"\nSaved model checkpoint to: {save_model_path}")
         else:
             if is_main_process:
                 print("\nEvaluation-only mode: skipping training loop.")

@@ -35,10 +35,7 @@ checkpoints/
 *.ckpt
 *.pdf
 # Datasets and large data directories
-Dataset/
 data/
-datasets/
-TEP\ dataset/
 *.csv
 *.tsv
 *.parquet

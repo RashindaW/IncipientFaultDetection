@@ -19,11 +19,11 @@ WINDOW_SIZE = 60
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dyedgegat'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dyedgegat', 'src'))
 
-from src.data.dataloader import create_dataloaders
-from src.data.dataset import get_control_variable_names
+from datasets import get_adapter
 from src.model.dyedgegat import DyEdgeGAT
 from src.config import cfg
-from src.data.column_config import MEASUREMENT_VARS
+
+DATASET_KEY = "co2"
 
 
 def test_model():
@@ -33,10 +33,17 @@ def test_model():
     
     # ========== Step 1: Configuration ==========
     print("\n[1/6] Setting up configuration...")
-    data_dir = 'Dataset'
-    control_var_names = get_control_variable_names(data_dir)
+    adapter = get_adapter(DATASET_KEY)
+    adapter.ensure("testing")
+    data_dir = adapter.get_default_data_dir()
+    if data_dir is None:
+        raise ValueError(
+            f"Dataset adapter '{DATASET_KEY}' does not define a default data directory. "
+            "Please set DATASET_KEY or pass --data-dir when invoking this script."
+        )
+    control_var_names = adapter.get_control_variables(data_dir)
     cfg.set_dataset_params(
-        n_nodes=len(MEASUREMENT_VARS),  # 142 nodes (measurement sensors)
+        n_nodes=adapter.measurement_count(),
         window_size=WINDOW_SIZE,
         ocvar_dim=len(control_var_names)  # Control variables (may include time encodings)
     )
@@ -46,11 +53,12 @@ def test_model():
     
     # ========== Step 2: Create DataLoaders ==========
     print("\n[2/6] Creating dataloaders...")
-    train_loader, val_loader, test_loaders = create_dataloaders(
+    train_loader, val_loader, test_loaders = adapter.create_dataloaders(
         window_size=cfg.dataset.window_size,
         batch_size=4,  # Small batch for testing
         train_stride=100,  # Large stride for quick test
         val_stride=100,
+        test_stride=100,
         data_dir=data_dir,
         num_workers=0,
     )
