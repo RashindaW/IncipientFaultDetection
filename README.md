@@ -53,9 +53,12 @@ Built-in adapters:
 |------------|---------------------------------------------------|-----------------------|-------------------|
 | `co2`      | CO₂ refrigeration benchmark (original cadence)    | `data/co2/raw`        | Training-ready    |
 | `co2_1min` | CO₂ refrigeration benchmark (1-minute aggregation)| `data/co2/1min`       | Training-ready    |
+| `ashrae`   | ASHRAE 1043-RP water-cooled chiller (XLS files)   | `data/ASHRAE_1043_RP` | Training-ready    |
 | `tep`      | Tennessee Eastman Process (RData)                 | `data/tep/raw`        | Scaffolding only* |
 
 `tep` is registered so you can extend it later, but all capabilities currently raise `NotImplementedError` until preprocessing and dataloaders are implemented.
+
+> **ASHRAE Dataset**: See [ASHRAE_INTEGRATION.md](ASHRAE_INTEGRATION.md) for detailed documentation on the ASHRAE 1043-RP dataset integration, including training on benchmark tests and testing on refrigerant leak scenarios.
 
 Adapters are selected via the new `--dataset-key` argument across training, testing, and plotting scripts. You can override the default location with `--data-dir` when needed.
 
