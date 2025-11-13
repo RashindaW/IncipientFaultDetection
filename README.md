@@ -58,7 +58,7 @@ Built-in adapters:
 
 `tep` is registered so you can extend it later, but all capabilities currently raise `NotImplementedError` until preprocessing and dataloaders are implemented.
 
-> **ASHRAE Dataset**: See [ASHRAE_INTEGRATION.md](ASHRAE_INTEGRATION.md) for detailed documentation on the ASHRAE 1043-RP dataset integration, including training on benchmark tests and testing on refrigerant leak scenarios.
+> **ASHRAE dataset**: Training uses the “Benchmark Tests” XLS files (normal and near‑normal operation) while testing targets the “Refrigerant leak” scenarios. The adapter loads the native spreadsheets directly (requires `xlrd`) so no additional conversion step is needed.
 
 Adapters are selected via the new `--dataset-key` argument across training, testing, and plotting scripts. You can override the default location with `--data-dir` when needed.
 
@@ -72,7 +72,7 @@ Adapters are selected via the new `--dataset-key` argument across training, test
 - `--epochs` – number of training epochs (default 10).
 - `--batch-size` – per-GPU batch size.
 - `--train-stride`, `--val-stride`, `--test-stride` – sliding-window strides.
-- `--dataset-key` – dataset adapter to use (`co2`, `co2_1min`, `tep`).
+- `--dataset-key` – dataset adapter to use (`co2`, `co2_1min`, `ashrae`, `tep`).
 - `--data-dir` – override the adapter's default data directory when needed.
 - `--use-amp` – enable automatic mixed precision on CUDA.
 - `--checkpoint` – optional weight file to resume from or evaluate.
