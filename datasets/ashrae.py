@@ -12,6 +12,8 @@ from dyedgegat.src.data.ashrae_column_config import (
     MEASUREMENT_VARS,
     BENCHMARK_DIR,
     REFRIGERANT_LEAK_DIR,
+    BASELINE_FAULT_CODE_WHITELIST,
+    BASELINE_UNIT_STATUS_WHITELIST,
 )
 from dyedgegat.src.data.ashrae_dataset import (
     ASHRAEDataset, 
@@ -99,12 +101,18 @@ def _create_dataloaders(
     # ========== Create Training Dataset ==========
     print("\n[1/3] Creating TRAINING dataset (Benchmark Tests)...")
     train_files = [os.path.join(BENCHMARK_DIR, f) for f in BASELINE_FILES['train']]
+    filter_kwargs = dict(
+        fault_code_whitelist=BASELINE_FAULT_CODE_WHITELIST,
+        unit_status_whitelist=BASELINE_UNIT_STATUS_WHITELIST,
+    )
+
     train_dataset = ASHRAEDataset(
         data_files=train_files,
         window_size=window_size,
         stride=train_stride,
         data_dir=data_dir,
         normalize=True,
+        **filter_kwargs,
     )
     
     # Get normalization statistics from training data
@@ -120,6 +128,7 @@ def _create_dataloaders(
         data_dir=data_dir,
         normalize=True,
         normalization_stats=norm_stats,  # Use training stats
+        **filter_kwargs,
     )
     
     # ========== Create Test Datasets ==========
@@ -135,6 +144,7 @@ def _create_dataloaders(
         data_dir=data_dir,
         normalize=True,
         normalization_stats=norm_stats,
+        **filter_kwargs,
     )
     test_datasets['baseline'] = baseline_test_dataset
     
@@ -262,4 +272,3 @@ register_adapter(
         list_fault_keys_fn=_list_faults,
     )
 )
-
