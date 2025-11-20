@@ -69,6 +69,7 @@ def _create_dataloaders(
     distributed: bool,
     rank: int,
     world_size: int,
+    baseline_from: str = "val",
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     """
     Create train, validation, and test dataloaders for ASHRAE dataset.
@@ -137,8 +138,11 @@ def _create_dataloaders(
     
     # Baseline test (normal operation)
     print("  - Baseline (near normal operation)")
+    if baseline_from not in ("val", "train"):
+        raise ValueError(f"baseline_from must be 'val' or 'train', got {baseline_from}")
+    baseline_source_files = val_files if baseline_from == "val" else train_files
     baseline_test_dataset = ASHRAEDataset(
-        data_files=val_files,
+        data_files=baseline_source_files,
         window_size=window_size,
         stride=test_stride,
         data_dir=data_dir,
@@ -244,6 +248,7 @@ def _create_dataloaders(
     for name, loader in test_loaders.items():
         print(f"  {name:30s}: {len(loader.dataset):6d} samples, {len(loader):4d} batches")
     print()
+    print(f"Baseline test source: {baseline_from} split")
     print(f"Data dimensions:")
     print(f"  Measurement variables: {train_dataset.n_measurement_vars}")
     print(f"  Control variables: {train_dataset.n_control_vars}")

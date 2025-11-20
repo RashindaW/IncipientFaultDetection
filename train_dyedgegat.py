@@ -1,9 +1,3 @@
-"""
-Training script for DyEdgeGAT on the refrigeration system dataset.
-
-Usage:
-    conda run -n rashindaNew-torch-env python train_dyedgegat.py --epochs 10
-"""
 
 import argparse
 import os
@@ -11,6 +5,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import numpy as np
+import matplotlib.pyplot as plt
 
 import torch
 import torch.distributed as dist
@@ -45,6 +41,12 @@ def parse_args() -> argparse.Namespace:
         default=60,
         help="Temporal window size (number of timesteps) for sliding windows.",
     )
+    parser.add_argument(
+        "--anomaly-weight",
+        type=float,
+        default=0.0,
+        help="Weight for topology-aware anomaly score penalty added to training loss (0 disables).",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Optimizer learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay (L2 regularization)")
     parser.add_argument(
@@ -76,7 +78,7 @@ def parse_args() -> argparse.Namespace:
         "--cuda-devices",
         type=str,
         default=None,
-        help="Comma separated CUDA device indices for multi-GPU training (e.g., '0,1').",
+        help="Comma separated CUDA device indices (single value only, e.g., '0').",
     )
     parser.add_argument("--save-model", type=str, default=None, help="Optional path to save best model state_dict")
     parser.add_argument(
@@ -95,6 +97,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Checkpoint path to load before evaluation or to warm-start training.",
+    )
+    parser.add_argument(
+        "--baseline-from",
+        type=str,
+        choices=["val", "train"],
+        default="val",
+        help="Source split for the baseline (normal) test loader; default reuses validation files.",
     )
     parser.add_argument(
         "--num-workers",
@@ -177,7 +186,7 @@ def resolve_devices(
             raise ValueError("Use either --cuda-device or --cuda-devices, not both.")
         if len(multi_device_ids) > 1:
             raise ValueError(
-                "Multi-GPU with --cuda-devices is no longer supported. Launch with torchrun for distributed training."
+                "Only single-GPU execution is supported; pass one index (e.g., --cuda-devices 0)."
             )
         cuda_index = multi_device_ids[0]
         multi_device_ids = None
@@ -305,15 +314,33 @@ def train_epoch(
     distributed: bool = False,
     scaler: Optional[GradScaler] = None,
     amp_enabled: bool = False,
-) -> float:
+) -> Tuple[float, float, float]:
     model.train()
-    running_loss = 0.0
+    base_model = unwrap_model(model)
+    use_graph = getattr(cfg, "anomaly_weight", 0.0) > 0.0
+    running_total_loss = 0.0
+    running_recon_loss = 0.0
+    running_anom = 0.0
     sample_count = 0
 
     for raw_batch in loader:
         optimizer.zero_grad(set_to_none=True)
         with autocast("cuda", enabled=amp_enabled):
-            loss, batch_obj = compute_recon_loss(model, raw_batch, criterion, device)
+            if use_graph:
+                (recon, edge_index, edge_attr), batch_obj = forward_model(
+                    model, raw_batch, device, return_graph=True
+                )
+            else:
+                recon, batch_obj = forward_model(model, raw_batch, device, return_graph=False)
+
+            target = batch_obj.x.unsqueeze(-1)
+            recon_loss = criterion(recon, target)
+            anom_score = torch.tensor(0.0, device=device)
+            if use_graph:
+                anom_score = base_model.compute_topology_aware_anomaly_score(
+                    target, recon, edge_index, edge_attr
+                )
+            loss = recon_loss + cfg.anomaly_weight * anom_score
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -324,15 +351,26 @@ def train_epoch(
             optimizer.step()
 
         batch_size = batch_obj.num_graphs
-        running_loss += loss.detach().item() * batch_size
+        running_total_loss += loss.detach().item() * batch_size
+        running_recon_loss += recon_loss.detach().item() * batch_size
+        running_anom += anom_score.detach().item() * batch_size
         sample_count += batch_size
 
-    totals = torch.tensor([running_loss, sample_count], device=device, dtype=torch.float64)
+    totals = torch.tensor(
+        [running_total_loss, running_recon_loss, running_anom, sample_count],
+        device=device,
+        dtype=torch.float64,
+    )
     if distributed:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
 
-    total_loss, total_samples = totals.tolist()
-    return float(total_loss / max(total_samples, 1.0))
+    total_loss, total_recon, total_anom, total_samples = totals.tolist()
+    denom = max(total_samples, 1.0)
+    return (
+        float(total_loss / denom),
+        float(total_recon / denom),
+        float(total_anom / denom),
+    )
 
 
 @torch.no_grad()
@@ -344,12 +382,14 @@ def evaluate(
     *,
     distributed: bool = False,
     amp_enabled: bool = False,
-) -> Tuple[float, float]:
+    return_scores: bool = False,
+) -> Tuple[float, float, Optional[np.ndarray]]:
     model.eval()
     base_model = unwrap_model(model)
     running_loss = 0.0
     running_score = 0.0
     sample_count = 0
+    all_scores = []
 
     for raw_batch in loader:
         with autocast("cuda", enabled=amp_enabled):
@@ -359,9 +399,18 @@ def evaluate(
             target = batch_obj.x.unsqueeze(-1)
             loss = criterion(recon, target)
 
+        # Compute aggregate score for metrics
         score = base_model.compute_topology_aware_anomaly_score(
             target, recon, edge_index, edge_attr
         )
+
+        # If detailed scores requested, compute per-sample scores
+        if return_scores:
+            # shape: [batch_size]
+            batch_scores = base_model.compute_anomaly_scores_per_sample(
+                target, recon, edge_index, edge_attr
+            )
+            all_scores.append(batch_scores.cpu().numpy())
 
         batch_size = batch_obj.num_graphs
         running_loss += loss.detach().item() * batch_size
@@ -374,30 +423,63 @@ def evaluate(
 
     total_loss, total_score, total_samples = totals.tolist()
     denom = max(total_samples, 1.0)
-    return float(total_loss / denom), float(total_score / denom)
+    
+    scores_array = None
+    if return_scores and all_scores:
+        scores_array = np.concatenate(all_scores)
+
+    return float(total_loss / denom), float(total_score / denom), scores_array
 
 
 @torch.no_grad()
-def evaluate_tests(
+def evaluate_tests_and_plot(
     model: DyEdgeGAT,
     loaders: Dict[str, torch.utils.data.DataLoader],
     criterion: torch.nn.Module,
     device: torch.device,
+    output_dir: str,
     *,
     distributed: bool = False,
     amp_enabled: bool = False,
 ) -> Dict[str, Dict[str, float]]:
     metrics: Dict[str, Dict[str, float]] = {}
+    os.makedirs(output_dir, exist_ok=True)
+    
+    print("\nGenerating anomaly score plots...")
+    
+    # Store all series to plot together or save
+    results_dict = {}
+
     for name, loader in loaders.items():
-        loss, score = evaluate(
+        loss, score, scores_array = evaluate(
             model,
             loader,
             criterion,
             device,
             distributed=distributed,
             amp_enabled=amp_enabled,
+            return_scores=True,
         )
         metrics[name] = {"recon_loss": loss, "anomaly_score": score}
+        
+        if scores_array is not None:
+            results_dict[name] = scores_array
+            
+            # Plot individual series
+            plt.figure(figsize=(12, 6))
+            plt.plot(scores_array, label=f'{name} (Avg: {score:.4f})')
+            plt.title(f"Anomaly Scores over Time - {name}")
+            plt.xlabel("Sample Index")
+            plt.ylabel("Anomaly Score")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.savefig(os.path.join(output_dir, f"anomaly_plot_{name}.png"))
+            plt.close()
+            
+    # Save raw scores for later analysis
+    np.savez(os.path.join(output_dir, "anomaly_scores.npz"), **results_dict)
+    print(f"Plots and scores saved to {output_dir}")
+            
     return metrics
 
 
@@ -405,17 +487,22 @@ def main() -> None:
     args = parse_args()
     if args.eval_only and not args.checkpoint:
         raise ValueError("--eval-only requires --checkpoint to be specified.")
-    distributed, rank, world_size, local_rank = init_distributed_mode(args.dist_backend)
-    is_main_process = (not distributed) or rank == 0
+    # Force single-GPU / single-process execution. Any torchrun/DDP environment
+    # variables are intentionally ignored.
+    distributed = False
+    rank = 0
+    world_size = 1
+    local_rank = 0
+    is_main_process = True
 
     try:
-        if distributed:
-            device = torch.device(f"cuda:{local_rank}")
-        else:
-            device, _ = resolve_devices(args.device, args.cuda_device, args.cuda_devices)
+        device, _ = resolve_devices(args.device, args.cuda_device, args.cuda_devices)
+        if "RANK" in os.environ or "WORLD_SIZE" in os.environ:
+            print("Single-GPU mode enforced; ignoring torchrun/Distributed environment variables.")
 
         if device.type == "cuda":
             torch.backends.cudnn.benchmark = True
+        cfg.anomaly_weight = float(args.anomaly_weight)
 
         adapter = get_adapter(args.dataset_key)
         adapter.ensure("training")
@@ -503,9 +590,11 @@ def main() -> None:
             distributed=distributed,
             rank=rank,
             world_size=world_size,
+            baseline_from=args.baseline_from,
         )
 
         best_val_loss = float("inf")
+        best_val_anom = float("inf")
         best_state = None
         checkpoint_manager = None
 
@@ -521,7 +610,7 @@ def main() -> None:
                     train_loader.sampler.set_epoch(epoch)
 
                 start_time = time.time()
-                train_loss = train_epoch(
+                train_total_loss, train_recon_loss, train_anom = train_epoch(
                     model,
                     train_loader,
                     optimizer,
@@ -531,40 +620,53 @@ def main() -> None:
                     scaler=scaler,
                     amp_enabled=amp_enabled,
                 )
-                val_loss, val_score = evaluate(
+                val_loss, val_score, _ = evaluate(
                     model,
                     val_loader,
                     criterion,
                     device,
                     distributed=distributed,
                     amp_enabled=amp_enabled,
+                    return_scores=False,
                 )
                 elapsed = time.time() - start_time
 
                 if is_main_process:
                     print(
-                        f"[Epoch {epoch:03d}] train_loss={train_loss:.6f} "
+                        f"[Epoch {epoch:03d}] train_total={train_total_loss:.6f} "
+                        f"train_recon={train_recon_loss:.6f} train_anom={train_anom:.6f} "
                         f"val_loss={val_loss:.6f} val_anom={val_score:.6f} time={elapsed:.1f}s"
                     )
                     if checkpoint_manager is not None:
                         checkpoint_path = checkpoint_manager.save_epoch(
                             epoch=epoch,
                             model=base_model,
-                            train_loss=train_loss,
+                            train_loss=train_total_loss,
                             val_loss=val_loss,
                             val_anom=val_score,
                             elapsed_time=elapsed,
                         )
                         print(f"  ↳ checkpoint saved: {checkpoint_path.name}")
 
-                if val_loss < best_val_loss:
+                improved = False
+                if val_score < best_val_anom - 1e-8:
+                    improved = True
+                elif abs(val_score - best_val_anom) <= 1e-8 and val_loss < best_val_loss:
+                    improved = True
+
+                if improved:
+                    best_val_anom = val_score
                     best_val_loss = val_loss
                     best_state = {k: v.cpu().clone() for k, v in base_model.state_dict().items()}
+                    if is_main_process:
+                        print(
+                            f"  ↳ new best model (val_anom={best_val_anom:.6f}, val_loss={best_val_loss:.6f})"
+                        )
 
             if best_state is not None:
                 base_model.load_state_dict(best_state)
                 if is_main_process:
-                    print(f"\nBest validation loss: {best_val_loss:.6f}")
+                    print(f"\nBest validation metrics: loss={best_val_loss:.6f}, anomaly={best_val_anom:.6f}")
             elif is_main_process:
                 print("\nWarning: No improvement over initial epoch.")
 
@@ -576,13 +678,14 @@ def main() -> None:
             if is_main_process:
                 print("\nEvaluation-only mode: skipping training loop.")
 
-        val_summary_loss, val_summary_score = evaluate(
+        val_summary_loss, val_summary_score, val_scores_array = evaluate(
             model,
             val_loader,
             criterion,
             device,
             distributed=distributed,
             amp_enabled=amp_enabled,
+            return_scores=True,
         )
 
         if is_main_process:
@@ -590,18 +693,35 @@ def main() -> None:
                 f"\nValidation summary -> recon_loss={val_summary_loss:.6f} "
                 f"anomaly_score={val_summary_score:.6f}"
             )
+            
+            # Create output directory for plots
+            plot_dir = os.path.join(checkpoint_root_path, "plots")
+            
+            # Save validation plots first
+            os.makedirs(plot_dir, exist_ok=True)
+            if val_scores_array is not None:
+                plt.figure(figsize=(12, 6))
+                plt.plot(val_scores_array, label=f'Validation (Avg: {val_summary_score:.4f})', color='green')
+                plt.title("Anomaly Scores over Time - Validation Set")
+                plt.xlabel("Sample Index")
+                plt.ylabel("Anomaly Score")
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                plt.savefig(os.path.join(plot_dir, "anomaly_plot_validation.png"))
+                plt.close()
+
             print("\nEvaluating on test datasets...")
 
-        test_scores = evaluate_tests(
-            model,
-            test_loaders,
-            criterion,
-            device,
-            distributed=distributed,
-            amp_enabled=amp_enabled,
-        )
+            test_scores = evaluate_tests_and_plot(
+                model,
+                test_loaders,
+                criterion,
+                device,
+                output_dir=plot_dir,
+                distributed=distributed,
+                amp_enabled=amp_enabled,
+            )
 
-        if is_main_process:
             for name, metrics in test_scores.items():
                 print(
                     f"  {name:30s}: recon_loss={metrics['recon_loss']:.6f} "
