@@ -54,9 +54,13 @@ Built-in adapters:
 | `co2`      | CO₂ refrigeration benchmark (original cadence)    | `data/co2/raw`        | Training-ready    |
 | `co2_1min` | CO₂ refrigeration benchmark (1-minute aggregation)| `data/co2/1min`       | Training-ready    |
 | `ashrae`   | ASHRAE 1043-RP water-cooled chiller (XLS files)   | `data/ASHRAE_1043_RP` | Training-ready    |
-| `tep`      | Tennessee Eastman Process (RData)                 | `data/tep/raw`        | Scaffolding only* |
+| `tep`      | Tennessee Eastman Process (RData)                 | `data/tep/raw`        | Training-ready†   |
 
-`tep` is registered so you can extend it later, but all capabilities currently raise `NotImplementedError` until preprocessing and dataloaders are implemented.
+† TEP now loads from the supplied RData files using `pyreadr`; install via `pip install pyreadr`. Files expected under `data/tep/raw`:
+- `TEP_FaultFree_Training.RData` (baseline train)
+- `TEP_FaultFree_Testing.RData` (baseline val/test)
+- `TEP_Faulty_Testing.RData` (fault labels 1–20)
+- `TEP_Faulty_Training.RData` (optional, not used by default)
 
 > **ASHRAE dataset**: Training uses the “Benchmark Tests” XLS files (normal and near‑normal operation) while testing targets the “Refrigerant leak” scenarios. The adapter loads the native spreadsheets directly (requires `xlrd`) so no additional conversion step is needed.
 
@@ -141,6 +145,10 @@ Key behaviour:
 - Uses the `co2` adapter (`data/co2/raw`) by default; edit `DATASET_KEY` inside the script to target other adapters.
 - Loads `cfg.dataset` with the measurement/control variable definitions from `dyedgegat/src/data/column_config.py`.
 - Prints batch/tensor shapes, loss values, and checks for NaNs/Infs.
+
+> **TEP evaluation**  
+> For the Tennessee Eastman Process, use `evaluate_tep_anomaly.py` to sweep anomaly-score thresholds and report precision/recall/F1 against fault labels:  
+> `python evaluate_tep_anomaly.py --checkpoint /path/to/model.pt --dataset-key tep --use-amp --device cuda`
 
 ---
 

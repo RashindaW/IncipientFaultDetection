@@ -289,10 +289,34 @@ def aggregate_by_timestamp(
     sensor_index: Optional[int],
     include_values: bool,
 ) -> pd.DataFrame:
+    # Preserve all timestamps in order before merging aggregated statistics
+    timestamps = pd.DataFrame({"timestamp": df["timestamp"].drop_duplicates().sort_values()})
+    grouped = timestamps.copy()
+
     if include_values and sensor_index is not None:
-        grouped = df.groupby("timestamp", as_index=False)[["actual", "reconstructed", "anomaly_score"]].mean()
-    else:
-        grouped = df.groupby("timestamp", as_index=False)[["anomaly_score"]].mean()
+        median_values = (
+            df.groupby("timestamp", as_index=False)[["actual", "reconstructed"]]
+            .median()
+        )
+        grouped = grouped.merge(median_values, on="timestamp", how="left")
+
+    # Ignore extreme anomaly spikes (>100) when aggregating
+    anomaly_df = df[df["anomaly_score"] <= 100]
+    if anomaly_df.empty:
+        anomaly_df = df
+
+    anomaly_median = (
+        anomaly_df.groupby("timestamp", as_index=False)["anomaly_score"]
+        .median()
+    )
+    anomaly_mean = (
+        anomaly_df.groupby("timestamp", as_index=False)["anomaly_score"]
+        .mean()
+        .rename(columns={"anomaly_score": "anomaly_score_mean_filtered"})
+    )
+
+    grouped = grouped.merge(anomaly_median, on="timestamp", how="left")
+    grouped = grouped.merge(anomaly_mean, on="timestamp", how="left")
 
     if denormalize and include_values and sensor_index is not None:
         mean = dataset.measurement_mean[sensor_index]
@@ -300,6 +324,8 @@ def aggregate_by_timestamp(
         grouped["actual"] = grouped["actual"] * std + mean
         grouped["reconstructed"] = grouped["reconstructed"] * std + mean
 
+    grouped.sort_values("timestamp", inplace=True)
+    grouped.reset_index(drop=True, inplace=True)
     return grouped
 
 

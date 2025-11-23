@@ -3,10 +3,12 @@ import argparse
 import os
 import sys
 import time
+import csv
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
+from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, accuracy_score
 
 import torch
 import torch.distributed as dist
@@ -445,11 +447,13 @@ def evaluate_tests_and_plot(
     metrics: Dict[str, Dict[str, float]] = {}
     os.makedirs(output_dir, exist_ok=True)
     
-    print("\nGenerating anomaly score plots...")
+    print("\nGenerating anomaly score plots and detailed metrics...")
     
-    # Store all series to plot together or save
+    # Store all series
     results_dict = {}
-
+    baseline_scores = None
+    
+    # First pass: Collecting scores
     for name, loader in loaders.items():
         loss, score, scores_array = evaluate(
             model,
@@ -465,6 +469,15 @@ def evaluate_tests_and_plot(
         if scores_array is not None:
             results_dict[name] = scores_array
             
+            # Identify baseline scores for AUC calculation
+            # Convention: 'baseline' or 'fault_free' in name implies Label 0
+            if "baseline" in name.lower() or "fault_free" in name.lower():
+                if baseline_scores is None:
+                    baseline_scores = scores_array
+                else:
+                    # Concat if multiple baselines
+                    baseline_scores = np.concatenate([baseline_scores, scores_array])
+
             # Plot individual series
             plt.figure(figsize=(12, 6))
             plt.plot(scores_array, label=f'{name} (Avg: {score:.4f})')
@@ -476,8 +489,58 @@ def evaluate_tests_and_plot(
             plt.savefig(os.path.join(output_dir, f"anomaly_plot_{name}.png"))
             plt.close()
             
-    # Save raw scores for later analysis
+    # Save raw scores
     np.savez(os.path.join(output_dir, "anomaly_scores.npz"), **results_dict)
+    
+    # Second pass: Compute Classification Metrics (AUC, Precision, Recall, F1)
+    # Only if we have a baseline to compare against
+    if baseline_scores is not None:
+        detailed_metrics_path = os.path.join(output_dir, "detailed_test_metrics.csv")
+        print(f"Calculating AUC/F1 metrics (using baseline N={len(baseline_scores)})...")
+        
+        with open(detailed_metrics_path, 'w', newline='') as csvfile:
+            fieldnames = ['test_set', 'auc_roc', 'precision', 'recall', 'f1_score', 'threshold']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for name, scores in results_dict.items():
+                # Skip if it IS the baseline
+                if "baseline" in name.lower() or "fault_free" in name.lower():
+                    continue
+                    
+                # Construct labels
+                # Baseline = 0, This Fault = 1
+                y_true = np.concatenate([np.zeros(len(baseline_scores)), np.ones(len(scores))])
+                y_scores = np.concatenate([baseline_scores, scores])
+                
+                try:
+                    auc = roc_auc_score(y_true, y_scores)
+                except ValueError:
+                    auc = 0.0
+                
+                # Determine threshold for F1 (simple approach: 95th percentile of baseline)
+                # A robust threshold strategy usually requires a separate validation set
+                threshold = np.percentile(baseline_scores, 99) # 1% false alarm rate target
+                y_pred = (y_scores > threshold).astype(int)
+                
+                prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
+                
+                row = {
+                    'test_set': name,
+                    'auc_roc': f"{auc:.4f}",
+                    'precision': f"{prec:.4f}",
+                    'recall': f"{rec:.4f}",
+                    'f1_score': f"{f1:.4f}",
+                    'threshold': f"{threshold:.6f}"
+                }
+                writer.writerow(row)
+                
+                # Update the returned metrics dict for printing
+                metrics[name]['auc'] = auc
+                metrics[name]['f1'] = f1
+
+        print(f"Detailed metrics saved to {detailed_metrics_path}")
+
     print(f"Plots and scores saved to {output_dir}")
             
     return metrics
@@ -535,12 +598,7 @@ def main() -> None:
         if is_main_process:
             print("=" * 80)
             mode_desc = "Evaluating" if args.eval_only else "Training"
-            if distributed:
-                print(
-                    f"{mode_desc} DyEdgeGAT ({args.dataset_key}) with DistributedDataParallel on {world_size} GPUs"
-                )
-            else:
-                print(f"{mode_desc} DyEdgeGAT ({args.dataset_key}) on device: {device}")
+            print(f"{mode_desc} DyEdgeGAT ({args.dataset_key}) on device: {device}")
             print(f"Data directory: {data_dir}")
             if not args.eval_only:
                 print(f"Checkpoint root: {checkpoint_root_path}")
@@ -561,14 +619,6 @@ def main() -> None:
                     print(f"  Missing keys: {load_result.missing_keys}")
                 if load_result.unexpected_keys:
                     print(f"  Unexpected keys: {load_result.unexpected_keys}")
-
-        if distributed:
-            model = TorchDDP(
-                model,
-                device_ids=[device.index],
-                output_device=device.index,
-                find_unused_parameters=True,
-            )
 
         base_model = unwrap_model(model)
         criterion = torch.nn.MSELoss()
@@ -606,9 +656,6 @@ def main() -> None:
                 print(f"\nSaving per-epoch checkpoints to: {checkpoint_manager.run_path}")
 
             for epoch in range(1, args.epochs + 1):
-                if distributed and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
-                    train_loader.sampler.set_epoch(epoch)
-
                 start_time = time.time()
                 train_total_loss, train_recon_loss, train_anom = train_epoch(
                     model,
@@ -649,9 +696,10 @@ def main() -> None:
                         print(f"  ↳ checkpoint saved: {checkpoint_path.name}")
 
                 improved = False
-                if val_score < best_val_anom - 1e-8:
+                # Use a slightly more robust improvement check
+                if val_score < best_val_anom - 1e-9:
                     improved = True
-                elif abs(val_score - best_val_anom) <= 1e-8 and val_loss < best_val_loss:
+                elif abs(val_score - best_val_anom) <= 1e-9 and val_loss < best_val_loss:
                     improved = True
 
                 if improved:
@@ -695,10 +743,15 @@ def main() -> None:
             )
             
             # Create output directory for plots
-            plot_dir = os.path.join(checkpoint_root_path, "plots")
+            if checkpoint_manager is not None:
+                plot_dir = os.path.join(checkpoint_manager.run_path, "plots")
+            else:
+                # Fallback for eval-only mode
+                plot_dir = os.path.join(checkpoint_root_path, f"eval_plots_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                
+            os.makedirs(plot_dir, exist_ok=True)
             
             # Save validation plots first
-            os.makedirs(plot_dir, exist_ok=True)
             if val_scores_array is not None:
                 plt.figure(figsize=(12, 6))
                 plt.plot(val_scores_array, label=f'Validation (Avg: {val_summary_score:.4f})', color='green')
@@ -723,9 +776,11 @@ def main() -> None:
             )
 
             for name, metrics in test_scores.items():
+                auc_str = f" auc={metrics['auc']:.4f}" if 'auc' in metrics else ""
+                f1_str = f" f1={metrics['f1']:.4f}" if 'f1' in metrics else ""
                 print(
                     f"  {name:30s}: recon_loss={metrics['recon_loss']:.6f} "
-                    f"anomaly_score={metrics['anomaly_score']:.6f}"
+                    f"anomaly_score={metrics['anomaly_score']:.6f}{auc_str}{f1_str}"
                 )
 
             if args.eval_only:
@@ -737,4 +792,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from datetime import datetime # Import locally to avoid top-level shadowing if needed
     main()
