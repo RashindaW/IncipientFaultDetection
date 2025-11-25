@@ -49,6 +49,61 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Weight for topology-aware anomaly score penalty added to training loss (0 disables).",
     )
+    parser.add_argument(
+        "--use-spectral-view",
+        action="store_true",
+        help="Enable dual-view spectral branch with spectral graph and divergence loss.",
+    )
+    parser.add_argument(
+        "--freq-embed-dim",
+        type=int,
+        default=16,
+        help="Embedding dimension for spectral encoder/GNN path.",
+    )
+    parser.add_argument(
+        "--freq-bins",
+        type=int,
+        default=0,
+        help="Number of rFFT bins to keep (0 uses all window_size//2+1).",
+    )
+    parser.add_argument(
+        "--freq-band-mix",
+        type=str,
+        default="none",
+        choices=["none", "conv", "mlp"],
+        help="Optional band-mixing layer on spectral bins.",
+    )
+    parser.add_argument(
+        "--freq-topk",
+        type=int,
+        default=None,
+        help="Optional top-k neighbors for spectral graph (defaults to temporal topk).",
+    )
+    parser.add_argument(
+        "--share-gnn-weights",
+        action="store_true",
+        help="Reuse temporal GNN weights for spectral branch (otherwise separate GNN stack).",
+    )
+    parser.add_argument(
+        "--fuse-mode",
+        type=str,
+        default="concat",
+        choices=["concat", "sum", "gated"],
+        help="Fusion strategy for temporal and spectral node embeddings.",
+    )
+    parser.add_argument(
+        "--divergence-type",
+        type=str,
+        default="js",
+        choices=["js", "kl"],
+        help="Divergence metric between temporal/spectral attentions.",
+    )
+    parser.add_argument(
+        "--lambda-div",
+        type=float,
+        default=0.0,
+        help="Weight for spectral/temporal divergence loss during training.",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Optimizer learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay (L2 regularization)")
     parser.add_argument(
@@ -223,7 +278,13 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return getattr(model, "module", model)
 
 
-def init_model(device: torch.device, window_size: int, ocvar_dim: int, n_nodes: int) -> DyEdgeGAT:
+def init_model(
+    device: torch.device,
+    window_size: int,
+    ocvar_dim: int,
+    n_nodes: int,
+    model_args: Optional[argparse.Namespace] = None,
+) -> DyEdgeGAT:
     cfg.set_dataset_params(
         n_nodes=n_nodes,
         window_size=window_size,
@@ -231,6 +292,15 @@ def init_model(device: torch.device, window_size: int, ocvar_dim: int, n_nodes: 
     )
     cfg.device = str(device)
     cfg.validate()
+
+    use_spectral = bool(getattr(model_args, "use_spectral_view", False)) if model_args is not None else False
+    freq_embed_dim = getattr(model_args, "freq_embed_dim", 16) if model_args is not None else 16
+    freq_bins = getattr(model_args, "freq_bins", 0) if model_args is not None else 0
+    freq_band_mix = getattr(model_args, "freq_band_mix", "none") if model_args is not None else "none"
+    freq_topk = getattr(model_args, "freq_topk", None) if model_args is not None else None
+    share_gnn_weights = bool(getattr(model_args, "share_gnn_weights", False)) if model_args is not None else False
+    fuse_mode = getattr(model_args, "fuse_mode", "concat") if model_args is not None else "concat"
+    divergence_type = getattr(model_args, "divergence_type", "js") if model_args is not None else "js"
 
     model = DyEdgeGAT(
         feat_input_node=1,
@@ -267,6 +337,14 @@ def init_model(device: torch.device, window_size: int, ocvar_dim: int, n_nodes: 
         act="relu",
         aug_control=True,
         flip_output=True,
+        use_spectral_view=use_spectral,
+        freq_node_embed_dim=freq_embed_dim,
+        freq_max_bins=freq_bins,
+        freq_band_mixer=freq_band_mix,
+        freq_topk=freq_topk,
+        share_gnn_weights=share_gnn_weights,
+        fuse_mode=fuse_mode,
+        divergence_type=divergence_type,
     )
     # Disable cuDNN weight flattening before transferring to device to avoid
     # CUDNN_STATUS_BAD_PARAM in multi-process setups.
@@ -292,6 +370,25 @@ def forward_model(
     batch_obj = batch.to(device)
     outputs = model(batch_obj, return_graph=return_graph)
     return outputs, batch_obj
+
+
+def unpack_model_outputs(outputs):
+    """
+    Normalize model outputs to (recon, edge_index, edge_attr, aux_dict).
+    Aux may contain spectral graph and divergence when enabled.
+    """
+    aux = {}
+    edge_index = edge_attr = None
+    if isinstance(outputs, tuple):
+        if len(outputs) == 4:
+            recon, edge_index, edge_attr, aux = outputs
+        elif len(outputs) == 3:
+            recon, edge_index, edge_attr = outputs
+        else:
+            recon = outputs[0]
+    else:
+        recon = outputs
+    return recon, edge_index, edge_attr, aux
 
 
 def compute_recon_loss(
@@ -320,29 +417,35 @@ def train_epoch(
     model.train()
     base_model = unwrap_model(model)
     use_graph = getattr(cfg, "anomaly_weight", 0.0) > 0.0
+    div_weight = getattr(cfg, "lambda_div", 0.0)
     running_total_loss = 0.0
     running_recon_loss = 0.0
     running_anom = 0.0
+    running_div = 0.0
     sample_count = 0
 
     for raw_batch in loader:
         optimizer.zero_grad(set_to_none=True)
         with autocast("cuda", enabled=amp_enabled):
             if use_graph:
-                (recon, edge_index, edge_attr), batch_obj = forward_model(
+                outputs, batch_obj = forward_model(
                     model, raw_batch, device, return_graph=True
                 )
+                recon, edge_index, edge_attr, aux = unpack_model_outputs(outputs)
             else:
                 recon, batch_obj = forward_model(model, raw_batch, device, return_graph=False)
+                edge_index = edge_attr = None
+                aux = {}
 
             target = batch_obj.x.unsqueeze(-1)
             recon_loss = criterion(recon, target)
             anom_score = torch.tensor(0.0, device=device)
+            div_loss = aux.get("divergence_loss", torch.tensor(0.0, device=device))
             if use_graph:
                 anom_score = base_model.compute_topology_aware_anomaly_score(
                     target, recon, edge_index, edge_attr
                 )
-            loss = recon_loss + cfg.anomaly_weight * anom_score
+            loss = recon_loss + cfg.anomaly_weight * anom_score + div_weight * div_loss
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -356,22 +459,24 @@ def train_epoch(
         running_total_loss += loss.detach().item() * batch_size
         running_recon_loss += recon_loss.detach().item() * batch_size
         running_anom += anom_score.detach().item() * batch_size
+        running_div += div_loss.detach().item() * batch_size
         sample_count += batch_size
 
     totals = torch.tensor(
-        [running_total_loss, running_recon_loss, running_anom, sample_count],
+        [running_total_loss, running_recon_loss, running_anom, running_div, sample_count],
         device=device,
         dtype=torch.float64,
     )
     if distributed:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
 
-    total_loss, total_recon, total_anom, total_samples = totals.tolist()
+    total_loss, total_recon, total_anom, total_div, total_samples = totals.tolist()
     denom = max(total_samples, 1.0)
     return (
         float(total_loss / denom),
         float(total_recon / denom),
         float(total_anom / denom),
+        float(total_div / denom),
     )
 
 
@@ -385,19 +490,19 @@ def evaluate(
     distributed: bool = False,
     amp_enabled: bool = False,
     return_scores: bool = False,
-) -> Tuple[float, float, Optional[np.ndarray]]:
+) -> Tuple[float, float, Optional[np.ndarray], float]:
     model.eval()
     base_model = unwrap_model(model)
     running_loss = 0.0
     running_score = 0.0
+    running_div = 0.0
     sample_count = 0
     all_scores = []
 
     for raw_batch in loader:
         with autocast("cuda", enabled=amp_enabled):
-            (recon, edge_index, edge_attr), batch_obj = forward_model(
-                model, raw_batch, device, return_graph=True
-            )
+            outputs, batch_obj = forward_model(model, raw_batch, device, return_graph=True)
+            recon, edge_index, edge_attr, aux = unpack_model_outputs(outputs)
             target = batch_obj.x.unsqueeze(-1)
             loss = criterion(recon, target)
 
@@ -405,6 +510,7 @@ def evaluate(
         score = base_model.compute_topology_aware_anomaly_score(
             target, recon, edge_index, edge_attr
         )
+        div_loss = aux.get("divergence_loss", torch.tensor(0.0, device=device))
 
         # If detailed scores requested, compute per-sample scores
         if return_scores:
@@ -417,20 +523,25 @@ def evaluate(
         batch_size = batch_obj.num_graphs
         running_loss += loss.detach().item() * batch_size
         running_score += score.item() * batch_size
+        running_div += div_loss.detach().item() * batch_size
         sample_count += batch_size
 
-    totals = torch.tensor([running_loss, running_score, sample_count], device=device, dtype=torch.float64)
+    totals = torch.tensor(
+        [running_loss, running_score, running_div, sample_count],
+        device=device,
+        dtype=torch.float64,
+    )
     if distributed:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
 
-    total_loss, total_score, total_samples = totals.tolist()
+    total_loss, total_score, total_div, total_samples = totals.tolist()
     denom = max(total_samples, 1.0)
     
     scores_array = None
     if return_scores and all_scores:
         scores_array = np.concatenate(all_scores)
 
-    return float(total_loss / denom), float(total_score / denom), scores_array
+    return float(total_loss / denom), float(total_score / denom), scores_array, float(total_div / denom)
 
 
 @torch.no_grad()
@@ -455,7 +566,7 @@ def evaluate_tests_and_plot(
     
     # First pass: Collecting scores
     for name, loader in loaders.items():
-        loss, score, scores_array = evaluate(
+        loss, score, scores_array, div_loss = evaluate(
             model,
             loader,
             criterion,
@@ -464,7 +575,7 @@ def evaluate_tests_and_plot(
             amp_enabled=amp_enabled,
             return_scores=True,
         )
-        metrics[name] = {"recon_loss": loss, "anomaly_score": score}
+        metrics[name] = {"recon_loss": loss, "anomaly_score": score, "divergence": div_loss}
         
         if scores_array is not None:
             results_dict[name] = scores_array
@@ -566,6 +677,7 @@ def main() -> None:
         if device.type == "cuda":
             torch.backends.cudnn.benchmark = True
         cfg.anomaly_weight = float(args.anomaly_weight)
+        cfg.lambda_div = float(args.lambda_div)
 
         adapter = get_adapter(args.dataset_key)
         adapter.ensure("training")
@@ -582,6 +694,7 @@ def main() -> None:
             args.window_size,
             len(control_var_names),
             adapter.measurement_count(),
+            model_args=args,
         )
 
         checkpoint_root = args.checkpoint_dir or os.path.join("checkpoints", adapter.key)
@@ -657,7 +770,7 @@ def main() -> None:
 
             for epoch in range(1, args.epochs + 1):
                 start_time = time.time()
-                train_total_loss, train_recon_loss, train_anom = train_epoch(
+                train_total_loss, train_recon_loss, train_anom, train_div = train_epoch(
                     model,
                     train_loader,
                     optimizer,
@@ -667,7 +780,7 @@ def main() -> None:
                     scaler=scaler,
                     amp_enabled=amp_enabled,
                 )
-                val_loss, val_score, _ = evaluate(
+                val_loss, val_score, _, val_div = evaluate(
                     model,
                     val_loader,
                     criterion,
@@ -681,8 +794,9 @@ def main() -> None:
                 if is_main_process:
                     print(
                         f"[Epoch {epoch:03d}] train_total={train_total_loss:.6f} "
-                        f"train_recon={train_recon_loss:.6f} train_anom={train_anom:.6f} "
-                        f"val_loss={val_loss:.6f} val_anom={val_score:.6f} time={elapsed:.1f}s"
+                        f"train_recon={train_recon_loss:.6f} train_anom={train_anom:.6f} train_div={train_div:.6f} "
+                        f"val_loss={val_loss:.6f} val_anom={val_score:.6f} val_div={val_div:.6f} "
+                        f"time={elapsed:.1f}s"
                     )
                     if checkpoint_manager is not None:
                         checkpoint_path = checkpoint_manager.save_epoch(
@@ -726,7 +840,7 @@ def main() -> None:
             if is_main_process:
                 print("\nEvaluation-only mode: skipping training loop.")
 
-        val_summary_loss, val_summary_score, val_scores_array = evaluate(
+        val_summary_loss, val_summary_score, val_scores_array, val_summary_div = evaluate(
             model,
             val_loader,
             criterion,
@@ -739,7 +853,7 @@ def main() -> None:
         if is_main_process:
             print(
                 f"\nValidation summary -> recon_loss={val_summary_loss:.6f} "
-                f"anomaly_score={val_summary_score:.6f}"
+                f"anomaly_score={val_summary_score:.6f} div={val_summary_div:.6f}"
             )
             
             # Create output directory for plots
@@ -778,9 +892,10 @@ def main() -> None:
             for name, metrics in test_scores.items():
                 auc_str = f" auc={metrics['auc']:.4f}" if 'auc' in metrics else ""
                 f1_str = f" f1={metrics['f1']:.4f}" if 'f1' in metrics else ""
+                div_str = f" div={metrics['divergence']:.6f}" if 'divergence' in metrics else ""
                 print(
                     f"  {name:30s}: recon_loss={metrics['recon_loss']:.6f} "
-                    f"anomaly_score={metrics['anomaly_score']:.6f}{auc_str}{f1_str}"
+                    f"anomaly_score={metrics['anomaly_score']:.6f}{div_str}{auc_str}{f1_str}"
                 )
 
             if args.eval_only:

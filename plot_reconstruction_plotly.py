@@ -19,7 +19,13 @@ import torch
 from torch.amp import autocast
 from torch_geometric.loader import DataLoader
 
-from train_dyedgegat import forward_model, init_model, resolve_devices, unwrap_model
+from train_dyedgegat import (
+    forward_model,
+    init_model,
+    resolve_devices,
+    unwrap_model,
+    unpack_model_outputs,
+)
 from datasets import get_adapter, list_adapter_keys
 
 
@@ -80,6 +86,55 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Stride applied when generating evaluation windows.",
+    )
+    parser.add_argument(
+        "--use-spectral-view",
+        action="store_true",
+        help="Enable spectral branch (must match training config).",
+    )
+    parser.add_argument(
+        "--freq-embed-dim",
+        type=int,
+        default=16,
+        help="Spectral embedding dimension (must match training checkpoint).",
+    )
+    parser.add_argument(
+        "--freq-bins",
+        type=int,
+        default=0,
+        help="Number of rFFT bins to keep (0 = all).",
+    )
+    parser.add_argument(
+        "--freq-band-mix",
+        type=str,
+        default="none",
+        choices=["none", "conv", "mlp"],
+        help="Band mixer type for spectral encoder.",
+    )
+    parser.add_argument(
+        "--freq-topk",
+        type=int,
+        default=None,
+        help="Top-k neighbors for spectral graph (default = temporal topk).",
+    )
+    parser.add_argument(
+        "--share-gnn-weights",
+        action="store_true",
+        help="Share temporal GNN weights with spectral branch.",
+    )
+    parser.add_argument(
+        "--fuse-mode",
+        type=str,
+        default="concat",
+        choices=["concat", "sum", "gated"],
+        help="Fusion strategy for temporal/spectral embeddings.",
+    )
+    parser.add_argument(
+        "--divergence-type",
+        type=str,
+        default="js",
+        choices=["js", "kl"],
+        help="Divergence metric used during training; needed to rebuild the model.",
     )
     parser.add_argument(
         "--batch-size",
@@ -224,12 +279,13 @@ def gather_time_series(
             sample_counter += batch_size
 
             with autocast("cuda", enabled=amp_enabled):
-                (recon, edge_index, edge_attr), batch_obj = forward_model(
+                outputs, batch_obj = forward_model(
                     model,
                     raw_batch,
                     device,
                     return_graph=True,
                 )
+                recon, edge_index, edge_attr, aux = unpack_model_outputs(outputs)
                 target = batch_obj.x.unsqueeze(-1)
 
             per_timestep = base_model.compute_anomaly_scores_per_timestep(
@@ -472,6 +528,7 @@ def main() -> None:
         args.window_size,
         len(control_var_names),
         adapter.measurement_count(),
+        model_args=args,
     )
 
     checkpoint = torch.load(args.checkpoint, map_location=device)

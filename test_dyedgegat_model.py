@@ -165,7 +165,7 @@ def test_model(args: argparse.Namespace) -> None:
         recon = model(batch)
         
         # Also get graph for anomaly scoring
-        recon_with_graph, edge_index, edge_weight = model(batch, return_graph=True)
+        recon_with_graph, edge_index, edge_weight, aux = model(batch, return_graph=True)
     
     print(f"✅ Forward pass successful!")
     print(f"   Reconstruction shape: {recon.shape}")
@@ -221,7 +221,7 @@ def test_model(args: argparse.Namespace) -> None:
     
     model.eval()
     with torch.no_grad():
-        recon, edge_index, edge_weight = model(batch, return_graph=True)
+        recon, edge_index, edge_weight, aux = model(batch, return_graph=True)
         
         # Compute anomaly score
         anomaly_score = model.compute_topology_aware_anomaly_score(

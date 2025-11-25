@@ -24,7 +24,13 @@ from torch.amp import autocast
 from torch_geometric.loader import DataLoader
 
 from datasets import get_adapter
-from train_dyedgegat import forward_model, init_model, resolve_devices, unwrap_model
+from train_dyedgegat import (
+    forward_model,
+    init_model,
+    resolve_devices,
+    unwrap_model,
+    unpack_model_outputs,
+)
 from dyedgegat.src.data.tep_column_config import (
     FAULT_FREE_TEST_FILE,
     FAULT_FREE_TRAIN_FILE,
@@ -61,6 +67,36 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default="outputs/tep_eval",
         help="Directory to store metrics JSON/text (will be created).",
+    )
+    parser.add_argument("--use-spectral-view", action="store_true", help="Enable spectral branch for evaluation.")
+    parser.add_argument("--freq-embed-dim", type=int, default=16, help="Spectral embedding dimension.")
+    parser.add_argument("--freq-bins", type=int, default=0, help="Number of rFFT bins to keep (0 = all).")
+    parser.add_argument(
+        "--freq-band-mix",
+        type=str,
+        default="none",
+        choices=["none", "conv", "mlp"],
+        help="Optional band mixer for spectral encoder.",
+    )
+    parser.add_argument("--freq-topk", type=int, default=None, help="Top-k neighbors for spectral graph (default=temporal topk).")
+    parser.add_argument(
+        "--share-gnn-weights",
+        action="store_true",
+        help="Share temporal GNN weights with spectral branch.",
+    )
+    parser.add_argument(
+        "--fuse-mode",
+        type=str,
+        default="concat",
+        choices=["concat", "sum", "gated"],
+        help="Fusion strategy for temporal/spectral embeddings.",
+    )
+    parser.add_argument(
+        "--divergence-type",
+        type=str,
+        default="js",
+        choices=["js", "kl"],
+        help="Divergence metric used during training; needed to build the model.",
     )
     return parser.parse_args()
 
@@ -112,12 +148,13 @@ def collect_scores(
     with torch.no_grad():
         for raw_batch in loader:
             with autocast("cuda", enabled=amp_enabled):
-                (recon, edge_index, edge_attr), batch_obj = forward_model(
+                outputs, batch_obj = forward_model(
                     model,
                     raw_batch,
                     device,
                     return_graph=True,
                 )
+                recon, edge_index, edge_attr, aux = unpack_model_outputs(outputs)
                 target = batch_obj.x.unsqueeze(-1)
                 batch_scores = base_model.compute_anomaly_scores_per_sample(
                     target, recon, edge_index, edge_attr
@@ -201,6 +238,7 @@ def main() -> None:
         args.window_size,
         len(control_vars),
         len(MEASUREMENT_VARS),
+        model_args=args,
     )
 
     checkpoint = torch.load(args.checkpoint, map_location=device)
