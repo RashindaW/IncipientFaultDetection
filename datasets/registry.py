@@ -32,7 +32,7 @@ class DatasetAdapter:
     control_names_fn: Optional[Callable[[str], List[str]]]
     dataloader_factory: Optional[
         Callable[
-            [int, int, int, int, Optional[int], str, int, bool, int, int, str],
+            [int, int, int, int, Optional[int], str, int, bool, int, int, str, Optional[Tuple[int, int]]],
             Tuple[DatasetType, DatasetType, Dict[str, DatasetType]],
         ]
     ]
@@ -78,6 +78,7 @@ class DatasetAdapter:
         rank: int = 0,
         world_size: int = 1,
         baseline_from: str = "val",
+        severity_range: Optional[Tuple[int, int]] = None,
     ):
         self.ensure("training")
         if self.dataloader_factory is None:
@@ -94,6 +95,7 @@ class DatasetAdapter:
             rank,
             world_size,
             baseline_from,
+            severity_range,
         )
 
     def resolve_split_files(self, split_key: str) -> List[str]:

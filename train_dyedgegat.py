@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, accuracy_score
+from sklearn.metrics import (
+    roc_auc_score,
+    precision_recall_curve,
+    precision_recall_fscore_support,
+    accuracy_score,
+)
 
 import torch
 import torch.distributed as dist
@@ -161,6 +166,14 @@ def parse_args() -> argparse.Namespace:
         choices=["val", "train"],
         default="val",
         help="Source split for the baseline (normal) test loader; default reuses validation files.",
+    )
+    parser.add_argument(
+        "--severity-range",
+        type=str,
+        default=None,
+        help="Severity range for fault detection testing (e.g., '10,20' for early faults). "
+             "Format: 'min,max'. Only affects fault test datasets, not training. "
+             "Use '10,20' to match paper's early fault detection protocol.",
     )
     parser.add_argument(
         "--num-workers",
@@ -398,7 +411,14 @@ def compute_recon_loss(
     device: torch.device,
 ) -> Tuple[torch.Tensor, Batch]:
     recon, batch_obj = forward_model(model, batch, device, return_graph=False)
-    target = batch_obj.x.unsqueeze(-1)
+    # Sanitize any non-finite values before loss
+    if not torch.isfinite(recon).all():
+        print("Warning: non-finite reconstruction detected in compute_recon_loss; sanitizing.")
+        recon = torch.nan_to_num(recon, nan=0.0, posinf=1e6, neginf=-1e6)
+    target = batch_obj.x.reshape_as(recon)
+    if not torch.isfinite(target).all():
+        print("Warning: non-finite target detected in compute_recon_loss; sanitizing.")
+        target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
     loss = criterion(recon, target)
     return loss, batch_obj
 
@@ -437,7 +457,13 @@ def train_epoch(
                 edge_index = edge_attr = None
                 aux = {}
 
-            target = batch_obj.x.unsqueeze(-1)
+            if not torch.isfinite(recon).all():
+                print("Warning: non-finite reconstruction detected; sanitizing and skipping anomaly/divergence for this batch.")
+                recon = torch.nan_to_num(recon, nan=0.0, posinf=1e6, neginf=-1e6)
+            target = batch_obj.x.reshape_as(recon)
+            if not torch.isfinite(target).all():
+                print("Warning: non-finite target detected; sanitizing.")
+                target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
             recon_loss = criterion(recon, target)
             anom_score = torch.tensor(0.0, device=device)
             div_loss = aux.get("divergence_loss", torch.tensor(0.0, device=device))
@@ -445,6 +471,12 @@ def train_epoch(
                 anom_score = base_model.compute_topology_aware_anomaly_score(
                     target, recon, edge_index, edge_attr
                 )
+                if not torch.isfinite(anom_score):
+                    print("Warning: non-finite anomaly score; zeroing for this batch.")
+                    anom_score = torch.tensor(0.0, device=device)
+            if not torch.isfinite(div_loss).all():
+                print("Warning: non-finite divergence loss; zeroing for this batch.")
+                div_loss = torch.tensor(0.0, device=device)
             loss = recon_loss + cfg.anomaly_weight * anom_score + div_weight * div_loss
 
         if scaler is not None:
@@ -503,7 +535,13 @@ def evaluate(
         with autocast("cuda", enabled=amp_enabled):
             outputs, batch_obj = forward_model(model, raw_batch, device, return_graph=True)
             recon, edge_index, edge_attr, aux = unpack_model_outputs(outputs)
-            target = batch_obj.x.unsqueeze(-1)
+            if not torch.isfinite(recon).all():
+                print("Warning: non-finite reconstruction detected during evaluation; sanitizing.")
+                recon = torch.nan_to_num(recon, nan=0.0, posinf=1e6, neginf=-1e6)
+            target = batch_obj.x.reshape_as(recon)
+            if not torch.isfinite(target).all():
+                print("Warning: non-finite target detected during evaluation; sanitizing.")
+                target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
             loss = criterion(recon, target)
 
         # Compute aggregate score for metrics
@@ -603,14 +641,25 @@ def evaluate_tests_and_plot(
     # Save raw scores
     np.savez(os.path.join(output_dir, "anomaly_scores.npz"), **results_dict)
     
-    # Second pass: Compute Classification Metrics (AUC, Precision, Recall, F1)
+    # Second pass: Compute Classification Metrics (AUC, Precision, Recall, F1 variants, Delay, Ambiguity)
     # Only if we have a baseline to compare against
     if baseline_scores is not None:
         detailed_metrics_path = os.path.join(output_dir, "detailed_test_metrics.csv")
         print(f"Calculating AUC/F1 metrics (using baseline N={len(baseline_scores)})...")
         
         with open(detailed_metrics_path, 'w', newline='') as csvfile:
-            fieldnames = ['test_set', 'auc_roc', 'precision', 'recall', 'f1_score', 'threshold']
+            fieldnames = [
+                'test_set',
+                'auc_roc',
+                'precision',
+                'recall',
+                'f1_score',          # F1 at fixed threshold (95th percentile)
+                'best_f1',           # F1* (max over PR curve)
+                'ambiguity',         # 1 - 2|AUC-0.5|
+                'threshold',         # fixed threshold (95th percentile of baseline)
+                'best_threshold',    # threshold achieving best_f1
+                'delay_best_thr',    # detection delay (samples) at best_threshold
+            ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             
@@ -629,12 +678,35 @@ def evaluate_tests_and_plot(
                 except ValueError:
                     auc = 0.0
                 
-                # Determine threshold for F1 (simple approach: 95th percentile of baseline)
-                # A robust threshold strategy usually requires a separate validation set
-                threshold = np.percentile(baseline_scores, 99) # 1% false alarm rate target
+                # Fixed threshold for F1: 95th percentile of baseline (per paper)
+                threshold = np.percentile(baseline_scores, 95)
                 y_pred = (y_scores > threshold).astype(int)
-                
-                prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
+                prec, rec, f1, _ = precision_recall_fscore_support(
+                    y_true, y_pred, average='binary', zero_division=0
+                )
+
+                # Best F1 (F1*): scan PR curve
+                pr_prec, pr_rec, pr_thresh = precision_recall_curve(y_true, y_scores)
+                f1_curve = 2 * pr_prec * pr_rec / (pr_prec + pr_rec + 1e-12)
+                best_idx = int(np.argmax(f1_curve))
+                best_f1 = float(f1_curve[best_idx])
+                # precision_recall_curve returns thresholds len = len(prec)-1
+                if best_idx >= len(pr_thresh):
+                    best_threshold = float(pr_thresh[-1]) if len(pr_thresh) else float(threshold)
+                else:
+                    best_threshold = float(pr_thresh[best_idx])
+
+                # Detection delay at best_threshold: samples until first detection in fault segment
+                # Using fault scores only (all ones) since baseline prepends zeros.
+                fault_scores = scores
+                delay_idx = next(
+                    (i for i, s in enumerate(fault_scores) if s > best_threshold),
+                    len(fault_scores),
+                )
+                delay_best = int(delay_idx)
+
+                # Ambiguity (for Pronto novel OCs; harmless for others)
+                ambiguity = 1.0 - 2.0 * abs(auc - 0.5)
                 
                 row = {
                     'test_set': name,
@@ -642,13 +714,20 @@ def evaluate_tests_and_plot(
                     'precision': f"{prec:.4f}",
                     'recall': f"{rec:.4f}",
                     'f1_score': f"{f1:.4f}",
-                    'threshold': f"{threshold:.6f}"
+                    'best_f1': f"{best_f1:.4f}",
+                    'ambiguity': f"{ambiguity:.4f}",
+                    'threshold': f"{threshold:.6f}",
+                    'best_threshold': f"{best_threshold:.6f}",
+                    'delay_best_thr': delay_best,
                 }
                 writer.writerow(row)
                 
                 # Update the returned metrics dict for printing
                 metrics[name]['auc'] = auc
                 metrics[name]['f1'] = f1
+                metrics[name]['best_f1'] = best_f1
+                metrics[name]['ambiguity'] = ambiguity
+                metrics[name]['delay_best_thr'] = delay_best
 
         print(f"Detailed metrics saved to {detailed_metrics_path}")
 
@@ -742,6 +821,26 @@ def main() -> None:
 
         effective_test_stride = args.test_stride if args.test_stride is not None else args.val_stride
 
+        # Parse severity range if provided
+        severity_range = None
+        if args.severity_range:
+            try:
+                min_sev, max_sev = map(int, args.severity_range.split(','))
+                severity_range = (min_sev, max_sev)
+                if is_main_process:
+                    print(f"🎯 Filtering fault test data to severity range: [{min_sev}, {max_sev}]")
+                    if min_sev <= 20:
+                        print("   → Testing EARLY fault detection (matching paper's protocol)")
+                    elif min_sev <= 40:
+                        print("   → Testing MODERATE fault detection")
+                    else:
+                        print("   → Testing SEVERE fault detection (easier)")
+            except ValueError:
+                raise ValueError(
+                    f"Invalid --severity-range format: '{args.severity_range}'. "
+                    "Expected 'min,max' (e.g., '10,20')"
+                )
+
         train_loader, val_loader, test_loaders = adapter.create_dataloaders(
             window_size=cfg.dataset.window_size,
             batch_size=args.batch_size,
@@ -754,6 +853,7 @@ def main() -> None:
             rank=rank,
             world_size=world_size,
             baseline_from=args.baseline_from,
+            severity_range=severity_range,
         )
 
         best_val_loss = float("inf")

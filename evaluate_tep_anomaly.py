@@ -16,7 +16,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Optional
 
 import numpy as np
 import torch
@@ -98,6 +98,13 @@ def parse_args() -> argparse.Namespace:
         choices=["js", "kl"],
         help="Divergence metric used during training; needed to build the model.",
     )
+    parser.add_argument(
+        "--faults",
+        type=int,
+        nargs="+",
+        default=None,
+        help="List of specific fault IDs to evaluate (e.g., --faults 3 9 15). If omitted, all faults are evaluated.",
+    )
     return parser.parse_args()
 
 
@@ -122,6 +129,8 @@ def build_datasets(args: argparse.Namespace, data_dir: str):
         normalization_stats=norm_stats,
         fault_filter=[0],
     )
+    
+    fault_filter = args.faults if args.faults is not None else None
     faulty_dataset = TEPDataset(
         data_files=[FAULTY_TEST_FILE],
         window_size=args.window_size,
@@ -129,7 +138,7 @@ def build_datasets(args: argparse.Namespace, data_dir: str):
         data_dir=data_dir,
         normalize=True,
         normalization_stats=norm_stats,
-        fault_filter=None,  # include all faults
+        fault_filter=fault_filter,
     )
     return train_dataset, val_dataset, faulty_dataset
 
@@ -201,6 +210,38 @@ def per_fault_metrics(scores: np.ndarray, labels: np.ndarray, threshold: float) 
     f1 = 2 * precision * recall / (precision + recall + 1e-9)
     metrics["overall"] = {"precision": float(precision), "recall": float(recall), "f1": float(f1)}
 
+    # Incipient Faults subset (Faults 3, 9, 15)
+    incipient_faults = {3, 9, 15}
+    incipient_mask = np.isin(labels, list(incipient_faults))
+    if incipient_mask.any():
+        # Predictions on incipient faults
+        inc_preds = preds[incipient_mask]
+        # True labels on incipient faults (all are anomalies)
+        inc_labels = binary_labels[incipient_mask]
+        
+        # False positives are counted from the global normal pool (labels == 0)
+        # We use the same False Positives as "overall" because in an anomaly detection setting,
+        # the "Normal" class is shared.
+        # However, Precision = TP / (TP + FP). TP comes from Incipient, FP comes from Normal.
+        
+        inc_tp = np.sum(inc_preds)
+        # FP is calculated against normal data only (labels == 0)
+        normal_mask = labels == 0
+        inc_fp = np.sum(preds[normal_mask])
+        
+        inc_fn = np.sum(~inc_preds)
+        
+        inc_prec = inc_tp / (inc_tp + inc_fp + 1e-9)
+        inc_rec = inc_tp / (inc_tp + inc_fn + 1e-9)
+        inc_f1 = 2 * inc_prec * inc_rec / (inc_prec + inc_rec + 1e-9)
+        
+        metrics["incipient_subset"] = {
+            "precision": float(inc_prec),
+            "recall": float(inc_rec),
+            "f1": float(inc_f1),
+            "support": int(incipient_mask.sum())
+        }
+
     # Per fault class (>0)
     for fault_id in sorted(set(int(x) for x in labels.tolist() if x > 0)):
         mask = labels == fault_id
@@ -208,8 +249,11 @@ def per_fault_metrics(scores: np.ndarray, labels: np.ndarray, threshold: float) 
             continue
         fault_preds = preds[mask]
         tp = np.sum(fault_preds)
-        fp = np.sum(preds & ~binary_labels)
+        # FP is always relative to the normal dataset
+        normal_mask = labels == 0
+        fp = np.sum(preds[normal_mask])
         fn = np.sum(~fault_preds)
+        
         precision = tp / (tp + fp + 1e-9)
         recall = tp / (tp + fn + 1e-9)
         f1 = 2 * precision * recall / (precision + recall + 1e-9)
@@ -298,6 +342,7 @@ def main() -> None:
         "val_stride": args.val_stride,
         "test_stride": args.test_stride,
         "device": str(device),
+        "faults_evaluated": args.faults if args.faults else "all",
         "best_threshold": best,
         "metrics": metrics,
     }
