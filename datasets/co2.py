@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import List
+from typing import List, Tuple
 
 from dyedgegat.src.data.column_config import BASELINE_FILES, FAULT_FILES, MEASUREMENT_VARS
 from dyedgegat.src.data.dataloader import create_dataloaders
@@ -43,6 +43,9 @@ def _create_dataloaders(
     rank: int,
     world_size: int,
     baseline_from: str = "val",
+    severity_range: Tuple[int, int] | None = None,
+    feature_option: str | None = None,
+    fault_keys: List[str] | None = None,
 ):
     return create_dataloaders(
         window_size=window_size,

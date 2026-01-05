@@ -11,9 +11,9 @@ from dyedgegat.src.data.ashrae_column_config import (
     FAULT_FILES, 
     MEASUREMENT_VARS,
     BENCHMARK_DIR,
-    REFRIGERANT_LEAK_DIR,
     BASELINE_FAULT_CODE_WHITELIST,
     BASELINE_UNIT_STATUS_WHITELIST,
+    get_measurement_vars,
 )
 from dyedgegat.src.data.ashrae_dataset import (
     ASHRAEDataset, 
@@ -39,13 +39,13 @@ def _resolve_split_files(split_key: str) -> List[str]:
     
     # Handle fault files
     if split_key in FAULT_FILES:
-        # Return fault file with full path from refrigerant leak directory
-        return [os.path.join(REFRIGERANT_LEAK_DIR, FAULT_FILES[split_key])]
+        subdir, fault_file = FAULT_FILES[split_key]
+        return [os.path.join(subdir, fault_file)]
     
     # Try case-insensitive match for fault names
-    for fault_name, fault_file in FAULT_FILES.items():
+    for fault_name, (subdir, fault_file) in FAULT_FILES.items():
         if fault_name.lower() == key:
-            return [os.path.join(REFRIGERANT_LEAK_DIR, fault_file)]
+            return [os.path.join(subdir, fault_file)]
     
     raise ValueError(
         f"Unknown dataset split '{split_key}'. Valid options: "
@@ -70,6 +70,9 @@ def _create_dataloaders(
     rank: int,
     world_size: int,
     baseline_from: str = "val",
+    severity_range: Tuple[int, int] | None = None,
+    feature_option: str | None = None,
+    fault_keys: List[str] | None = None,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     """
     Create train, validation, and test dataloaders for ASHRAE dataset.
@@ -113,6 +116,7 @@ def _create_dataloaders(
         stride=train_stride,
         data_dir=data_dir,
         normalize=True,
+        feature_option=feature_option,
         **filter_kwargs,
     )
     
@@ -129,12 +133,26 @@ def _create_dataloaders(
         data_dir=data_dir,
         normalize=True,
         normalization_stats=norm_stats,  # Use training stats
+        feature_option=feature_option,
         **filter_kwargs,
     )
     
     # ========== Create Test Datasets ==========
     print("\n[3/3] Creating TEST datasets...")
     test_datasets = {}
+
+    selected_faults = list(FAULT_FILES.items())
+    if fault_keys is not None:
+        requested = {k.lower() for k in fault_keys}
+        selected = []
+        unknown = []
+        for name, file in FAULT_FILES.items():
+            if name.lower() in requested:
+                selected.append((name, file))
+        unknown = [k for k in fault_keys if k.lower() not in {n.lower() for n, _ in selected}]
+        if unknown:
+            raise ValueError(f"Unknown ASHRAE fault keys: {unknown}. Valid: {list(FAULT_FILES.keys())}")
+        selected_faults = selected
     
     # Baseline test (normal operation)
     print("  - Baseline (near normal operation)")
@@ -148,14 +166,16 @@ def _create_dataloaders(
         data_dir=data_dir,
         normalize=True,
         normalization_stats=norm_stats,
+        feature_option=feature_option,
         **filter_kwargs,
     )
     test_datasets['baseline'] = baseline_test_dataset
     
     # Fault datasets - Refrigerant leak
-    for fault_idx, (fault_name, fault_file) in enumerate(FAULT_FILES.items(), start=1):
+    for fault_idx, (fault_name, fault_entry) in enumerate(selected_faults, start=1):
         print(f"  - {fault_name}")
-        fault_file_path = os.path.join(REFRIGERANT_LEAK_DIR, fault_file)
+        fault_subdir, fault_file = fault_entry
+        fault_file_path = os.path.join(fault_subdir, fault_file)
         fault_dataset = ASHRAEFaultDataset(
             data_files=[fault_file_path],
             fault_label=fault_idx,  # Assign sequential fault labels
@@ -164,6 +184,7 @@ def _create_dataloaders(
             data_dir=data_dir,
             normalize=True,
             normalization_stats=norm_stats,  # Use training stats
+            feature_option=feature_option,
         )
         test_datasets[fault_name] = fault_dataset
     
@@ -270,6 +291,7 @@ register_adapter(
         description="ASHRAE 1043-RP water-cooled chiller dataset. Training on benchmark tests, testing on refrigerant leak.",
         default_data_dir=ASHRAE_DEFAULT_DIR,
         measurement_vars=MEASUREMENT_VARS,
+        measurement_vars_resolver=get_measurement_vars,
         dataset_cls=ASHRAEDataset,
         control_names_fn=get_ashrae_control_variable_names,
         dataloader_factory=_create_dataloaders,

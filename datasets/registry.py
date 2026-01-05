@@ -29,21 +29,42 @@ class DatasetAdapter:
     default_data_dir: Optional[str]
     measurement_vars: Sequence[str]
     dataset_cls: Optional[Type[DatasetType]]
-    control_names_fn: Optional[Callable[[str], List[str]]]
+    control_names_fn: Optional[Callable[[str, Optional[str]], List[str]]]
     dataloader_factory: Optional[
         Callable[
-            [int, int, int, int, Optional[int], str, int, bool, int, int, str, Optional[Tuple[int, int]]],
+            [
+                int,
+                int,
+                int,
+                int,
+                Optional[int],
+                str,
+                int,
+                bool,
+                int,
+                int,
+                str,
+                Optional[Tuple[int, int]],
+                Optional[str],
+                Optional[List[str]],
+            ],
             Tuple[DatasetType, DatasetType, Dict[str, DatasetType]],
         ]
     ]
     resolve_split_files_fn: Optional[Callable[[str], List[str]]]
     list_fault_keys_fn: Optional[Callable[[], List[str]]]
+    measurement_vars_resolver: Optional[Callable[[Optional[str]], Sequence[str]]] = None
     supports_training: bool = True
     supports_testing: bool = True
     supports_plotting: bool = True
 
-    def measurement_count(self) -> int:
-        return len(self.measurement_vars)
+    def get_measurement_variables(self, feature_option: Optional[str] = None) -> List[str]:
+        if self.measurement_vars_resolver is not None:
+            return list(self.measurement_vars_resolver(feature_option))
+        return list(self.measurement_vars)
+
+    def measurement_count(self, feature_option: Optional[str] = None) -> int:
+        return len(self.get_measurement_variables(feature_option))
 
     def ensure(self, capability: str) -> None:
         flag = {
@@ -59,10 +80,10 @@ class DatasetAdapter:
     def get_default_data_dir(self) -> Optional[str]:
         return self.default_data_dir
 
-    def get_control_variables(self, data_dir: str) -> List[str]:
+    def get_control_variables(self, data_dir: str, feature_option: Optional[str] = None) -> List[str]:
         if self.control_names_fn is None:
             raise NotImplementedError(f"Dataset '{self.key}' has no control-variable resolver yet.")
-        return list(self.control_names_fn(data_dir))
+        return list(self.control_names_fn(data_dir, feature_option))
 
     def create_dataloaders(
         self,
@@ -79,6 +100,8 @@ class DatasetAdapter:
         world_size: int = 1,
         baseline_from: str = "val",
         severity_range: Optional[Tuple[int, int]] = None,
+        feature_option: Optional[str] = None,
+        fault_keys: Optional[List[str]] = None,
     ):
         self.ensure("training")
         if self.dataloader_factory is None:
@@ -96,6 +119,8 @@ class DatasetAdapter:
             world_size,
             baseline_from,
             severity_range,
+            feature_option,
+            fault_keys,
         )
 
     def resolve_split_files(self, split_key: str) -> List[str]:

@@ -118,6 +118,21 @@ def parse_args() -> argparse.Namespace:
         help=f"Dataset adapter to use. Available: {', '.join(available_datasets)}.",
     )
     parser.add_argument(
+        "--ashrae-feature-option",
+        type=str,
+        choices=["a", "b"],
+        default="a",
+        help="Feature selection for ASHRAE only: 'a' (minimal context) or 'b' (control-aware).",
+    )
+    parser.add_argument(
+        "--ashrae-faults",
+        type=str,
+        default="all",
+        help="ASHRAE only: comma-separated fault keys to include in testing (default 'all'). "
+             "Valid keys: Condenser_Fouling_06, Condenser_Fouling_12, Condenser_Fouling_20, "
+             "Condenser_Fouling_30, Condenser_Fouling_45.",
+    )
+    parser.add_argument(
         "--data-dir",
         type=str,
         default=None,
@@ -767,12 +782,18 @@ def main() -> None:
                 "please supply --data-dir."
             )
 
-        control_var_names = adapter.get_control_variables(data_dir)
+        feature_option = args.ashrae_feature_option if args.dataset_key == "ashrae" else None
+        ashrae_faults: Optional[List[str]] = None
+        if args.dataset_key == "ashrae" and args.ashrae_faults.lower() != "all":
+            ashrae_faults = [f.strip() for f in args.ashrae_faults.split(",") if f.strip()]
+
+        control_var_names = adapter.get_control_variables(data_dir, feature_option=feature_option)
+        measurement_var_names = adapter.get_measurement_variables(feature_option)
         model = init_model(
             device,
             args.window_size,
             len(control_var_names),
-            adapter.measurement_count(),
+            adapter.measurement_count(feature_option),
             model_args=args,
         )
 
@@ -796,6 +817,10 @@ def main() -> None:
                 print(f"Checkpoint root: {checkpoint_root_path}")
             if save_model_path is not None:
                 print(f"Final model will be saved to: {save_model_path.as_posix()}")
+            print("\nSelected feature columns:")
+            print(f"  Controls (U): {control_var_names}")
+            print(f"  Measurements (X): {measurement_var_names}")
+            print("  Labels and timestamps are excluded from model inputs; timestamps are only for ordering, labels for filtering/metrics.")
             print("=" * 80)
 
         if args.checkpoint:
@@ -854,6 +879,8 @@ def main() -> None:
             world_size=world_size,
             baseline_from=args.baseline_from,
             severity_range=severity_range,
+            feature_option=feature_option,
+            fault_keys=ashrae_faults,
         )
 
         best_val_loss = float("inf")

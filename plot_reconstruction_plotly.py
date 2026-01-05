@@ -44,6 +44,13 @@ def parse_args() -> argparse.Namespace:
         help="Dataset adapter to use for loading data (e.g., 'co2', 'co2_1min').",
     )
     parser.add_argument(
+        "--ashrae-feature-option",
+        type=str,
+        choices=["a", "b"],
+        default="a",
+        help="ASHRAE only: 'a' (minimal context) or 'b' (control-aware). Ignored for other datasets.",
+    )
+    parser.add_argument(
         "--data-dir",
         default=None,
         help="Override dataset directory (adapter default used when omitted).",
@@ -201,6 +208,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Plot only anomaly scores over time (omit actual/reconstructed series).",
     )
+    parser.add_argument(
+        "--median-windows",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Optional rolling median window sizes to smooth anomaly/divergence scores and emit extra Plotly plots.",
+    )
     return parser.parse_args()
 
 
@@ -219,6 +233,7 @@ def build_dataset(
     dataset_key: str,
     args: argparse.Namespace,
     data_dir: str,
+    feature_option: Optional[str] = None,
 ) -> any:
     dataset_cls = adapter.dataset_cls
     if dataset_cls is None:
@@ -232,12 +247,18 @@ def build_dataset(
     print(f"\nLoading training dataset for normalization ({len(train_sources)} file(s)):")
     for f in train_sources:
         print(f"  - {f}")
-    train_dataset = dataset_cls(
-        data_files=train_sources,
+    base_kwargs = dict(
         window_size=args.window_size,
         stride=max(1, args.stride),
         data_dir=data_dir,
         normalize=True,
+    )
+    if adapter.key == "ashrae" and feature_option is not None:
+        base_kwargs["feature_option"] = feature_option
+
+    train_dataset = dataset_cls(
+        data_files=train_sources,
+        **base_kwargs,
     )
     norm_stats = train_dataset.get_normalization_stats()
     del train_dataset
@@ -246,13 +267,12 @@ def build_dataset(
     for f in eval_sources:
         print(f"  - {f}")
 
+    eval_kwargs = dict(base_kwargs)
+    eval_kwargs["normalization_stats"] = norm_stats
+
     eval_dataset = dataset_cls(
         data_files=eval_sources,
-        window_size=args.window_size,
-        stride=max(1, args.stride),
-        data_dir=data_dir,
-        normalize=True,
-        normalization_stats=norm_stats,
+        **eval_kwargs,
     )
     return eval_dataset
 
@@ -288,6 +308,12 @@ def gather_time_series(
                 recon, edge_index, edge_attr, aux = unpack_model_outputs(outputs)
                 target = batch_obj.x.unsqueeze(-1)
 
+            divergence_scores = None
+            if isinstance(aux, dict):
+                divergence_scores = aux.get("divergence_score")
+                if divergence_scores is not None:
+                    divergence_scores = divergence_scores.detach().cpu().view(-1)
+
             per_timestep = base_model.compute_anomaly_scores_per_timestep(
                 target, recon, edge_index, edge_attr
             ).detach().cpu()
@@ -307,6 +333,9 @@ def gather_time_series(
                     .reset_index(drop=True)
                 )
                 anomaly_series = per_timestep[local_idx].numpy()
+                divergence_value = (
+                    float(divergence_scores[local_idx]) if divergence_scores is not None else None
+                )
 
                 if include_values and sensor_index is not None:
                     actual_series = target_np[local_idx, sensor_index]
@@ -318,6 +347,8 @@ def gather_time_series(
                         "timestep_index": step_idx,
                         "anomaly_score": float(anomaly_series[step_idx]),
                     }
+                    if divergence_value is not None:
+                        entry["divergence_score"] = divergence_value
                     if include_values and sensor_index is not None:
                         entry["actual"] = float(actual_series[step_idx])
                         entry["reconstructed"] = float(recon_series[step_idx])
@@ -374,6 +405,19 @@ def aggregate_by_timestamp(
     grouped = grouped.merge(anomaly_median, on="timestamp", how="left")
     grouped = grouped.merge(anomaly_mean, on="timestamp", how="left")
 
+    if "divergence_score" in df.columns:
+        divergence_median = (
+            df.groupby("timestamp", as_index=False)["divergence_score"]
+            .median()
+        )
+        divergence_mean = (
+            df.groupby("timestamp", as_index=False)["divergence_score"]
+            .mean()
+            .rename(columns={"divergence_score": "divergence_score_mean"})
+        )
+        grouped = grouped.merge(divergence_median, on="timestamp", how="left")
+        grouped = grouped.merge(divergence_mean, on="timestamp", how="left")
+
     if denormalize and include_values and sensor_index is not None:
         mean = dataset.measurement_mean[sensor_index]
         std = dataset.measurement_std[sensor_index]
@@ -390,6 +434,10 @@ def build_plot(
     sensor_name: str,
     dataset_label: str,
     include_values: bool,
+    include_divergence: bool,
+    *,
+    anomaly_col: str = "anomaly_score",
+    divergence_col: str = "divergence_score",
 ) -> go.Figure:
     if include_values:
         fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -414,13 +462,24 @@ def build_plot(
         fig.add_trace(
             go.Scatter(
                 x=timeseries["timestamp"],
-                y=timeseries["anomaly_score"],
+                y=timeseries[anomaly_col],
                 name="Anomaly Score",
                 mode="lines",
                 line=dict(color="firebrick", dash="dot"),
             ),
             secondary_y=True,
         )
+        if include_divergence and divergence_col in timeseries:
+            fig.add_trace(
+                go.Scatter(
+                    x=timeseries["timestamp"],
+                    y=timeseries[divergence_col],
+                    name="Divergence Score",
+                    mode="lines",
+                    line=dict(color="seagreen", dash="dash"),
+                ),
+                secondary_y=True,
+            )
 
         title = f"{dataset_label} – {sensor_name}"
         fig.update_layout(
@@ -430,25 +489,37 @@ def build_plot(
         )
         fig.update_xaxes(title_text="Timestamp")
         fig.update_yaxes(title_text="Sensor Value", secondary_y=False)
-        fig.update_yaxes(title_text="Anomaly Score", secondary_y=True)
+        y2_label = "Anomaly / Divergence Score" if include_divergence else "Anomaly Score"
+        fig.update_yaxes(title_text=y2_label, secondary_y=True)
     else:
         fig = go.Figure()
         fig.add_trace(
             go.Scatter(
                 x=timeseries["timestamp"],
-                y=timeseries["anomaly_score"],
+                y=timeseries[anomaly_col],
                 name="Anomaly Score",
                 mode="lines",
                 line=dict(color="firebrick"),
             )
         )
+        if include_divergence and divergence_col in timeseries:
+            fig.add_trace(
+                go.Scatter(
+                    x=timeseries["timestamp"],
+                    y=timeseries[divergence_col],
+                    name="Divergence Score",
+                    mode="lines",
+                    line=dict(color="seagreen", dash="dash"),
+                )
+            )
         title = f"{dataset_label} – Anomaly Score"
         fig.update_layout(
             title=title,
             hovermode="x unified",
         )
         fig.update_xaxes(title_text="Timestamp")
-        fig.update_yaxes(title_text="Anomaly Score")
+        y_label = "Anomaly / Divergence Score" if include_divergence else "Anomaly Score"
+        fig.update_yaxes(title_text=y_label)
     return fig
 
 
@@ -507,6 +578,8 @@ def main() -> None:
     if not dataset_keys:
         dataset_keys.append(args.dataset)
 
+    feature_option = args.ashrae_feature_option if args.dataset_key == "ashrae" else None
+
     seen = set()
     ordered_keys: List[str] = []
     for key in dataset_keys:
@@ -522,12 +595,12 @@ def main() -> None:
     device, _ = resolve_devices(args.device, args.cuda_device, None)
     amp_enabled = args.use_amp and device.type == "cuda"
 
-    control_var_names = adapter.get_control_variables(data_dir)
+    control_var_names = adapter.get_control_variables(data_dir, feature_option=feature_option)
     model = init_model(
         device,
         args.window_size,
         len(control_var_names),
-        adapter.measurement_count(),
+        adapter.measurement_count(feature_option),
         model_args=args,
     )
 
@@ -586,7 +659,7 @@ def main() -> None:
 
     for dataset_key in dataset_keys:
         print(f"\n=== Processing dataset: {dataset_key} ===")
-        dataset = build_dataset(adapter, dataset_key, args, data_dir)
+        dataset = build_dataset(adapter, dataset_key, args, data_dir, feature_option=feature_option)
 
         loader = DataLoader(
             dataset,
@@ -615,6 +688,18 @@ def main() -> None:
             sensor_index=sensor_index,
             include_values=include_values,
         )
+        include_divergence = "divergence_score" in timeseries.columns
+
+        # Add median-smoothed variants if requested
+        median_windows = [w for w in (args.median_windows or []) if w and w > 1]
+        for w in median_windows:
+            timeseries[f"anomaly_score_med_{w}"] = (
+                timeseries["anomaly_score"].rolling(window=w, center=True, min_periods=1).median()
+            )
+            if include_divergence:
+                timeseries[f"divergence_score_med_{w}"] = (
+                    timeseries["divergence_score"].rolling(window=w, center=True, min_periods=1).median()
+                )
 
         if html_override and not multi_dataset:
             html_path = html_override
@@ -625,9 +710,31 @@ def main() -> None:
             safe_dataset = dataset_key.replace("/", "_").replace(" ", "_")
             html_path = html_dir / f"{safe_dataset}_{safe_sensor}_{file_suffix}.html"
 
-        fig = build_plot(timeseries, label_for_naming, dataset_key, include_values)
+        fig = build_plot(timeseries, label_for_naming, dataset_key, include_values, include_divergence)
         fig.write_html(str(html_path), include_plotlyjs="cdn")
         print(f"Saved Plotly visualization to {html_path}")
+
+        # Extra Plotly plots for each median window (if provided)
+        for w in median_windows:
+            anom_col = f"anomaly_score_med_{w}"
+            div_col = f"divergence_score_med_{w}" if include_divergence else None
+            if anom_col not in timeseries.columns:
+                continue
+            html_dir = base_html_dir / dataset_key if html_override is None or multi_dataset else base_html_dir
+            html_dir.mkdir(parents=True, exist_ok=True)
+            safe_dataset = dataset_key.replace("/", "_").replace(" ", "_")
+            html_path_med = html_dir / f"{safe_dataset}_{safe_sensor}_{file_suffix}_med{w}.html"
+            fig_med = build_plot(
+                timeseries,
+                label_for_naming,
+                f"{dataset_key} (median {w})",
+                include_values,
+                include_divergence,
+                anomaly_col=anom_col,
+                divergence_col=div_col or "divergence_score",
+            )
+            fig_med.write_html(str(html_path_med), include_plotlyjs="cdn")
+            print(f"Saved median-smoothed Plotly (w={w}) to {html_path_med}")
 
         if csv_override and not multi_dataset:
             csv_path = csv_override

@@ -47,6 +47,9 @@ def _create_dataloaders(
     rank: int,
     world_size: int,
     baseline_from: str = "val",
+    severity_range: Tuple[int, int] | None = None,
+    feature_option: str | None = None,
+    fault_keys: List[str] | None = None,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     if test_stride is None:
         test_stride = val_stride
@@ -178,7 +181,7 @@ register_adapter(
         default_data_dir=os.path.join("data", "tep", "raw"),
         measurement_vars=MEASUREMENT_VARS,
         dataset_cls=TEPDataset,
-        control_names_fn=lambda _: CONTROL_VARS.copy(),
+        control_names_fn=lambda _, __=None: CONTROL_VARS.copy(),
         dataloader_factory=_create_dataloaders,
         resolve_split_files_fn=_resolve_split_files,
         list_fault_keys_fn=_list_fault_keys,

@@ -53,6 +53,13 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Stride applied to train/val/test loaders during the check.",
     )
+    parser.add_argument(
+        "--ashrae-feature-option",
+        type=str,
+        choices=["a", "b"],
+        default="a",
+        help="ASHRAE only: 'a' (minimal context) or 'b' (control-aware). Ignored for other datasets.",
+    )
     args = parser.parse_args()
     if args.dataset_key is None:
         parser.error(
@@ -76,9 +83,10 @@ def test_model(args: argparse.Namespace) -> None:
             f"Dataset adapter '{args.dataset_key}' does not define a default data directory. "
             "Please provide --data-dir."
         )
-    control_var_names = adapter.get_control_variables(data_dir)
+    feature_option = args.ashrae_feature_option if args.dataset_key == "ashrae" else None
+    control_var_names = adapter.get_control_variables(data_dir, feature_option=feature_option)
     cfg.set_dataset_params(
-        n_nodes=adapter.measurement_count(),
+        n_nodes=adapter.measurement_count(feature_option),
         window_size=WINDOW_SIZE,
         ocvar_dim=len(control_var_names)  # Control variables (may include time encodings)
     )
@@ -96,6 +104,8 @@ def test_model(args: argparse.Namespace) -> None:
         test_stride=args.stride,
         data_dir=data_dir,
         num_workers=0,
+        feature_option=feature_option,
+        fault_keys=None,
     )
     print(f"✅ DataLoaders created:")
     print(f"   Train: {len(train_loader)} batches")
