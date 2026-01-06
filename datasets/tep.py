@@ -50,6 +50,7 @@ def _create_dataloaders(
     severity_range: Tuple[int, int] | None = None,
     feature_option: str | None = None,
     fault_keys: List[str] | None = None,
+    pred_horizon: int | None = None,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     if test_stride is None:
         test_stride = val_stride
@@ -67,6 +68,7 @@ def _create_dataloaders(
         data_dir=data_dir,
         normalize=True,
         fault_filter=[0],
+        pred_horizon=pred_horizon or 0,
     )
     norm_stats = train_dataset.get_normalization_stats()
 
@@ -80,6 +82,7 @@ def _create_dataloaders(
         normalize=True,
         normalization_stats=norm_stats,
         fault_filter=[0],
+        pred_horizon=pred_horizon or 0,
     )
 
     # Testing on fault-free + all faults
@@ -97,6 +100,7 @@ def _create_dataloaders(
         normalize=True,
         normalization_stats=norm_stats,
         fault_filter=[0],
+        pred_horizon=pred_horizon or 0,
     )
     test_datasets["baseline"] = baseline_test
 
@@ -112,6 +116,7 @@ def _create_dataloaders(
         normalize=True,
         normalization_stats=norm_stats,
         fault_filter=None, # No filter = load everything
+        pred_horizon=pred_horizon or 0,
     )
     test_datasets["test_all_faults"] = combined_test
 

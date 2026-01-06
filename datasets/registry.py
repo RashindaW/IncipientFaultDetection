@@ -47,6 +47,7 @@ class DatasetAdapter:
                 Optional[Tuple[int, int]],
                 Optional[str],
                 Optional[List[str]],
+                Optional[int],
             ],
             Tuple[DatasetType, DatasetType, Dict[str, DatasetType]],
         ]
@@ -102,6 +103,7 @@ class DatasetAdapter:
         severity_range: Optional[Tuple[int, int]] = None,
         feature_option: Optional[str] = None,
         fault_keys: Optional[List[str]] = None,
+        pred_horizon: Optional[int] = None,
     ):
         self.ensure("training")
         if self.dataloader_factory is None:
@@ -121,6 +123,7 @@ class DatasetAdapter:
             severity_range,
             feature_option,
             fault_keys,
+            pred_horizon,
         )
 
     def resolve_split_files(self, split_key: str) -> List[str]:

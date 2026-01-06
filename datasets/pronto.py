@@ -52,6 +52,7 @@ def _create_dataloaders(
     severity_range: Tuple[int, int] | None = None,
     feature_option: str | None = None,
     fault_keys: List[str] | None = None,
+    pred_horizon: int | None = None,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     
     if test_stride is None:
@@ -74,7 +75,8 @@ def _create_dataloaders(
         stride=train_stride,
         data_dir=full_data_dir,
         normalize=True,
-        segments_to_load=[0, 1] # Train on first two runs
+        segments_to_load=[0, 1], # Train on first two runs
+        pred_horizon=pred_horizon or 0,
     )
     norm_stats = train_dataset.get_normalization_stats()
     
@@ -88,7 +90,8 @@ def _create_dataloaders(
         normalize=True,
         normalization_stats=norm_stats,
         segments_to_load=[2], # Validate on third run
-        require_stats=True
+        require_stats=True,
+        pred_horizon=pred_horizon or 0,
     )
 
     print("[3/3] Loading TEST datasets...")
@@ -103,7 +106,8 @@ def _create_dataloaders(
         normalize=True,
         normalization_stats=norm_stats,
         segments_to_load=[2],
-        require_stats=True
+        require_stats=True,
+        pred_horizon=pred_horizon or 0,
     )
     
     # Slugging (Novel OC)
@@ -114,7 +118,8 @@ def _create_dataloaders(
         data_dir=full_data_dir,
         normalize=True,
         normalization_stats=norm_stats,
-        require_stats=True
+        require_stats=True,
+        pred_horizon=pred_horizon or 0,
     )
     
     # Faults (All Combined)
@@ -126,7 +131,8 @@ def _create_dataloaders(
         normalize=True,
         normalization_stats=norm_stats,
         require_stats=True,
-        severity_range=severity_range
+        severity_range=severity_range,
+        pred_horizon=pred_horizon or 0,
     )
     
     # Individual Faults
@@ -140,7 +146,8 @@ def _create_dataloaders(
             normalize=True,
             normalization_stats=norm_stats,
             require_stats=True,
-            severity_range=severity_range
+            severity_range=severity_range,
+            pred_horizon=pred_horizon or 0,
         )
 
     # Samplers for Distributed Training

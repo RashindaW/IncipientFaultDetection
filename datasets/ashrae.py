@@ -73,6 +73,7 @@ def _create_dataloaders(
     severity_range: Tuple[int, int] | None = None,
     feature_option: str | None = None,
     fault_keys: List[str] | None = None,
+    pred_horizon: int | None = None,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     """
     Create train, validation, and test dataloaders for ASHRAE dataset.
@@ -117,6 +118,7 @@ def _create_dataloaders(
         data_dir=data_dir,
         normalize=True,
         feature_option=feature_option,
+        pred_horizon=pred_horizon or 0,
         **filter_kwargs,
     )
     
@@ -134,6 +136,7 @@ def _create_dataloaders(
         normalize=True,
         normalization_stats=norm_stats,  # Use training stats
         feature_option=feature_option,
+        pred_horizon=pred_horizon or 0,
         **filter_kwargs,
     )
     
@@ -167,6 +170,7 @@ def _create_dataloaders(
         normalize=True,
         normalization_stats=norm_stats,
         feature_option=feature_option,
+        pred_horizon=pred_horizon or 0,
         **filter_kwargs,
     )
     test_datasets['baseline'] = baseline_test_dataset
@@ -185,6 +189,8 @@ def _create_dataloaders(
             normalize=True,
             normalization_stats=norm_stats,  # Use training stats
             feature_option=feature_option,
+            unit_status_whitelist=BASELINE_UNIT_STATUS_WHITELIST,
+            pred_horizon=pred_horizon or 0,
         )
         test_datasets[fault_name] = fault_dataset
     

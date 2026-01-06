@@ -46,6 +46,7 @@ def _create_dataloaders(
     severity_range: Tuple[int, int] | None = None,
     feature_option: str | None = None,
     fault_keys: List[str] | None = None,
+    pred_horizon: int | None = None,
 ):
     return create_dataloaders(
         window_size=window_size,
@@ -58,6 +59,7 @@ def _create_dataloaders(
         distributed=distributed,
         rank=rank,
         world_size=world_size,
+        pred_horizon=pred_horizon or 0,
     )
 
 

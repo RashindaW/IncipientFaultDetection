@@ -1,9 +1,11 @@
 
 import argparse
 import os
-import sys
 import time
 import csv
+import math
+import shlex
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
@@ -47,6 +49,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=60,
         help="Temporal window size (number of timesteps) for sliding windows.",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        choices=["reconstruction", "prediction"],
+        default="reconstruction",
+        help="Training task: reconstruct the input window or predict future horizon.",
+    )
+    parser.add_argument(
+        "--pred-horizon",
+        type=int,
+        default=0,
+        help="Prediction horizon (required when --task prediction).",
     )
     parser.add_argument(
         "--anomaly-weight",
@@ -183,6 +198,11 @@ def parse_args() -> argparse.Namespace:
         help="Source split for the baseline (normal) test loader; default reuses validation files.",
     )
     parser.add_argument(
+        "--skip-test",
+        action="store_true",
+        help="Skip evaluation on test/fault datasets (train + validation only).",
+    )
+    parser.add_argument(
         "--severity-range",
         type=str,
         default=None,
@@ -213,6 +233,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             f"--dataset-key is required. Available adapters: {', '.join(available_datasets)}"
         )
+    if args.task == "prediction" and args.pred_horizon <= 0:
+        parser.error("--pred-horizon must be > 0 when --task prediction is selected.")
     return args
 
 
@@ -311,12 +333,16 @@ def init_model(
     window_size: int,
     ocvar_dim: int,
     n_nodes: int,
+    task: str,
+    pred_horizon: int,
     model_args: Optional[argparse.Namespace] = None,
 ) -> DyEdgeGAT:
     cfg.set_dataset_params(
         n_nodes=n_nodes,
         window_size=window_size,
         ocvar_dim=ocvar_dim,
+        pred_horizon=pred_horizon,
+        task=task,
     )
     cfg.device = str(device)
     cfg.validate()
@@ -364,7 +390,6 @@ def init_model(
         edge_aggr="temp",
         act="relu",
         aug_control=True,
-        flip_output=True,
         use_spectral_view=use_spectral,
         freq_node_embed_dim=freq_embed_dim,
         freq_max_bins=freq_bins,
@@ -373,6 +398,9 @@ def init_model(
         share_gnn_weights=share_gnn_weights,
         fuse_mode=fuse_mode,
         divergence_type=divergence_type,
+        flip_output=(task == "reconstruction"),
+        task=task,
+        pred_horizon=pred_horizon,
     )
     # Disable cuDNN weight flattening before transferring to device to avoid
     # CUDNN_STATUS_BAD_PARAM in multi-process setups.
@@ -419,6 +447,16 @@ def unpack_model_outputs(outputs):
     return recon, edge_index, edge_attr, aux
 
 
+def resolve_target(batch_obj: Batch, recon: torch.Tensor, task: str) -> torch.Tensor:
+    if task == "prediction":
+        if not hasattr(batch_obj, "y_future"):
+            raise ValueError("Prediction task requires batch.y_future targets.")
+        target = batch_obj.y_future
+    else:
+        target = batch_obj.x
+    return target.reshape_as(recon)
+
+
 def compute_recon_loss(
     model: torch.nn.Module,
     batch,
@@ -430,7 +468,8 @@ def compute_recon_loss(
     if not torch.isfinite(recon).all():
         print("Warning: non-finite reconstruction detected in compute_recon_loss; sanitizing.")
         recon = torch.nan_to_num(recon, nan=0.0, posinf=1e6, neginf=-1e6)
-    target = batch_obj.x.reshape_as(recon)
+    task = getattr(cfg.dataset, "task", "reconstruction")
+    target = resolve_target(batch_obj, recon, task)
     if not torch.isfinite(target).all():
         print("Warning: non-finite target detected in compute_recon_loss; sanitizing.")
         target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -451,6 +490,7 @@ def train_epoch(
 ) -> Tuple[float, float, float]:
     model.train()
     base_model = unwrap_model(model)
+    task = getattr(cfg.dataset, "task", "reconstruction")
     use_graph = getattr(cfg, "anomaly_weight", 0.0) > 0.0
     div_weight = getattr(cfg, "lambda_div", 0.0)
     running_total_loss = 0.0
@@ -475,7 +515,7 @@ def train_epoch(
             if not torch.isfinite(recon).all():
                 print("Warning: non-finite reconstruction detected; sanitizing and skipping anomaly/divergence for this batch.")
                 recon = torch.nan_to_num(recon, nan=0.0, posinf=1e6, neginf=-1e6)
-            target = batch_obj.x.reshape_as(recon)
+            target = resolve_target(batch_obj, recon, task)
             if not torch.isfinite(target).all():
                 print("Warning: non-finite target detected; sanitizing.")
                 target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -540,6 +580,7 @@ def evaluate(
 ) -> Tuple[float, float, Optional[np.ndarray], float]:
     model.eval()
     base_model = unwrap_model(model)
+    task = getattr(cfg.dataset, "task", "reconstruction")
     running_loss = 0.0
     running_score = 0.0
     running_div = 0.0
@@ -553,7 +594,7 @@ def evaluate(
             if not torch.isfinite(recon).all():
                 print("Warning: non-finite reconstruction detected during evaluation; sanitizing.")
                 recon = torch.nan_to_num(recon, nan=0.0, posinf=1e6, neginf=-1e6)
-            target = batch_obj.x.reshape_as(recon)
+            target = resolve_target(batch_obj, recon, task)
             if not torch.isfinite(target).all():
                 print("Warning: non-finite target detected during evaluation; sanitizing.")
                 target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -598,6 +639,100 @@ def evaluate(
 
 
 @torch.no_grad()
+def evaluate_with_per_sample_metrics(
+    model: DyEdgeGAT,
+    loader: torch.utils.data.DataLoader,
+    criterion: torch.nn.Module,
+    device: torch.device,
+    *,
+    distributed: bool = False,
+    amp_enabled: bool = False,
+) -> Tuple[float, float, float, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    model.eval()
+    base_model = unwrap_model(model)
+    task = getattr(cfg.dataset, "task", "reconstruction")
+    running_loss = 0.0
+    running_score = 0.0
+    running_div = 0.0
+    sample_count = 0
+    all_anom = []
+    all_mse = []
+    all_div = []
+
+    for raw_batch in loader:
+        with autocast("cuda", enabled=amp_enabled):
+            outputs, batch_obj = forward_model(model, raw_batch, device, return_graph=True)
+            recon, edge_index, edge_attr, aux = unpack_model_outputs(outputs)
+            if not torch.isfinite(recon).all():
+                recon = torch.nan_to_num(recon, nan=0.0, posinf=1e6, neginf=-1e6)
+            target = resolve_target(batch_obj, recon, task)
+            if not torch.isfinite(target).all():
+                target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
+            loss = criterion(recon, target)
+
+        score = base_model.compute_topology_aware_anomaly_score(
+            target, recon, edge_index, edge_attr
+        )
+        div_loss = aux.get("divergence_loss", torch.tensor(0.0, device=device))
+
+        anom_per = base_model.compute_anomaly_scores_per_sample(
+            target, recon, edge_index, edge_attr
+        )
+        anom_per = torch.nan_to_num(anom_per, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        n = cfg.dataset.n_nodes
+        b = max(int(target.shape[0] // n), 1)
+        err = (target - recon) ** 2
+        mse_per = err.view(b, n, -1).mean(dim=(1, 2))
+
+        div_per = aux.get("divergence_score", None)
+        if div_per is None:
+            div_per = torch.zeros_like(anom_per)
+        else:
+            div_per = div_per.view(-1)
+            if div_per.numel() != anom_per.numel():
+                if div_per.numel() > anom_per.numel():
+                    div_per = div_per[: anom_per.numel()]
+                else:
+                    pad = torch.zeros(anom_per.numel() - div_per.numel(), device=div_per.device)
+                    div_per = torch.cat([div_per, pad])
+
+        all_anom.append(anom_per.detach().cpu().numpy())
+        all_mse.append(mse_per.detach().cpu().numpy())
+        all_div.append(div_per.detach().cpu().numpy())
+
+        batch_size = batch_obj.num_graphs
+        running_loss += loss.detach().item() * batch_size
+        running_score += score.detach().item() * batch_size
+        running_div += div_loss.detach().item() * batch_size
+        sample_count += batch_size
+
+    totals = torch.tensor(
+        [running_loss, running_score, running_div, sample_count],
+        device=device,
+        dtype=torch.float64,
+    )
+    if distributed:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+
+    total_loss, total_score, total_div, total_samples = totals.tolist()
+    denom = max(total_samples, 1.0)
+
+    anom_array = np.concatenate(all_anom) if all_anom else None
+    mse_array = np.concatenate(all_mse) if all_mse else None
+    div_array = np.concatenate(all_div) if all_div else None
+
+    return (
+        float(total_loss / denom),
+        float(total_score / denom),
+        float(total_div / denom),
+        anom_array,
+        mse_array,
+        div_array,
+    )
+
+
+@torch.no_grad()
 def evaluate_tests_and_plot(
     model: DyEdgeGAT,
     loaders: Dict[str, torch.utils.data.DataLoader],
@@ -610,51 +745,114 @@ def evaluate_tests_and_plot(
 ) -> Dict[str, Dict[str, float]]:
     metrics: Dict[str, Dict[str, float]] = {}
     os.makedirs(output_dir, exist_ok=True)
-    
-    print("\nGenerating anomaly score plots and detailed metrics...")
-    
-    # Store all series
-    results_dict = {}
+
+    print("\nGenerating Plotly test metrics (anomaly, MSE, divergence)...")
+
+    results_anom: Dict[str, np.ndarray] = {}
+    results_mse: Dict[str, np.ndarray] = {}
+    results_div: Dict[str, np.ndarray] = {}
     baseline_scores = None
-    
-    # First pass: Collecting scores
+
+    # Collect per-sample metrics for each test loader
     for name, loader in loaders.items():
-        loss, score, scores_array, div_loss = evaluate(
+        loss, score, div_loss, anom_arr, mse_arr, div_arr = evaluate_with_per_sample_metrics(
             model,
             loader,
             criterion,
             device,
             distributed=distributed,
             amp_enabled=amp_enabled,
-            return_scores=True,
         )
         metrics[name] = {"recon_loss": loss, "anomaly_score": score, "divergence": div_loss}
-        
-        if scores_array is not None:
-            results_dict[name] = scores_array
-            
+
+        if anom_arr is not None:
+            results_anom[name] = anom_arr
+            results_mse[name] = mse_arr if mse_arr is not None else np.zeros_like(anom_arr)
+            results_div[name] = div_arr if div_arr is not None else np.zeros_like(anom_arr)
+
             # Identify baseline scores for AUC calculation
-            # Convention: 'baseline' or 'fault_free' in name implies Label 0
             if "baseline" in name.lower() or "fault_free" in name.lower():
                 if baseline_scores is None:
-                    baseline_scores = scores_array
+                    baseline_scores = anom_arr
                 else:
-                    # Concat if multiple baselines
-                    baseline_scores = np.concatenate([baseline_scores, scores_array])
+                    baseline_scores = np.concatenate([baseline_scores, anom_arr])
 
-            # Plot individual series
-            plt.figure(figsize=(12, 6))
-            plt.plot(scores_array, label=f'{name} (Avg: {score:.4f})')
-            plt.title(f"Anomaly Scores over Time - {name}")
-            plt.xlabel("Sample Index")
-            plt.ylabel("Anomaly Score")
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            plt.savefig(os.path.join(output_dir, f"anomaly_plot_{name}.png"))
-            plt.close()
-            
     # Save raw scores
-    np.savez(os.path.join(output_dir, "anomaly_scores.npz"), **results_dict)
+    if results_anom:
+        np.savez(os.path.join(output_dir, "anomaly_scores.npz"), **results_anom)
+        np.savez(os.path.join(output_dir, "mse_scores.npz"), **results_mse)
+        np.savez(os.path.join(output_dir, "divergence_scores.npz"), **results_div)
+
+        try:
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+        except Exception:
+            print("Plotly not available; skipping HTML plot generation.")
+        else:
+            def sanitize_plot_name(value: str) -> str:
+                return (
+                    value.replace("/", "_")
+                    .replace("\\", "_")
+                    .replace(" ", "_")
+                    .replace(":", "_")
+                    .replace(",", "_")
+                )
+
+            for name, series in results_anom.items():
+                x = np.arange(series.shape[0])
+                fig = make_subplots(
+                    rows=3,
+                    cols=1,
+                    shared_xaxes=True,
+                    vertical_spacing=0.02,
+                    subplot_titles=("Anomaly Score", "MSE", "Divergence"),
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=x,
+                        y=series,
+                        mode="lines",
+                        name="anomaly",
+                        showlegend=False,
+                    ),
+                    row=1,
+                    col=1,
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=x,
+                        y=results_mse[name],
+                        mode="lines",
+                        name="mse",
+                        showlegend=False,
+                    ),
+                    row=2,
+                    col=1,
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=x,
+                        y=results_div[name],
+                        mode="lines",
+                        name="divergence",
+                        showlegend=False,
+                    ),
+                    row=3,
+                    col=1,
+                )
+
+                fig.update_layout(
+                    height=900,
+                    width=1200,
+                    title_text=f"Test Set Metrics - {name}",
+                )
+                fig.update_xaxes(title_text="Sample Index", row=3, col=1)
+                fig.update_yaxes(title_text="Anomaly Score", row=1, col=1)
+                fig.update_yaxes(title_text="MSE", row=2, col=1)
+                fig.update_yaxes(title_text="Divergence", row=3, col=1)
+                fig.write_html(
+                    os.path.join(output_dir, f"test_metrics_plot_{sanitize_plot_name(name)}.html")
+                )
     
     # Second pass: Compute Classification Metrics (AUC, Precision, Recall, F1 variants, Delay, Ambiguity)
     # Only if we have a baseline to compare against
@@ -678,7 +876,7 @@ def evaluate_tests_and_plot(
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             
-            for name, scores in results_dict.items():
+            for name, scores in results_anom.items():
                 # Skip if it IS the baseline
                 if "baseline" in name.lower() or "fault_free" in name.lower():
                     continue
@@ -786,6 +984,8 @@ def main() -> None:
         ashrae_faults: Optional[List[str]] = None
         if args.dataset_key == "ashrae" and args.ashrae_faults.lower() != "all":
             ashrae_faults = [f.strip() for f in args.ashrae_faults.split(",") if f.strip()]
+        if args.skip_test and args.dataset_key == "ashrae":
+            ashrae_faults = []
 
         control_var_names = adapter.get_control_variables(data_dir, feature_option=feature_option)
         measurement_var_names = adapter.get_measurement_variables(feature_option)
@@ -794,6 +994,8 @@ def main() -> None:
             args.window_size,
             len(control_var_names),
             adapter.measurement_count(feature_option),
+            args.task,
+            args.pred_horizon,
             model_args=args,
         )
 
@@ -821,6 +1023,7 @@ def main() -> None:
             print(f"  Controls (U): {control_var_names}")
             print(f"  Measurements (X): {measurement_var_names}")
             print("  Labels and timestamps are excluded from model inputs; timestamps are only for ordering, labels for filtering/metrics.")
+            print(f"  Task: {args.task} (pred_horizon={args.pred_horizon})")
             print("=" * 80)
 
         if args.checkpoint:
@@ -881,6 +1084,7 @@ def main() -> None:
             severity_range=severity_range,
             feature_option=feature_option,
             fault_keys=ashrae_faults,
+            pred_horizon=args.pred_horizon,
         )
 
         best_val_loss = float("inf")
@@ -894,6 +1098,9 @@ def main() -> None:
             )
             if is_main_process:
                 print(f"\nSaving per-epoch checkpoints to: {checkpoint_manager.run_path}")
+                command_path = Path(checkpoint_manager.run_path) / "train_command.txt"
+                command = shlex.join([sys.executable] + sys.argv)
+                command_path.write_text(f"{command}\n", encoding="utf-8")
 
             for epoch in range(1, args.epochs + 1):
                 start_time = time.time()
@@ -926,6 +1133,8 @@ def main() -> None:
                         f"time={elapsed:.1f}s"
                     )
                     if checkpoint_manager is not None:
+                        train_rmse = math.sqrt(train_recon_loss)
+                        val_rmse = math.sqrt(val_loss)
                         checkpoint_path = checkpoint_manager.save_epoch(
                             epoch=epoch,
                             model=base_model,
@@ -933,6 +1142,16 @@ def main() -> None:
                             val_loss=val_loss,
                             val_anom=val_score,
                             elapsed_time=elapsed,
+                            extra_state={
+                                "train_mse": f"{train_recon_loss:.6f}",
+                                "train_rmse": f"{train_rmse:.6f}",
+                                "train_div": f"{train_div:.6f}",
+                                "train_anom": f"{train_anom:.6f}",
+                                "val_mse": f"{val_loss:.6f}",
+                                "val_rmse": f"{val_rmse:.6f}",
+                                "val_div": f"{val_div:.6f}",
+                                "val_anom": f"{val_score:.6f}",
+                            },
                         )
                         print(f"  ↳ checkpoint saved: {checkpoint_path.name}")
 
@@ -982,7 +1201,13 @@ def main() -> None:
                 f"\nValidation summary -> recon_loss={val_summary_loss:.6f} "
                 f"anomaly_score={val_summary_score:.6f} div={val_summary_div:.6f}"
             )
+
+        if args.skip_test:
+            if is_main_process:
+                print("\nSkipping test evaluation (--skip-test).")
+            return
             
+        if is_main_process:
             # Create output directory for plots
             if checkpoint_manager is not None:
                 plot_dir = os.path.join(checkpoint_manager.run_path, "plots")
