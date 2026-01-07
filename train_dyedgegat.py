@@ -193,9 +193,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--baseline-from",
         type=str,
-        choices=["val", "train"],
-        default="val",
-        help="Source split for the baseline (normal) test loader; default reuses validation files.",
+        choices=["val", "train", "test"],
+        default="test",
+        help="Source split for the baseline (normal) test loader; default uses benchmark test split.",
     )
     parser.add_argument(
         "--skip-test",
@@ -1229,11 +1229,16 @@ def main() -> None:
                 plt.savefig(os.path.join(plot_dir, "anomaly_plot_validation.png"))
                 plt.close()
 
-            print("\nEvaluating on test datasets...")
+            print("\nEvaluating on benchmark validation/test plus fault datasets...")
+
+            eval_loaders = {"baseline_val": val_loader}
+            for name, loader in test_loaders.items():
+                key = "baseline_test" if name == "baseline" else name
+                eval_loaders[key] = loader
 
             test_scores = evaluate_tests_and_plot(
                 model,
-                test_loaders,
+                eval_loaders,
                 criterion,
                 device,
                 output_dir=plot_dir,

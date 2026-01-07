@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import List, Tuple, Optional, Dict
 import torch
 from torch_geometric.loader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from dyedgegat.src.data.ashrae_column_config import (
-    BASELINE_FILES, 
-    FAULT_FILES, 
+    FAULT_FILES,
     MEASUREMENT_VARS,
     BENCHMARK_DIR,
     BASELINE_FAULT_CODE_WHITELIST,
@@ -27,30 +27,89 @@ from .registry import DatasetAdapter, register_adapter
 def _resolve_split_files(split_key: str) -> List[str]:
     """Resolve dataset split key to list of file paths."""
     key = split_key.lower()
-    
-    # Handle baseline/validation splits
-    if key in ("baseline", "val"):
-        # Return validation files with full path from benchmark directory
-        return [os.path.join(BENCHMARK_DIR, f) for f in BASELINE_FILES["val"]]
-    
-    if key == "train":
-        # Return training files with full path from benchmark directory
-        return [os.path.join(BENCHMARK_DIR, f) for f in BASELINE_FILES["train"]]
-    
-    # Handle fault files
+
+    if key in ("train", "val", "test", "baseline"):
+        benchmark_files = _list_benchmark_files(ASHRAE_DEFAULT_DIR)
+        train_files, val_files, test_files = _split_benchmark_files(benchmark_files)
+        if key == "train":
+            return train_files
+        if key == "val":
+            return val_files
+        return test_files
+
+    # NOTE: Benchmarks are split dynamically in _create_dataloaders. This resolver
+    # remains for tooling that expects fault keys.
     if split_key in FAULT_FILES:
         subdir, fault_file = FAULT_FILES[split_key]
         return [os.path.join(subdir, fault_file)]
-    
+
     # Try case-insensitive match for fault names
     for fault_name, (subdir, fault_file) in FAULT_FILES.items():
         if fault_name.lower() == key:
             return [os.path.join(subdir, fault_file)]
-    
+
     raise ValueError(
         f"Unknown dataset split '{split_key}'. Valid options: "
-        f"'train', 'baseline', 'val', or one of {list(FAULT_FILES.keys())}"
+        f"one of {list(FAULT_FILES.keys())}"
     )
+
+
+def _list_benchmark_files(data_dir: str) -> List[str]:
+    """List benchmark CSV files (relative paths) under the data directory."""
+    benchmark_root = os.path.join(data_dir, BENCHMARK_DIR)
+    files: List[str] = []
+    for root, _, filenames in os.walk(benchmark_root):
+        for filename in filenames:
+            if not filename.lower().endswith(".csv"):
+                continue
+            full_path = os.path.join(root, filename)
+            files.append(os.path.relpath(full_path, data_dir))
+    return sorted(files)
+
+
+def _split_benchmark_files(files: List[str]) -> Tuple[List[str], List[str], List[str]]:
+    """Split benchmark files into train/val/test by file count (70/20/10)."""
+    total = len(files)
+    if total == 0:
+        return [], [], []
+    train_count = int(total * 0.7)
+    val_count = int(total * 0.2)
+    test_count = total - train_count - val_count
+    if train_count == 0:
+        train_count = 1
+        test_count = max(0, total - train_count - val_count)
+    if test_count == 0 and total >= 2:
+        test_count = 1
+        if val_count > 0:
+            val_count -= 1
+        else:
+            train_count -= 1
+    train_files = files[:train_count]
+    val_files = files[train_count:train_count + val_count]
+    test_files = files[train_count + val_count:]
+    return train_files, val_files, test_files
+
+
+def _severity_from_filename(filename: str) -> Optional[int]:
+    numbers = re.findall(r"\d+", filename)
+    if not numbers:
+        return None
+    return min(int(value) for value in numbers)
+
+
+def _filter_faults_by_severity(
+    fault_items: List[Tuple[str, Tuple[str, str]]],
+    severity_range: Tuple[int, int],
+) -> List[Tuple[str, Tuple[str, str]]]:
+    min_sev, max_sev = severity_range
+    filtered = []
+    for name, (subdir, filename) in fault_items:
+        severity = _severity_from_filename(filename)
+        if severity is None:
+            continue
+        if min_sev <= severity <= max_sev:
+            filtered.append((name, (subdir, filename)))
+    return filtered
 
 
 def _list_faults() -> List[str]:
@@ -74,6 +133,7 @@ def _create_dataloaders(
     feature_option: str | None = None,
     fault_keys: List[str] | None = None,
     pred_horizon: int | None = None,
+    max_time_gap: float = 12.0,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     """
     Create train, validation, and test dataloaders for ASHRAE dataset.
@@ -84,7 +144,7 @@ def _create_dataloaders(
         train_stride: Stride for training data sliding window
         val_stride: Stride for validation data (larger=faster, fewer samples)
         test_stride: Stride for test data (defaults to val_stride when None)
-        data_dir: Directory containing ASHRAE XLS files
+        data_dir: Directory containing ASHRAE CSV files
         num_workers: Number of worker processes for data loading
         distributed: Enable DistributedSampler for multi-process training
         rank: Rank of the current process (used when distributed=True)
@@ -105,7 +165,12 @@ def _create_dataloaders(
     
     # ========== Create Training Dataset ==========
     print("\n[1/3] Creating TRAINING dataset (Benchmark Tests)...")
-    train_files = [os.path.join(BENCHMARK_DIR, f) for f in BASELINE_FILES['train']]
+    benchmark_files = _list_benchmark_files(data_dir)
+    train_files, val_files, test_files = _split_benchmark_files(benchmark_files)
+    print(
+        f"  Benchmark files: {len(benchmark_files)} | "
+        f"Train/Val/Test: {len(train_files)}/{len(val_files)}/{len(test_files)}"
+    )
     filter_kwargs = dict(
         fault_code_whitelist=BASELINE_FAULT_CODE_WHITELIST,
         unit_status_whitelist=BASELINE_UNIT_STATUS_WHITELIST,
@@ -119,6 +184,7 @@ def _create_dataloaders(
         normalize=True,
         feature_option=feature_option,
         pred_horizon=pred_horizon or 0,
+        max_time_gap=max_time_gap,
         **filter_kwargs,
     )
     
@@ -127,7 +193,6 @@ def _create_dataloaders(
     
     # ========== Create Validation Dataset ==========
     print("\n[2/3] Creating VALIDATION dataset (Near Normal Tests)...")
-    val_files = [os.path.join(BENCHMARK_DIR, f) for f in BASELINE_FILES['val']]
     val_dataset = ASHRAEDataset(
         data_files=val_files,
         window_size=window_size,
@@ -137,6 +202,7 @@ def _create_dataloaders(
         normalization_stats=norm_stats,  # Use training stats
         feature_option=feature_option,
         pred_horizon=pred_horizon or 0,
+        max_time_gap=max_time_gap,
         **filter_kwargs,
     )
     
@@ -156,12 +222,19 @@ def _create_dataloaders(
         if unknown:
             raise ValueError(f"Unknown ASHRAE fault keys: {unknown}. Valid: {list(FAULT_FILES.keys())}")
         selected_faults = selected
+    elif severity_range is not None:
+        selected_faults = _filter_faults_by_severity(selected_faults, severity_range)
     
     # Baseline test (normal operation)
     print("  - Baseline (near normal operation)")
-    if baseline_from not in ("val", "train"):
-        raise ValueError(f"baseline_from must be 'val' or 'train', got {baseline_from}")
-    baseline_source_files = val_files if baseline_from == "val" else train_files
+    if baseline_from not in ("val", "train", "test"):
+        raise ValueError(f"baseline_from must be 'train', 'val', or 'test', got {baseline_from}")
+    if baseline_from == "val":
+        baseline_source_files = val_files
+    elif baseline_from == "test":
+        baseline_source_files = test_files
+    else:
+        baseline_source_files = train_files
     baseline_test_dataset = ASHRAEDataset(
         data_files=baseline_source_files,
         window_size=window_size,
@@ -171,6 +244,7 @@ def _create_dataloaders(
         normalization_stats=norm_stats,
         feature_option=feature_option,
         pred_horizon=pred_horizon or 0,
+        max_time_gap=max_time_gap,
         **filter_kwargs,
     )
     test_datasets['baseline'] = baseline_test_dataset
@@ -191,6 +265,7 @@ def _create_dataloaders(
             feature_option=feature_option,
             unit_status_whitelist=BASELINE_UNIT_STATUS_WHITELIST,
             pred_horizon=pred_horizon or 0,
+            max_time_gap=max_time_gap,
         )
         test_datasets[fault_name] = fault_dataset
     
@@ -271,6 +346,10 @@ def _create_dataloaders(
     print(f"  Samples: {len(val_dataset)}")
     print(f"  Batches: {len(val_loader)}")
     print()
+    print(f"Benchmark Test Holdout:")
+    print(f"  Files: {len(test_files)}")
+    print(f"  Samples: {len(baseline_test_dataset)}")
+    print()
     print(f"Testing:")
     for name, loader in test_loaders.items():
         print(f"  {name:30s}: {len(loader.dataset):6d} samples, {len(loader):4d} batches")
@@ -288,13 +367,16 @@ def _create_dataloaders(
 
 
 # Default data directory for ASHRAE dataset
-ASHRAE_DEFAULT_DIR = os.path.join("data", "ASHRAE_1043_RP")
+ASHRAE_DEFAULT_DIR = os.path.join("data", "ASHRAE_csv")
 
 # Register the ASHRAE adapter
 register_adapter(
     DatasetAdapter(
         key="ashrae",
-        description="ASHRAE 1043-RP water-cooled chiller dataset. Training on benchmark tests, testing on refrigerant leak.",
+        description=(
+            "ASHRAE 1043-RP water-cooled chiller dataset (CSV). "
+            "Benchmark tests split by file for train/val/test."
+        ),
         default_data_dir=ASHRAE_DEFAULT_DIR,
         measurement_vars=MEASUREMENT_VARS,
         measurement_vars_resolver=get_measurement_vars,
