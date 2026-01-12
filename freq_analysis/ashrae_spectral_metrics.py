@@ -14,14 +14,14 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from dyedgegat.src.data.ashrae_column_config import (
+from dystgat.src.data.ashrae_column_config import (
     BASELINE_FILES,
     FAULT_FILES,
     BENCHMARK_DIR,
     BASELINE_FAULT_CODE_WHITELIST,
     BASELINE_UNIT_STATUS_WHITELIST,
 )
-from dyedgegat.src.data.ashrae_dataset import ASHRAEDataset, ASHRAEFaultDataset
+from dystgat.src.data.ashrae_dataset import ASHRAEDataset, ASHRAEFaultDataset
 
 try:
     from scipy.stats import ks_2samp

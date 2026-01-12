@@ -1,8 +1,8 @@
-# Dual-View Spectral-Temporal DyEdge
+# DySTGAT: Dual-View Spectral-Temporal Graph Attention for Enhanced Fault Detection
 
 A specialized framework for **incipient fault detection** in complex industrial systems using **Dynamic Graph Neural Networks**.
 
-This repository implements **DyEdgeGAT** with a novel **Dual-View (Spectral + Temporal) Architecture**. It learns two concurrent graph topologies:
+This repository implements **DySTGAT** (Dynamic Spectral-Temporal Graph ATtention) with a novel **Dual-View (Spectral + Temporal) Architecture**. It learns two concurrent graph topologies:
 1.  **Temporal Graph ($A_{time}$)**: Captures dynamic correlations (nodes moving together).
 2.  **Spectral Graph ($A_{freq}$)**: Captures frequency-domain similarities (nodes resonating together).
 
@@ -15,7 +15,7 @@ By monitoring the **structural divergence** between these two graphs ($D_{div}$)
 *   **Dual-View Learning**: Simultaneous `GRUEncoder` (time) and `SpectralEncoder` (frequency) branches.
 *   **Structural Divergence Score**: Explicitly measures mismatch between physical connectivity and spectral behavior (early warning signal).
 *   **Topology-Aware Anomaly Scoring**: Penalizes errors on central nodes more heavily.
-*   **Multi-Dataset Support**: Ready for TEP, CO₂, PRONTO, and IMS Bearing benchmarks.
+*   **Multi-Dataset Support**: Ready for TEP, CO2, PRONTO, ASHRAE, and IMS Bearing benchmarks.
 *   **Interactive Visualization**: Plotly-based dashboards for reconstruction and anomaly score analysis.
 
 ---
@@ -28,19 +28,21 @@ Data adapters are defined in `datasets/` and accessed via `--dataset-key`.
 | :--- | :--- | :--- | :--- | :--- |
 | `tep` | Tennessee Eastman Process | Chemical Process | **Ready** | [Open](http://brahms.scs.uiuc.edu) |
 | `pronto` | PRONTO Benchmark | Multiphase Flow | **Ready** | [Zenodo](https://zenodo.org/records/1341583) |
+| `ashrae` | ASHRAE 1043-RP | HVAC/Refrigeration | **Ready** | Research Project |
 | `ims` | NASA IMS Bearing | Rotating Machinery | **Ready** | [NASA](https://data.nasa.gov/dataset/ims-bearings) |
 | `swat` | SWaT (Secure Water Treatment) | ICS / Cyber-Physical | *Request* | [iTrust](https://itrust.sutd.edu.sg) |
-| `co2` | CO₂ Refrigeration | HVAC | **Ready** | Proprietary/Internal |
+| `co2` | CO2 Refrigeration | HVAC | **Ready** | Proprietary/Internal |
 
 ### 2.1 Data Setup
 Place datasets in `data/`:
 ```bash
-DyEdge/
+DySTGAT/
 ├── data/
-│   ├── tep/raw/        # TEP .RData files
-│   ├── pronto/         # PRONTO benchmark files
-│   ├── IMS_Bearing/    # 1st_test, 2nd_test, etc.
-│   └── swat/           # SWaT .csv files
+│   ├── tep/raw/           # TEP .RData files
+│   ├── pronto/            # PRONTO benchmark files
+│   ├── ASHRAE_1043_RP/    # ASHRAE CSV files
+│   ├── IMS_Bearing/       # 1st_test, 2nd_test, etc.
+│   └── swat/              # SWaT .csv files
 ```
 See `data/README.md` for detailed download instructions.
 
@@ -52,7 +54,7 @@ To train the **Dual-View Spectral-Temporal** model, use the `--use-spectral-view
 
 ### Example: Training on TEP
 ```bash
-python train_dyedgegat.py \
+python train_dystgat.py \
     --dataset-key tep \
     --use-spectral-view \
     --freq-embed-dim 16 \
@@ -101,8 +103,8 @@ Outputs HTML plots to `outputs/plotly/`.
 
 ## 5. Repository Structure
 
-*   `dyedgegat/src/model/dyedgegat.py`: Core model (Dual-View Architecture).
-*   `train_dyedgegat.py`: Main training loop with divergence loss.
+*   `dystgat/src/model/dystgat.py`: Core model (Dual-View Architecture).
+*   `train_dystgat.py`: Main training loop with divergence loss.
 *   `evaluate_tep_anomaly.py`: Evaluation script for TEP.
 *   `datasets/`: Data adapters for different benchmarks.
 *   `checkpoints/`: Model artifacts.
@@ -110,4 +112,4 @@ Outputs HTML plots to `outputs/plotly/`.
 ## 6. Quick Start
 1.  Install dependencies: `pip install -r requirements.txt`
 2.  Download TEP or PRONTO data (see `data/README.md`).
-3.  Run a test: `python test_dyedgegat_model.py --dataset-key tep`
+3.  Run a test: `python test_dystgat_model.py --dataset-key tep`

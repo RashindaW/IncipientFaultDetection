@@ -1,14 +1,14 @@
 #!/bin/bash
 
-# Run baseline DyEdgeGAT WITHOUT spectral view
+# Run baseline DySTGAT WITHOUT spectral view
 # This should be closer to the original paper's architecture
 
 echo "=============================================================================="
-echo "Running BASELINE DyEdgeGAT (without spectral view)"
+echo "Running BASELINE DySTGAT (without spectral view)"
 echo "This matches the original paper's architecture more closely"
 echo "=============================================================================="
 
-CUDA_VISIBLE_DEVICES=3 python train_dyedgegat.py \
+CUDA_VISIBLE_DEVICES=3 python train_dystgat.py \
     --dataset-key pronto \
     --window-size 15 \
     --anomaly-weight 0.5 \

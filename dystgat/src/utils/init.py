@@ -1,8 +1,8 @@
 """
-Weight initialization utilities for DyEdgeGAT.
+Weight initialization utilities for DySTGAT.
 
 This module provides standard weight initialization schemes for various
-neural network layers used in the DyEdgeGAT model.
+neural network layers used in the DySTGAT model.
 """
 
 import torch.nn as nn

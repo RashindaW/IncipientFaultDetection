@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+import warnings
 from torch.nn import ModuleList
 from typing import Optional, Tuple
 from torch_geometric.nn.inits import glorot
@@ -353,13 +354,15 @@ class SpectralEncoder(nn.Module):
     This forms the 'Spectral View' of the data.
     """
     def __init__(
-        self, 
-        window_size, 
-        embed_dim=16, 
-        max_freq_bins=0, 
-        band_mixer="none", 
-        activation="relu", 
-        norm_func=None
+        self,
+        window_size,
+        embed_dim=16,
+        max_freq_bins=0,
+        band_mixer="none",
+        activation="relu",
+        norm_func=None,
+        use_log_magnitude=True,
+        use_spectral_features=False,
     ):
         super().__init__()
         self.window_size = window_size
@@ -373,6 +376,9 @@ class SpectralEncoder(nn.Module):
             self.n_bins = max_freq_bins
             
         self.band_mixer_type = band_mixer
+        self.use_log_magnitude = use_log_magnitude
+        self.use_spectral_features = use_spectral_features
+        self.feature_dim = 7 if self.use_spectral_features else 0
         
         # Layers for mixing frequency bands
         # Input shape per node: [Batch, n_bins] (magnitude)
@@ -395,8 +401,52 @@ class SpectralEncoder(nn.Module):
             # Linear projection
             self.mixer = nn.Linear(self.n_bins, embed_dim)
 
-        self.norm = norm_func(embed_dim) if norm_func else nn.Identity()
+        self.output_dim = embed_dim + self.feature_dim
+        self.norm = norm_func(self.output_dim) if norm_func else nn.Identity()
         self.eps = 1e-8
+        self.register_buffer("freqs", torch.linspace(0.0, 1.0, steps=self.n_bins), persistent=False)
+
+    def _compute_spectral_features(self, power: torch.Tensor) -> torch.Tensor:
+        """
+        Compute spectral shape features from power spectra.
+        Returns [B, N, 7] features.
+        """
+        b, n, bins = power.shape
+        freqs = self.freqs.to(power.device).view(1, 1, -1)
+        total = power.sum(dim=-1).clamp_min(self.eps)
+
+        centroid = (power * freqs).sum(dim=-1) / total
+
+        diff = freqs - centroid.unsqueeze(-1)
+        bandwidth = torch.sqrt((power * diff.pow(2)).sum(dim=-1) / total)
+
+        geo_mean = torch.exp(torch.mean(torch.log(power + self.eps), dim=-1))
+        arith_mean = power.mean(dim=-1).clamp_min(self.eps)
+        flatness = geo_mean / arith_mean
+
+        rolloff_ratio = 0.85
+        cumulative = power.cumsum(dim=-1)
+        threshold = total * rolloff_ratio
+        mask = cumulative >= threshold.unsqueeze(-1)
+        rolloff_idx = mask.float().argmax(dim=-1)
+        rolloff = self.freqs.to(power.device)[rolloff_idx]
+
+        band_1 = max(1, bins // 3)
+        band_2 = max(band_1 + 1, (2 * bins) // 3)
+        band_2 = min(band_2, bins)
+        low = power[..., :band_1].sum(dim=-1)
+        mid = power[..., band_1:band_2].sum(dim=-1)
+        high = power[..., band_2:].sum(dim=-1)
+        band_total = total.clamp_min(self.eps)
+        band_low = low / band_total
+        band_mid = mid / band_total
+        band_high = high / band_total
+
+        features = torch.stack(
+            [centroid, bandwidth, flatness, rolloff, band_low, band_mid, band_high],
+            dim=-1,
+        )
+        return torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
     def forward(self, x):
         """
@@ -412,15 +462,18 @@ class SpectralEncoder(nn.Module):
         # x: [B, N, W] -> rFFT -> [B, N, W/2 + 1] (complex)
         fft_out = torch.fft.rfft(x, dim=-1)
         
-        # 2. Compute Magnitude
+        # 2. Compute Magnitude / Power
         # [B, N, n_bins]
         mag = torch.abs(fft_out).clamp_min(self.eps)
-        mag = torch.log1p(mag)
+        power = mag.pow(2)
+        if self.use_log_magnitude:
+            mag = torch.log1p(mag)
         mag = torch.nan_to_num(mag, nan=0.0, posinf=0.0, neginf=0.0)
         
         # 3. Truncate/Select bins
         if self.n_bins < mag.shape[-1]:
             mag = mag[..., :self.n_bins]
+            power = power[..., :self.n_bins]
             
         # 4. Mix Bands -> Embedding
         # Reshape for mixer: [B*N, n_bins]
@@ -434,6 +487,9 @@ class SpectralEncoder(nn.Module):
         
         # [B, N, Embed_Dim]
         h_freq = h_freq.reshape(b, n, -1)
+        if self.use_spectral_features:
+            spectral_features = self._compute_spectral_features(power)
+            h_freq = torch.cat([h_freq, spectral_features], dim=-1)
         
         # 5. Normalize
         # Apply norm per node embedding if configured.
@@ -558,6 +614,8 @@ class DySTGAT(nn.Module):
         freq_node_embed_dim=None,
         freq_max_bins=0,
         freq_band_mixer="none",
+        freq_use_log=True,
+        freq_use_spectral_features=False,
         freq_topk=None,
         share_gnn_weights=False,
         fuse_mode="concat",  # concat | sum | gated
@@ -598,17 +656,28 @@ class DySTGAT(nn.Module):
         )
         self.idcnn = nn.Conv1d(1, 1, kernel_size=3, padding=1)
 
-        self.freq_node_embed_dim = freq_node_embed_dim or temp_node_embed_dim
+        base_freq_embed_dim = freq_node_embed_dim or temp_node_embed_dim
+        self.freq_node_embed_dim = base_freq_embed_dim
         freq_topk = freq_topk if freq_topk is not None else topk
         if self.use_spectral_view:
             self.spectral_encoder = SpectralEncoder(
                 window_size=cfg.dataset.window_size,
-                embed_dim=self.freq_node_embed_dim,
+                embed_dim=base_freq_embed_dim,
                 max_freq_bins=freq_max_bins,
                 band_mixer=freq_band_mixer,
                 activation=act,
                 norm_func=NORM_LAYER_DICT[encoder_norm_type] if do_encoder_norm else None,
+                use_log_magnitude=freq_use_log,
+                use_spectral_features=freq_use_spectral_features,
             )
+            self.freq_node_embed_dim = self.spectral_encoder.output_dim
+
+        if self.use_spectral_view and freq_topk != topk:
+            warnings.warn(
+                "freq_topk differs from temporal topk; overriding to match for divergence alignment.",
+                RuntimeWarning,
+            )
+            freq_topk = topk
 
         if self.infer_graph:
             self.feat_edge_layer = FeatureGraph(
@@ -848,15 +917,11 @@ class DySTGAT(nn.Module):
             attn_freq = torch.nan_to_num(attn_freq, nan=0.0, posinf=0.0, neginf=0.0)
             attn_freq = attn_freq.view(-1, 1)  # [E, 1]
 
-            # Divergence between temporal and spectral attentions (JS)
-            b_graphs = int(batch.max().item()) + 1
-            n_nodes = cfg.dataset.n_nodes
+            # Divergence between temporal and spectral attentions
             try:
-                dense_temp = self._dense_attn(adj_temp, attn_temp.view(-1), b_graphs, n_nodes)
-                dense_freq = self._dense_attn(adj_freq, attn_freq.view(-1), b_graphs, n_nodes)
-                js_per_graph = self._js_divergence(dense_temp, dense_freq)
-                div_loss = js_per_graph.mean()
-                div_score = js_per_graph.detach()
+                div_loss, div_score = self._compute_view_divergence(
+                    adj_temp, attn_temp, adj_freq, attn_freq, batch
+                )
             except Exception:
                 div_loss = torch.tensor(0.0, device=x.device)
                 div_score = None
@@ -934,6 +999,8 @@ class DySTGAT(nn.Module):
                 aux["divergence_loss"] = div_loss
                 if div_score is not None:
                     aux["divergence_score"] = div_score
+                aux["adj_freq"] = adj_freq
+                aux["attn_freq"] = attn_freq
             return recon, adj_temp, attn_temp, aux
             
         return recon
@@ -991,6 +1058,52 @@ class DySTGAT(nn.Module):
         kl_QM = (Q * (Q / M).log()).sum(dim=1)
         js = 0.5 * (kl_PM + kl_QM)
         return js
+
+    def _kl_divergence(self, temp_dense: torch.Tensor, freq_dense: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """
+        KL divergence between two dense attention distributions.
+        Returns per-graph KL divergence [B] for P||Q.
+        """
+        temp_dense = torch.nan_to_num(temp_dense, nan=0.0, posinf=0.0, neginf=0.0)
+        freq_dense = torch.nan_to_num(freq_dense, nan=0.0, posinf=0.0, neginf=0.0)
+        P = temp_dense.clamp_min(eps)
+        Q = freq_dense.clamp_min(eps)
+        P = P.view(P.size(0), -1)
+        Q = Q.view(Q.size(0), -1)
+        P = P / P.sum(dim=1, keepdim=True).clamp_min(eps)
+        Q = Q / Q.sum(dim=1, keepdim=True).clamp_min(eps)
+        kl = (P * (P / Q).log()).sum(dim=1)
+        return kl
+
+    def _compute_view_divergence(
+        self,
+        adj_temp: torch.Tensor,
+        attn_temp: torch.Tensor,
+        adj_freq: torch.Tensor,
+        attn_freq: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Align temporal and spectral attention to a common support and compute divergence.
+        Returns (loss_scalar, per_graph_scores).
+        """
+        if adj_temp is None or adj_freq is None:
+            return torch.tensor(0.0, device=batch.device), None
+        if attn_temp is None or attn_freq is None:
+            return torch.tensor(0.0, device=batch.device), None
+
+        b_graphs = int(batch.max().item()) + 1
+        n_nodes = cfg.dataset.n_nodes
+        dense_temp = self._dense_attn(adj_temp, attn_temp.view(-1), b_graphs, n_nodes)
+        dense_freq = self._dense_attn(adj_freq, attn_freq.view(-1), b_graphs, n_nodes)
+
+        divergence_type = (self.divergence_type or "js").lower()
+        if divergence_type == "kl":
+            per_graph = self._kl_divergence(dense_temp, dense_freq)
+        else:
+            per_graph = self._js_divergence(dense_temp, dense_freq)
+
+        return per_graph.mean(), per_graph.detach()
 
     def _topology_scores_per_graph(
         self,

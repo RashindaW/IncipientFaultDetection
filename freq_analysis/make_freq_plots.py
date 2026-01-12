@@ -166,7 +166,7 @@ def process_dataset(
 # Dataset loaders
 # ---------------------------------------------------------------------------
 def load_co2(dataset_name: str, base_dir: Path, window_size: int) -> Dict:
-    cfg = runpy.run_path(BASE_DIR.parent / "dyedgegat" / "src" / "data" / "column_config.py")
+    cfg = runpy.run_path(BASE_DIR.parent / "dystgat" / "src" / "data" / "column_config.py")
     meas = cfg["MEASUREMENT_VARS"]
     healthy_path = base_dir / "BaselineTestA.csv"
     fault_path = base_dir / "Fault1_DisplayCaseDoorOpen.csv"
@@ -188,7 +188,7 @@ def load_co2(dataset_name: str, base_dir: Path, window_size: int) -> Dict:
 
 
 def load_ashrae(window_size: int = 512) -> Dict:
-    cfg = runpy.run_path(BASE_DIR.parent / "dyedgegat" / "src" / "data" / "ashrae_column_config.py")
+    cfg = runpy.run_path(BASE_DIR.parent / "dystgat" / "src" / "data" / "ashrae_column_config.py")
     meas = cfg["get_measurement_vars"](None)
     file_path = BASE_DIR.parent / "data" / "ASHRAE_1043_RP" / "Benchmark Tests" / "normal1.xls"
 
@@ -228,7 +228,7 @@ def load_ashrae(window_size: int = 512) -> Dict:
 
 
 def load_pronto(window_size: int = 512) -> Dict:
-    cfg = runpy.run_path(BASE_DIR.parent / "dyedgegat" / "src" / "data" / "pronto_column_config.py")
+    cfg = runpy.run_path(BASE_DIR.parent / "dystgat" / "src" / "data" / "pronto_column_config.py")
     all_vars = cfg["ALL_VARS"]
     meas_indices = cfg["MEASUREMENT_INDICES"]
     meas = [all_vars[i] for i in meas_indices]
@@ -263,7 +263,7 @@ def load_pronto(window_size: int = 512) -> Dict:
 
 
 def load_tep(window_size: int = 512) -> Dict:
-    cfg = runpy.run_path(BASE_DIR.parent / "dyedgegat" / "src" / "data" / "tep_column_config.py")
+    cfg = runpy.run_path(BASE_DIR.parent / "dystgat" / "src" / "data" / "tep_column_config.py")
     meas = cfg["MEASUREMENT_VARS"]
     control = cfg["CONTROL_VARS"]
     fault_col = cfg["FAULT_LABEL_COL"]

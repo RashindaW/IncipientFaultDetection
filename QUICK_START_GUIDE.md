@@ -9,7 +9,7 @@ The severity filtering has been successfully implemented and tested. You can now
 ## 📝 Changes Made
 
 ### Files Modified:
-1. **`dyedgegat/src/data/pronto_dataset.py`**
+1. **`dystgat/src/data/pronto_dataset.py`**
    - Added `severity_range` parameter to filter fault data by severity (10-80)
    - Filters applied before normalization and windowing
 
@@ -17,7 +17,7 @@ The severity filtering has been successfully implemented and tested. You can now
    - Updated `_create_dataloaders` to accept and pass `severity_range`
    - Applied to both individual fault datasets and combined `faults_all`
 
-3. **`train_dyedgegat.py`**
+3. **`train_dystgat.py`**
    - Added `--severity-range` CLI argument
    - Parses format: `min,max` (e.g., `10,20`)
    - Displays helpful messages about test difficulty
@@ -29,7 +29,7 @@ The severity filtering has been successfully implemented and tested. You can now
 ### Recommended: Early Fault Detection (Match Paper)
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 python train_dyedgegat.py \
+CUDA_VISIBLE_DEVICES=3 python train_dystgat.py \
     --dataset-key pronto \
     --window-size 15 \
     --use-spectral-view \
@@ -174,7 +174,7 @@ Average: AUC=0.80±0.05, F1=0.58
 
 ### Step 1: Test on Early Faults
 ```bash
-CUDA_VISIBLE_DEVICES=3 python train_dyedgegat.py \
+CUDA_VISIBLE_DEVICES=3 python train_dystgat.py \
     --dataset-key pronto \
     --window-size 15 \
     --use-spectral-view \
@@ -232,7 +232,7 @@ Created files for reference:
 Before running experiments:
 - [x] Modified `pronto_dataset.py` ✅
 - [x] Modified `pronto.py` ✅
-- [x] Modified `train_dyedgegat.py` ✅
+- [x] Modified `train_dystgat.py` ✅
 - [x] Tested severity filtering ✅
 - [x] Validated sample counts ✅
 

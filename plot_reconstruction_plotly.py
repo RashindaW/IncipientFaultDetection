@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Load a DyEdgeGAT checkpoint, run inference, and visualize original vs reconstructed
+Load a DySTGAT checkpoint, run inference, and visualize original vs reconstructed
 sensor readings alongside anomaly scores using Plotly.
 """
 
@@ -19,7 +19,7 @@ import torch
 from torch.amp import autocast
 from torch_geometric.loader import DataLoader
 
-from train_dyedgegat import (
+from train_dystgat import (
     forward_model,
     init_model,
     resolve_devices,
@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Plot original vs reconstructed sensor values and anomaly scores "
-            "with Plotly for a DyEdgeGAT checkpoint."
+            "with Plotly for a DySTGAT checkpoint."
         )
     )
     parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint (.pt).")

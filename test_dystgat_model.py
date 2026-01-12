@@ -1,7 +1,7 @@
 """
-Test script for DyEdgeGAT model with real data.
+Test script for DySTGAT model with real data.
 
-This script tests the complete DyEdgeGAT pipeline:
+This script tests the complete DySTGAT pipeline:
 1. Load data
 2. Initialize model
 3. Forward pass
@@ -18,17 +18,17 @@ import torch
 WINDOW_SIZE = 60
 
 # Add both paths for proper imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dyedgegat'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dyedgegat', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dystgat'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'dystgat', 'src'))
 
 from datasets import get_adapter, list_adapter_keys
-from src.model.dyedgegat import DyEdgeGAT
+from src.model.dystgat import DySTGAT
 from src.config import cfg
 
 
 def parse_args() -> argparse.Namespace:
     dataset_keys = list_adapter_keys()
-    parser = argparse.ArgumentParser(description="Quick DyEdgeGAT pipeline test")
+    parser = argparse.ArgumentParser(description="Quick DySTGAT pipeline test")
     parser.add_argument(
         "--dataset-key",
         type=str,
@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
 
 def test_model(args: argparse.Namespace) -> None:
     print("=" * 80)
-    print(" " * 25 + "DYEDGEGAT MODEL TEST")
+    print(" " * 25 + "DYSTGAT MODEL TEST")
     print("=" * 80)
     
     # ========== Step 1: Configuration ==========
@@ -113,8 +113,8 @@ def test_model(args: argparse.Namespace) -> None:
     print(f"   Test: {len(test_loaders)} datasets")
     
     # ========== Step 3: Initialize Model ==========
-    print("\n[3/6] Initializing DyEdgeGAT model...")
-    model = DyEdgeGAT(
+    print("\n[3/6] Initializing DySTGAT model...")
+    model = DySTGAT(
         feat_input_node=1,           # Each sensor is univariate
         feat_target_node=1,          # Reconstruct 1 value per sensor
         feat_input_edge=1,           # Edge features are scalar attention values
@@ -261,7 +261,7 @@ if __name__ == "__main__":
     print("✅ Backward pass: OK")
     print("✅ Anomaly scoring: OK")
     print()
-    print("🎉 All tests passed! DyEdgeGAT is ready for training.")
+    print("All tests passed! DySTGAT is ready for training.")
     print()
     print("Model Details:")
     print(f"  - Parameters: {trainable_params:,}")

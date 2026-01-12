@@ -94,6 +94,24 @@ def parse_args() -> argparse.Namespace:
         help="Optional band-mixing layer on spectral bins.",
     )
     parser.add_argument(
+        "--freq-use-log",
+        dest="freq_use_log",
+        action="store_true",
+        help="Use log-magnitude scaling for spectral inputs (default).",
+    )
+    parser.add_argument(
+        "--no-freq-use-log",
+        dest="freq_use_log",
+        action="store_false",
+        help="Disable log-magnitude scaling for spectral inputs.",
+    )
+    parser.set_defaults(freq_use_log=True)
+    parser.add_argument(
+        "--freq-use-spectral-features",
+        action="store_true",
+        help="Append spectral shape features (centroid/flatness/rolloff/bands) to spectral embeddings.",
+    )
+    parser.add_argument(
         "--freq-topk",
         type=int,
         default=None,
@@ -351,6 +369,10 @@ def init_model(
     freq_embed_dim = getattr(model_args, "freq_embed_dim", 16) if model_args is not None else 16
     freq_bins = getattr(model_args, "freq_bins", 0) if model_args is not None else 0
     freq_band_mix = getattr(model_args, "freq_band_mix", "none") if model_args is not None else "none"
+    freq_use_log = getattr(model_args, "freq_use_log", True) if model_args is not None else True
+    freq_use_spectral_features = (
+        getattr(model_args, "freq_use_spectral_features", False) if model_args is not None else False
+    )
     freq_topk = getattr(model_args, "freq_topk", None) if model_args is not None else None
     share_gnn_weights = bool(getattr(model_args, "share_gnn_weights", False)) if model_args is not None else False
     fuse_mode = getattr(model_args, "fuse_mode", "concat") if model_args is not None else "concat"
@@ -394,6 +416,8 @@ def init_model(
         freq_node_embed_dim=freq_embed_dim,
         freq_max_bins=freq_bins,
         freq_band_mixer=freq_band_mix,
+        freq_use_log=freq_use_log,
+        freq_use_spectral_features=freq_use_spectral_features,
         freq_topk=freq_topk,
         share_gnn_weights=share_gnn_weights,
         fuse_mode=fuse_mode,

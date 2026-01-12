@@ -1,4 +1,4 @@
-"""Utility modules for DyEdgeGAT."""
+"""Utility modules for DySTGAT."""
 
 from .checkpoint import EpochCheckpointManager
 from .init import init_weights

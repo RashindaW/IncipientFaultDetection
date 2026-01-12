@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Evaluate DyEdgeGAT on the TEP dataset with labeled faults.
+Evaluate DySTGAT on the TEP dataset with labeled faults.
 
 Workflow:
 - Train/val stats come from FaultFree training.
@@ -24,25 +24,25 @@ from torch.amp import autocast
 from torch_geometric.loader import DataLoader
 
 from datasets import get_adapter
-from train_dyedgegat import (
+from train_dystgat import (
     forward_model,
     init_model,
     resolve_devices,
     unwrap_model,
     unpack_model_outputs,
 )
-from dyedgegat.src.data.tep_column_config import (
+from dystgat.src.data.tep_column_config import (
     FAULT_FREE_TEST_FILE,
     FAULT_FREE_TRAIN_FILE,
     FAULTY_TEST_FILE,
     MEASUREMENT_VARS,
 )
-from dyedgegat.src.data.tep_dataset import TEPDataset
+from dystgat.src.data.tep_dataset import TEPDataset
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate DyEdgeGAT on TEP with best-F1 threshold search.")
-    parser.add_argument("--checkpoint", required=True, help="Path to a trained DyEdgeGAT checkpoint.")
+    parser = argparse.ArgumentParser(description="Evaluate DySTGAT on TEP with best-F1 threshold search.")
+    parser.add_argument("--checkpoint", required=True, help="Path to a trained DySTGAT checkpoint.")
     parser.add_argument("--data-dir", default=None, help="Path to TEP RData files (defaults to adapter).")
     parser.add_argument("--window-size", type=int, default=60, help="Sliding window size.")
     parser.add_argument("--train-stride", type=int, default=1, help="Stride for fault-free training windows.")

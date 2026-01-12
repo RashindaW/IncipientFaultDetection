@@ -1,11 +1,11 @@
 """
-Training script for DyEdgeGAT using the 1-minute aggregated dataset.
+Training script for DySTGAT using the 1-minute aggregated dataset.
 
 Usage:
-    conda run -n rashindaNew-torch-env python train_dyedgegat_1min.py --epochs 10
+    conda run -n rashindaNew-torch-env python train_dystgat_1min.py --epochs 10
 """
 
-from train_dyedgegat import main as _main
+from train_dystgat import main as _main
 
 
 def _ensure_dataset_args(
