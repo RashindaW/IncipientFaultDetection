@@ -6,14 +6,14 @@ from torch_geometric.loader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from typing import Dict, List, Tuple
 
-from dyedgegat.src.data.tep_column_config import (
+from dystgat.src.data.tep_column_config import (
     CONTROL_VARS,
     FAULT_FREE_TEST_FILE,
     FAULT_FREE_TRAIN_FILE,
     FAULTY_TEST_FILE,
     MEASUREMENT_VARS,
 )
-from dyedgegat.src.data.tep_dataset import TEPDataset
+from dystgat.src.data.tep_dataset import TEPDataset
 
 from .registry import DatasetAdapter, register_adapter
 

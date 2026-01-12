@@ -9,7 +9,7 @@ DatasetType = TypeVar("DatasetType")
 @dataclass
 class DatasetAdapter:
     """
-    Adapter describing how to use a particular dataset with the DyEdgeGAT pipeline.
+    Adapter describing how to use a particular dataset with the DySTGAT pipeline.
 
     Attributes:
         key: Short identifier (e.g., "co2", "co2_1min").

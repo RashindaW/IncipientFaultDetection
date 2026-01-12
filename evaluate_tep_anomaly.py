@@ -323,12 +323,9 @@ def main() -> None:
     test_scores, test_labels = collect_scores(faulty_loader, model, device, amp_enabled)
     print(f"  Collected {len(test_scores)} samples with faults present.")
 
-    all_scores = np.concatenate([val_scores, test_scores])
-    all_labels = np.concatenate([val_labels, test_labels])
-
-    print("\nSearching for best F1 threshold...")
-    best = best_f1(all_scores, all_labels, quantiles=args.quantiles)
-    metrics = per_fault_metrics(all_scores, all_labels, best["threshold"])
+    print("\nSearching for best F1 threshold on validation...")
+    best = best_f1(val_scores, val_labels, quantiles=args.quantiles)
+    metrics = per_fault_metrics(test_scores, test_labels, best["threshold"])
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name or f"tep_eval_{Path(args.checkpoint).stem}_{timestamp}"

@@ -6,8 +6,8 @@ from torch_geometric.loader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from typing import Dict, List, Tuple, Optional
 
-from dyedgegat.src.data.pronto_column_config import MEASUREMENT_VARS, CONTROL_VARS
-from dyedgegat.src.data.pronto_dataset import PRONTODataset
+from dystgat.src.data.pronto_column_config import MEASUREMENT_VARS, CONTROL_VARS
+from dystgat.src.data.pronto_dataset import PRONTODataset
 from .registry import DatasetAdapter, register_adapter
 
 # Define file paths

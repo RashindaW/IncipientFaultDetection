@@ -3,9 +3,9 @@ from __future__ import annotations
 import os
 from typing import List, Tuple
 
-from dyedgegat.src.data.column_config import BASELINE_FILES, FAULT_FILES, MEASUREMENT_VARS
-from dyedgegat.src.data.dataloader import create_dataloaders
-from dyedgegat.src.data.dataset import RefrigerationDataset, get_control_variable_names
+from dystgat.src.data.column_config import BASELINE_FILES, FAULT_FILES, MEASUREMENT_VARS
+from dystgat.src.data.dataloader import create_dataloaders
+from dystgat.src.data.dataset import RefrigerationDataset, get_control_variable_names
 
 from .registry import DatasetAdapter, register_adapter
 

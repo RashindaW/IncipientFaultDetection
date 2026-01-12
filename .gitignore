@@ -11,7 +11,7 @@ __pycache__/
 .ipynb_checkpoints/
 *.ipynb
 notebooks/
-
+*.png
 # Virtual environments
 .env
 .venv

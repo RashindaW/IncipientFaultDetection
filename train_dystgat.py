@@ -23,17 +23,17 @@ from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as TorchDDP
 from torch_geometric.data import Batch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dyedgegat"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dystgat"))
 
 from src.config import cfg
 from datasets import get_adapter, list_adapter_keys
-from src.model.dyedgegat import DyEdgeGAT
+from src.model.dystgat import DySTGAT
 from src.utils.checkpoint import EpochCheckpointManager
 
 
 def parse_args() -> argparse.Namespace:
     available_datasets = list_adapter_keys()
-    parser = argparse.ArgumentParser(description="Train DyEdgeGAT on refrigeration dataset")
+    parser = argparse.ArgumentParser(description="Train DySTGAT (Dynamic Spectral-Temporal GAT) for anomaly detection")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for training")
     parser.add_argument("--train-stride", type=int, default=1, help="Sliding window stride for training dataset")
@@ -336,7 +336,7 @@ def init_model(
     task: str,
     pred_horizon: int,
     model_args: Optional[argparse.Namespace] = None,
-) -> DyEdgeGAT:
+) -> DySTGAT:
     cfg.set_dataset_params(
         n_nodes=n_nodes,
         window_size=window_size,
@@ -356,7 +356,7 @@ def init_model(
     fuse_mode = getattr(model_args, "fuse_mode", "concat") if model_args is not None else "concat"
     divergence_type = getattr(model_args, "divergence_type", "js") if model_args is not None else "js"
 
-    model = DyEdgeGAT(
+    model = DySTGAT(
         feat_input_node=1,
         feat_target_node=1,
         feat_input_edge=1,
@@ -478,7 +478,7 @@ def compute_recon_loss(
 
 
 def train_epoch(
-    model: DyEdgeGAT,
+    model: DySTGAT,
     loader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     criterion: torch.nn.Module,
@@ -569,7 +569,7 @@ def train_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: DyEdgeGAT,
+    model: DySTGAT,
     loader: torch.utils.data.DataLoader,
     criterion: torch.nn.Module,
     device: torch.device,
@@ -640,7 +640,7 @@ def evaluate(
 
 @torch.no_grad()
 def evaluate_with_per_sample_metrics(
-    model: DyEdgeGAT,
+    model: DySTGAT,
     loader: torch.utils.data.DataLoader,
     criterion: torch.nn.Module,
     device: torch.device,
@@ -734,7 +734,7 @@ def evaluate_with_per_sample_metrics(
 
 @torch.no_grad()
 def evaluate_tests_and_plot(
-    model: DyEdgeGAT,
+    model: DySTGAT,
     loaders: Dict[str, torch.utils.data.DataLoader],
     criterion: torch.nn.Module,
     device: torch.device,
@@ -1004,7 +1004,7 @@ def main() -> None:
         if args.save_model:
             save_model_path: Optional[Path] = Path(args.save_model).expanduser().resolve()
         elif not args.eval_only:
-            save_model_path = checkpoint_root_path / f"dyedgegat_{adapter.key}_best.pt"
+            save_model_path = checkpoint_root_path / f"dystgat_{adapter.key}_best.pt"
         else:
             save_model_path = None
         if save_model_path is not None:
@@ -1013,7 +1013,7 @@ def main() -> None:
         if is_main_process:
             print("=" * 80)
             mode_desc = "Evaluating" if args.eval_only else "Training"
-            print(f"{mode_desc} DyEdgeGAT ({args.dataset_key}) on device: {device}")
+            print(f"{mode_desc} DySTGAT ({args.dataset_key}) on device: {device}")
             print(f"Data directory: {data_dir}")
             if not args.eval_only:
                 print(f"Checkpoint root: {checkpoint_root_path}")
@@ -1094,7 +1094,7 @@ def main() -> None:
 
         if not args.eval_only:
             checkpoint_manager = EpochCheckpointManager(
-                str(checkpoint_root_path), prefix=f"dyedgegat_{args.dataset_key}"
+                str(checkpoint_root_path), prefix=f"dystgat_{args.dataset_key}"
             )
             if is_main_process:
                 print(f"\nSaving per-epoch checkpoints to: {checkpoint_manager.run_path}")
