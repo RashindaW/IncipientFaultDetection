@@ -1,0 +1,65 @@
+% Graph Learning Diagram
+\begin{tikzpicture}[
+    scale=0.75,
+    node/.style={circle, draw, minimum size=0.6cm, font=\tiny},
+    temp_node/.style={node, fill=temporal!40},
+    spec_node/.style={node, fill=spectral!40},
+    edge/.style={-,thick},
+    strong_edge/.style={edge, line width=2pt},
+    weak_edge/.style={edge, line width=0.5pt, gray},
+]
+
+% Temporal Graph
+\begin{scope}
+    \node[temp_node] (t1) at (0,2) {1};
+    \node[temp_node] (t2) at (1.5,2.5) {2};
+    \node[temp_node] (t3) at (2.5,1.5) {3};
+    \node[temp_node] (t4) at (1,0.5) {4};
+    \node[temp_node] (t5) at (2,0) {5};
+
+    % Strong edges (top-k)
+    \draw[strong_edge, temporal] (t1) -- (t2);
+    \draw[strong_edge, temporal] (t2) -- (t3);
+    \draw[strong_edge, temporal] (t1) -- (t4);
+    \draw[strong_edge, temporal] (t4) -- (t5);
+    \draw[strong_edge, temporal] (t3) -- (t5);
+
+    % Weak edges
+    \draw[weak_edge] (t2) -- (t4);
+
+    \node[below=0.3cm of t5, font=\scriptsize, text=temporal] {\textbf{Temporal Graph}};
+    \node[above=0.1cm of t2, font=\scriptsize] {$\mathbf{A}_{temp}$};
+\end{scope}
+
+% Spectral Graph
+\begin{scope}[xshift=4.5cm]
+    \node[spec_node] (s1) at (0,2) {1};
+    \node[spec_node] (s2) at (1.5,2.5) {2};
+    \node[spec_node] (s3) at (2.5,1.5) {3};
+    \node[spec_node] (s4) at (1,0.5) {4};
+    \node[spec_node] (s5) at (2,0) {5};
+
+    % Strong edges (different pattern)
+    \draw[strong_edge, spectral] (s1) -- (s2);
+    \draw[strong_edge, spectral] (s1) -- (s3);
+    \draw[strong_edge, spectral] (s2) -- (s4);
+    \draw[strong_edge, spectral] (s3) -- (s4);
+    \draw[strong_edge, spectral] (s4) -- (s5);
+
+    % Weak edges
+    \draw[weak_edge] (s2) -- (s5);
+
+    \node[below=0.3cm of s5, font=\scriptsize, text=spectral] {\textbf{Spectral Graph}};
+    \node[above=0.1cm of s2, font=\scriptsize] {$\mathbf{A}_{freq}$};
+\end{scope}
+
+% Divergence arrow
+\draw[<->, dashed, thick, green!50!black] (2.8,1.25) -- node[above, font=\tiny] {$D_{JS}$} (4.2,1.25);
+
+% Attention computation annotation
+\node[draw, rounded corners, fill=yellow!10, font=\tiny, align=center] at (3.5,-1) {
+    Top-K Selection\\
+    $K$ strongest edges
+};
+
+\end{tikzpicture}

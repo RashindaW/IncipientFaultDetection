@@ -72,8 +72,9 @@ def _create_dataloaders(
     )
     norm_stats = train_dataset.get_normalization_stats()
 
-    # Validation on fault-free testing
-    print("\n[2/3] Loading FAULT-FREE VALIDATION dataset...")
+    # Validation on fault-free testing (runs 1-250)
+    # NOTE: Split by runs to avoid data leakage with test baseline (runs 251-500)
+    print("\n[2/3] Loading FAULT-FREE VALIDATION dataset (runs 1-250)...")
     val_dataset = TEPDataset(
         data_files=[FAULT_FREE_TEST_FILE],
         window_size=window_size,
@@ -83,17 +84,18 @@ def _create_dataloaders(
         normalization_stats=norm_stats,
         fault_filter=[0],
         pred_horizon=pred_horizon or 0,
+        run_filter=range(1, 251),  # First half of runs for validation
     )
 
     # Testing on fault-free + all faults
     print("\n[3/3] Loading TEST datasets...")
     test_datasets = {}
 
-    # 1. Baseline (Normal)
-    baseline_file = FAULT_FREE_TEST_FILE if baseline_from == "val" else FAULT_FREE_TRAIN_FILE
-    print(f"  - Baseline (from {baseline_from})")
+    # 1. Baseline (Normal) - Use runs 251-500 (separate from validation)
+    # IMPORTANT: This must use different runs than validation to avoid data leakage
+    print("  - Baseline (runs 251-500, separate from validation)")
     baseline_test = TEPDataset(
-        data_files=[baseline_file],
+        data_files=[FAULT_FREE_TEST_FILE],
         window_size=window_size,
         stride=test_stride,
         data_dir=data_dir,
@@ -101,6 +103,7 @@ def _create_dataloaders(
         normalization_stats=norm_stats,
         fault_filter=[0],
         pred_horizon=pred_horizon or 0,
+        run_filter=range(251, 501),  # Second half of runs for test baseline
     )
     test_datasets["baseline"] = baseline_test
 

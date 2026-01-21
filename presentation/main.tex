@@ -1,0 +1,494 @@
+% DySTGAT Presentation
+% Dynamic Spectral-Temporal Graph Attention Network for Anomaly Detection
+\documentclass[aspectratio=169,11pt]{beamer}
+
+% Theme and colors
+\usetheme{Madrid}
+\usecolortheme{whale}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+
+% Packages
+\usepackage{tikz}
+\usepackage{pgfplots}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+\usepackage{subcaption}
+
+% TikZ libraries
+\usetikzlibrary{shapes,arrows,positioning,fit,calc,backgrounds,decorations.pathreplacing,matrix,chains}
+
+% Custom colors
+\definecolor{temporal}{RGB}{65,105,225}    % Royal Blue
+\definecolor{spectral}{RGB}{220,20,60}     % Crimson
+\definecolor{fusion}{RGB}{50,205,50}       % Lime Green
+\definecolor{graph}{RGB}{255,165,0}        % Orange
+\definecolor{encoder}{RGB}{147,112,219}    % Medium Purple
+\definecolor{decoder}{RGB}{70,130,180}     % Steel Blue
+
+% pgfplots settings
+\pgfplotsset{compat=1.18}
+
+% Title information
+\title[DySTGAT]{Dynamic Spectral-Temporal Graph Attention Network\\for Multivariate Time Series Anomaly Detection}
+\subtitle{A Dual-View Approach with Learned Graph Structure}
+\author{Author Name}
+\institute{Institution}
+\date{\today}
+
+\begin{document}
+
+% ==============================================================================
+% TITLE SLIDE
+% ==============================================================================
+\begin{frame}
+    \titlepage
+\end{frame}
+
+% ==============================================================================
+% OUTLINE
+% ==============================================================================
+\begin{frame}{Outline}
+    \tableofcontents
+\end{frame}
+
+% ==============================================================================
+% SECTION: INTRODUCTION
+% ==============================================================================
+\section{Introduction}
+
+\begin{frame}{Problem Statement}
+    \begin{columns}
+        \begin{column}{0.5\textwidth}
+            \textbf{Challenge:} Detect anomalies in multivariate time series from industrial systems
+
+            \vspace{0.5cm}
+            \textbf{Key Difficulties:}
+            \begin{itemize}
+                \item Complex inter-variable dependencies
+                \item Unknown graph structure
+                \item Temporal and frequency patterns
+                \item Imbalanced data (rare faults)
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.5\textwidth}
+            \begin{tikzpicture}[scale=0.7]
+                % Time series visualization
+                \draw[->] (0,0) -- (6,0) node[right] {$t$};
+                \draw[->] (0,0) -- (0,3.5) node[above] {$x$};
+
+                % Normal signal
+                \draw[blue,thick] plot[domain=0:4,samples=50] (\x, {1.5 + 0.3*sin(3*\x r) + 0.2*rand});
+
+                % Anomaly region
+                \fill[red!20] (4,0) rectangle (5.5,3.5);
+                \draw[red,thick] plot[domain=4:5.5,samples=30] (\x, {1.5 + 0.8*sin(8*\x r) + 0.5*rand});
+
+                \node[blue] at (2,2.8) {Normal};
+                \node[red] at (4.75,3) {Anomaly};
+            \end{tikzpicture}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+\begin{frame}{Motivation: Dual-View Analysis}
+    \begin{columns}
+        \begin{column}{0.5\textwidth}
+            \textbf{Temporal View}
+            \begin{itemize}
+                \item Captures sequential dependencies
+                \item Detects trend changes
+                \item Models dynamic relationships
+            \end{itemize}
+
+            \vspace{0.5cm}
+            \textbf{Spectral View}
+            \begin{itemize}
+                \item Reveals frequency patterns
+                \item Detects periodic anomalies
+                \item Robust to phase shifts
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.5\textwidth}
+            \begin{tikzpicture}[scale=0.65]
+                % Temporal signal
+                \begin{scope}
+                    \node at (2.5,3.5) {\textbf{Temporal Domain}};
+                    \draw[->] (0,0) -- (5,0) node[right] {$t$};
+                    \draw[->] (0,0) -- (0,2.5);
+                    \draw[temporal,thick] plot[domain=0:4.5,samples=100] (\x, {1 + 0.5*sin(4*\x r) + 0.3*sin(12*\x r)});
+                \end{scope}
+
+                % Arrow
+                \draw[->,thick,gray] (2.5,-0.5) -- (2.5,-1.5) node[midway,right] {FFT};
+
+                % Frequency spectrum
+                \begin{scope}[yshift=-5cm]
+                    \node at (2.5,3.5) {\textbf{Spectral Domain}};
+                    \draw[->] (0,0) -- (5,0) node[right] {$f$};
+                    \draw[->] (0,0) -- (0,2.5);
+                    \draw[spectral,thick,fill=spectral!30] (0.8,0) -- (0.8,1.8) -- (1.2,1.8) -- (1.2,0);
+                    \draw[spectral,thick,fill=spectral!30] (2.3,0) -- (2.3,1.0) -- (2.7,1.0) -- (2.7,0);
+                    \draw[spectral,thick,fill=spectral!30] (3.8,0) -- (3.8,0.4) -- (4.2,0.4) -- (4.2,0);
+                \end{scope}
+            \end{tikzpicture}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+% ==============================================================================
+% SECTION: METHODOLOGY
+% ==============================================================================
+\section{Methodology}
+
+\begin{frame}{DySTGAT: Overall Architecture}
+    \begin{center}
+        \input{figures/architecture_overview}
+    \end{center}
+\end{frame}
+
+\begin{frame}{Dual-View Encoder}
+    \begin{columns}
+        \begin{column}{0.55\textwidth}
+            \textbf{Temporal Encoder (GRU)}
+            \begin{itemize}
+                \item Input: $\mathbf{X} \in \mathbb{R}^{N \times W}$
+                \item IDCNN preprocessing
+                \item Per-node GRU encoding
+                \item Output: $\mathbf{H}_{temp} \in \mathbb{R}^{N \times D}$
+            \end{itemize}
+
+            \vspace{0.3cm}
+            \textbf{Spectral Encoder (FFT + MLP)}
+            \begin{itemize}
+                \item Real FFT: $\mathbf{X} \rightarrow \mathbf{F}$
+                \item Log-magnitude spectrum
+                \item Band mixing via MLP
+                \item Spectral shape features
+                \item Output: $\mathbf{H}_{freq} \in \mathbb{R}^{N \times D'}$
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.45\textwidth}
+            \input{figures/encoder_detail}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+\begin{frame}{Dynamic Graph Learning}
+    \begin{columns}
+        \begin{column}{0.5\textwidth}
+            \textbf{Graph Attention Mechanism}
+            \begin{equation*}
+                \alpha_{ij} = \text{LeakyReLU}\left(\mathbf{a}^T [\mathbf{W}\mathbf{h}_i \| \mathbf{W}\mathbf{h}_j]\right)
+            \end{equation*}
+
+            \vspace{0.3cm}
+            \textbf{Top-K Sparsification}
+            \begin{itemize}
+                \item Select $K$ strongest edges per node
+                \item Softmax normalization
+                \item Separate graphs for temporal/spectral
+            \end{itemize}
+
+            \vspace{0.3cm}
+            \textbf{Divergence Loss}
+            \begin{equation*}
+                \mathcal{L}_{div} = D_{JS}(\mathbf{A}_{temp} \| \mathbf{A}_{freq})
+            \end{equation*}
+        \end{column}
+        \begin{column}{0.5\textwidth}
+            \input{figures/graph_learning}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+\begin{frame}{GNN Message Passing \& Fusion}
+    \begin{columns}
+        \begin{column}{0.5\textwidth}
+            \textbf{Graph Neural Network}
+            \begin{itemize}
+                \item GIN/GAT layers
+                \item Edge-weighted aggregation
+                \item Separate pathways for views
+            \end{itemize}
+
+            \vspace{0.3cm}
+            \textbf{Fusion Strategies}
+            \begin{itemize}
+                \item \textbf{Concat}: $\mathbf{Z} = [\mathbf{Z}_{temp}; \mathbf{Z}_{freq}]$
+                \item \textbf{Sum}: $\mathbf{Z} = \mathbf{Z}_{temp} + \mathbf{Z}_{freq}$
+                \item \textbf{Gated}: $\mathbf{Z} = g \cdot \mathbf{Z}_{temp} + (1-g) \cdot \mathbf{Z}_{freq}$
+            \end{itemize}
+
+            \vspace{0.3cm}
+            \textbf{Reconstruction Decoder}
+            \begin{itemize}
+                \item GRU-based decoder
+                \item Reverse reconstruction
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.5\textwidth}
+            \input{figures/fusion_decoder}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+\begin{frame}{Training Objective}
+    \textbf{Total Loss Function:}
+    \begin{equation*}
+        \mathcal{L} = \mathcal{L}_{recon} + \lambda_{anom} \cdot \mathcal{L}_{anom} + \lambda_{div} \cdot \mathcal{L}_{div}
+    \end{equation*}
+
+    \vspace{0.5cm}
+    \begin{columns}
+        \begin{column}{0.33\textwidth}
+            \textbf{Reconstruction Loss}
+            \begin{equation*}
+                \mathcal{L}_{recon} = \|\mathbf{X} - \hat{\mathbf{X}}\|_2^2
+            \end{equation*}
+            Learn normal patterns
+        \end{column}
+        \begin{column}{0.33\textwidth}
+            \textbf{Anomaly Score}
+            \begin{equation*}
+                \mathcal{L}_{anom} = \sum_i s_i \cdot \|\mathbf{x}_i - \hat{\mathbf{x}}_i\|
+            \end{equation*}
+            Weighted by node centrality
+        \end{column}
+        \begin{column}{0.33\textwidth}
+            \textbf{Divergence Loss}
+            \begin{equation*}
+                \mathcal{L}_{div} = D_{JS}(\mathbf{A}_t \| \mathbf{A}_f)
+            \end{equation*}
+            Align graph structures
+        \end{column}
+    \end{columns}
+
+    \vspace{0.5cm}
+    \textbf{Anomaly Detection:} At test time, reconstruction error indicates anomaly severity.
+\end{frame}
+
+% ==============================================================================
+% SECTION: EXPERIMENTS
+% ==============================================================================
+\section{Experiments}
+
+\begin{frame}{Datasets}
+    \begin{table}[h]
+        \centering
+        \small
+        \begin{tabular}{lcccc}
+            \toprule
+            \textbf{Dataset} & \textbf{Variables} & \textbf{Window} & \textbf{Samples} & \textbf{Domain} \\
+            \midrule
+            ASHRAE-1043RP & 6-12 & 180 & 10K+ & HVAC Systems \\
+            TEP & 52 & 48 & 50K+ & Chemical Process \\
+            IMS Bearing & 4 & 15 & 984 & Rotating Machinery \\
+            PRONTO & 8 & 15 & 5K+ & Multiphase Flow \\
+            \bottomrule
+        \end{tabular}
+    \end{table}
+
+    \vspace{0.3cm}
+    \textbf{Evaluation Metrics:}
+    \begin{itemize}
+        \item AUC-ROC: Area under ROC curve
+        \item F1 Score: At 95th percentile threshold
+        \item Best-F1: Maximum F1 over all thresholds
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Main Results}
+    \begin{table}[h]
+        \centering
+        \begin{tabular}{lccc}
+            \toprule
+            \textbf{Dataset} & \textbf{AUC-ROC} & \textbf{F1} & \textbf{Best-F1} \\
+            \midrule
+            ASHRAE-1043RP & 0.8705 & 0.7857 & 0.8710 \\
+            TEP & \textbf{1.0000} & \textbf{0.9988} & \textbf{1.0000} \\
+            IMS Bearing & \textbf{1.0000} & 0.9860 & \textbf{1.0000} \\
+            PRONTO (Faults) & \textbf{1.0000} & 0.9969 & \textbf{1.0000} \\
+            \bottomrule
+        \end{tabular}
+        \caption{Best results across hyperparameter configurations}
+    \end{table}
+
+    \vspace{0.3cm}
+    \textbf{Key Findings:}
+    \begin{itemize}
+        \item Perfect detection on TEP, IMS, and PRONTO fault detection
+        \item ASHRAE presents the most challenging scenario
+        \item Larger windows beneficial for slow-evolving faults
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Ablation Study: Spectral View Impact}
+    \begin{columns}
+        \begin{column}{0.5\textwidth}
+            \begin{table}[h]
+                \centering
+                \small
+                \begin{tabular}{lcc}
+                    \toprule
+                    \textbf{Configuration} & \textbf{AUC} & \textbf{$\Delta$} \\
+                    \midrule
+                    Full Model & 0.8705 & -- \\
+                    No Spectral & 0.7776 & -10.7\% \\
+                    No Spec Features & 0.6383 & -26.7\% \\
+                    Band Mix: None & 0.8049 & -7.5\% \\
+                    Band Mix: Conv & 0.6383 & -26.7\% \\
+                    \bottomrule
+                \end{tabular}
+                \caption{ASHRAE ablation results}
+            \end{table}
+        \end{column}
+        \begin{column}{0.5\textwidth}
+            \begin{tikzpicture}[scale=0.8]
+                \begin{axis}[
+                    ybar,
+                    bar width=15pt,
+                    ylabel={AUC-ROC},
+                    symbolic x coords={Full,No Spec,No Feat,None,Conv},
+                    xtick=data,
+                    x tick label style={rotate=45,anchor=east,font=\small},
+                    ymin=0.5,ymax=1.0,
+                    nodes near coords,
+                    nodes near coords style={font=\tiny},
+                    every node near coord/.append style={rotate=90, anchor=west},
+                ]
+                \addplot[fill=temporal!70] coordinates {(Full,0.8705) (No Spec,0.7776) (No Feat,0.6383) (None,0.8049) (Conv,0.6383)};
+                \end{axis}
+            \end{tikzpicture}
+        \end{column}
+    \end{columns}
+
+    \vspace{0.3cm}
+    \textbf{Insight:} Spectral view contributes +10.7\% AUC improvement on ASHRAE.
+\end{frame}
+
+\begin{frame}{Sensitivity Analysis: Window Size}
+    \begin{columns}
+        \begin{column}{0.5\textwidth}
+            \begin{table}[h]
+                \centering
+                \small
+                \begin{tabular}{lccc}
+                    \toprule
+                    \textbf{Window} & \textbf{ASHRAE} & \textbf{TEP} \\
+                    \midrule
+                    Small (60/32) & 0.5281 & 0.9855 \\
+                    Base (180/48) & 0.8117 & 0.8843 \\
+                    Large (300/64) & 0.7378 & 0.9998 \\
+                    XLarge (450/96) & \textbf{0.8705} & 0.9994 \\
+                    \bottomrule
+                \end{tabular}
+                \caption{Window size impact on AUC}
+            \end{table}
+        \end{column}
+        \begin{column}{0.5\textwidth}
+            \begin{tikzpicture}[scale=0.75]
+                \begin{axis}[
+                    xlabel={Window Size},
+                    ylabel={AUC-ROC},
+                    legend pos=south east,
+                    grid=major,
+                    ymin=0.5,ymax=1.05,
+                ]
+                \addplot[color=temporal,mark=square*,thick] coordinates {
+                    (60,0.5281) (180,0.8117) (300,0.7378) (450,0.8705)
+                };
+                \addplot[color=spectral,mark=triangle*,thick] coordinates {
+                    (32,0.9855) (48,0.8843) (64,0.9998) (96,0.9994)
+                };
+                \legend{ASHRAE,TEP}
+                \end{axis}
+            \end{tikzpicture}
+        \end{column}
+    \end{columns}
+
+    \vspace{0.3cm}
+    \textbf{Insight:} Optimal window size is dataset-dependent; ASHRAE benefits from larger windows.
+\end{frame}
+
+\begin{frame}{Sensitivity Analysis: Key Hyperparameters}
+    \begin{columns}
+        \begin{column}{0.5\textwidth}
+            \textbf{Anomaly Weight ($\lambda_{anom}$)}
+            \begin{itemize}
+                \item Low (0.1): Focus on reconstruction
+                \item High (2.0-3.0): Focus on detection
+                \item Best: 1.0-2.0 (balanced)
+            \end{itemize}
+
+            \vspace{0.3cm}
+            \textbf{Divergence Weight ($\lambda_{div}$)}
+            \begin{itemize}
+                \item $\lambda=0$: Independent views
+                \item $\lambda=0.2$: Soft alignment
+                \item $\lambda>0.4$: Strong coupling
+            \end{itemize}
+        \end{column}
+        \begin{column}{0.5\textwidth}
+            \textbf{Embedding Dimension}
+            \begin{itemize}
+                \item 8: Underfitting
+                \item 24-32: Optimal
+                \item 48: Overfitting risk
+            \end{itemize}
+
+            \vspace{0.3cm}
+            \textbf{Fusion Mode}
+            \begin{itemize}
+                \item Concat: Best overall
+                \item Sum: Competitive
+                \item Gated: Dataset-specific
+            \end{itemize}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+% ==============================================================================
+% SECTION: CONCLUSION
+% ==============================================================================
+\section{Conclusion}
+
+\begin{frame}{Summary \& Contributions}
+    \textbf{Key Contributions:}
+    \begin{enumerate}
+        \item \textbf{Dual-View Architecture}: Combines temporal and spectral analysis for comprehensive anomaly detection
+        \item \textbf{Dynamic Graph Learning}: Learns inter-variable relationships from data without prior knowledge
+        \item \textbf{Divergence Alignment}: Novel loss term aligns temporal and spectral graph structures
+        \item \textbf{Comprehensive Evaluation}: Validated on 4 diverse industrial datasets
+    \end{enumerate}
+
+    \vspace{0.5cm}
+    \textbf{Results Summary:}
+    \begin{itemize}
+        \item Perfect AUC on TEP, IMS, PRONTO fault detection
+        \item 87\% AUC on challenging ASHRAE dataset
+        \item Spectral view provides +10.7\% improvement
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Future Work}
+    \begin{itemize}
+        \item \textbf{Multi-scale spectral analysis}: Wavelets for time-frequency localization
+        \item \textbf{Attention visualization}: Interpretable graph structures
+        \item \textbf{Online adaptation}: Continual learning for drift
+        \item \textbf{Early detection}: Temporal evidence accumulation
+        \item \textbf{Root cause analysis}: Identify faulty sensors
+    \end{itemize}
+
+    \vspace{1cm}
+    \centering
+    \Large\textbf{Thank You!}\\
+    \vspace{0.5cm}
+    \normalsize Questions?
+\end{frame}
+
+\end{document}

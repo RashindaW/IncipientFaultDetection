@@ -67,21 +67,23 @@ def _create_dataloaders(
     print("CREATING PRONTO DATALOADERS")
     print("=" * 70)
 
-    # 1. Train Dataset (Healthy: Segments 0, 1)
-    print("[1/3] Loading FAULT-FREE TRAINING dataset (Segments 0, 1)...")
+    # 1. Train Dataset (Healthy: Segment 0 only)
+    # NOTE: Using only segment 0 for training to prevent overlap with validation (segment 1)
+    print("[1/3] Loading FAULT-FREE TRAINING dataset (Segment 0)...")
     train_dataset = PRONTODataset(
         data_files=[HEALTHY_FILE],
         window_size=window_size,
         stride=train_stride,
         data_dir=full_data_dir,
         normalize=True,
-        segments_to_load=[0, 1], # Train on first two runs
+        segments_to_load=[0],  # Train on segment 0 only (val uses segment 1)
         pred_horizon=pred_horizon or 0,
     )
     norm_stats = train_dataset.get_normalization_stats()
     
-    # 2. Validation (Healthy: Segment 2)
-    print("[2/3] Loading FAULT-FREE VALIDATION dataset (Segment 2)...")
+    # 2. Validation (Healthy: Segment 1 - late training period)
+    # NOTE: Segment 1 is used for validation to avoid data leakage with test baseline
+    print("[2/3] Loading FAULT-FREE VALIDATION dataset (Segment 1)...")
     val_dataset = PRONTODataset(
         data_files=[HEALTHY_FILE],
         window_size=window_size,
@@ -89,15 +91,16 @@ def _create_dataloaders(
         data_dir=full_data_dir,
         normalize=True,
         normalization_stats=norm_stats,
-        segments_to_load=[2], # Validate on third run
+        segments_to_load=[1],  # Validate on segment 1 (not same as test baseline)
         require_stats=True,
         pred_horizon=pred_horizon or 0,
     )
 
     print("[3/3] Loading TEST datasets...")
     test_datasets = {}
-    
-    # Baseline (Normal) - Use Validation segment
+
+    # Baseline (Normal) - Use Segment 2 (completely held out from val)
+    # IMPORTANT: This must be different from validation segment to avoid data leakage
     test_datasets["baseline"] = PRONTODataset(
         data_files=[HEALTHY_FILE],
         window_size=window_size,
@@ -105,7 +108,7 @@ def _create_dataloaders(
         data_dir=full_data_dir,
         normalize=True,
         normalization_stats=norm_stats,
-        segments_to_load=[2],
+        segments_to_load=[2],  # Segment 2 only for test baseline
         require_stats=True,
         pred_horizon=pred_horizon or 0,
     )

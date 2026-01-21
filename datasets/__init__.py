@@ -12,6 +12,7 @@ from . import co2  # noqa: F401
 from . import tep  # noqa: F401
 from . import ashrae  # noqa: F401
 from . import pronto  # noqa: F401
+from . import ims  # noqa: F401
 
 __all__ = [
     "DatasetAdapter",

@@ -640,13 +640,16 @@ class DySTGAT(nn.Module):
         self.do_gnn_norm = do_gnn_norm
         self.do_decoder_norm = do_decoder_norm
 
-        if self.aug_control:
+        # Only create control encoder if we have control variables
+        if self.aug_control and cfg.dataset.ocvar_dim > 0:
             self.control_encoder = ENCODER_DICT[contr_encoder_type](
                 in_channels=cfg.dataset.ocvar_dim,
                 out_channels=temp_node_embed_dim,
                 norm_func=NORM_LAYER_DICT[encoder_norm_type] if do_encoder_norm else None,
                 mode='multivariate',
             )
+        else:
+            self.aug_control = False  # Disable if no control variables
 
         self.node_encoder = ENCODER_DICT[node_encoder_type](
             in_channels=feat_input_node,

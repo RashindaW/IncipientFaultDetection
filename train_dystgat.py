@@ -1,6 +1,7 @@
 
 import argparse
 import os
+import random
 import time
 import csv
 import math
@@ -29,12 +30,32 @@ from src.config import cfg
 from datasets import get_adapter, list_adapter_keys
 from src.model.dystgat import DySTGAT
 from src.utils.checkpoint import EpochCheckpointManager
+from src.utils.tea import TemporalEvidenceAccumulator, compute_tea_metrics
+
+
+def set_seed(seed: int) -> None:
+    """Set random seeds for reproducibility across all libraries."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # For full determinism (may reduce performance)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def parse_args() -> argparse.Namespace:
     available_datasets = list_adapter_keys()
     parser = argparse.ArgumentParser(description="Train DySTGAT (Dynamic Spectral-Temporal GAT) for anomaly detection")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility. If not set, runs are non-deterministic.",
+    )
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for training")
     parser.add_argument("--train-stride", type=int, default=1, help="Sliding window stride for training dataset")
     parser.add_argument("--val-stride", type=int, default=5, help="Sliding window stride for validation/test datasets")
@@ -896,6 +917,11 @@ def evaluate_tests_and_plot(
                 'threshold',         # fixed threshold (95th percentile of baseline)
                 'best_threshold',    # threshold achieving best_f1
                 'delay_best_thr',    # detection delay (samples) at best_threshold
+                # TEA (Temporal Evidence Accumulation) metrics
+                'tea_auc',           # AUC with TEA post-processing
+                'tea_best_f1',       # Best F1 with TEA
+                'tea_best_window',   # Window size that achieved best TEA AUC
+                'tea_auc_delta',     # Improvement in AUC from TEA
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
@@ -944,7 +970,20 @@ def evaluate_tests_and_plot(
 
                 # Ambiguity (for Pronto novel OCs; harmless for others)
                 ambiguity = 1.0 - 2.0 * abs(auc - 0.5)
-                
+
+                # TEA (Temporal Evidence Accumulation) for incipient fault detection
+                # Window sizes: 30 (~5min), 60 (~10min), 180 (~30min) at 10s sampling
+                tea_metrics = compute_tea_metrics(
+                    baseline_scores,
+                    scores,
+                    window_sizes=[30, 60, 180],
+                    return_best_window=True,
+                )
+                tea_auc = tea_metrics['auc']
+                tea_best_f1 = tea_metrics['best_f1']
+                tea_best_window = tea_metrics['best_window']
+                tea_auc_delta = tea_auc - auc
+
                 row = {
                     'test_set': name,
                     'auc_roc': f"{auc:.4f}",
@@ -956,6 +995,10 @@ def evaluate_tests_and_plot(
                     'threshold': f"{threshold:.6f}",
                     'best_threshold': f"{best_threshold:.6f}",
                     'delay_best_thr': delay_best,
+                    'tea_auc': f"{tea_auc:.4f}",
+                    'tea_best_f1': f"{tea_best_f1:.4f}",
+                    'tea_best_window': tea_best_window,
+                    'tea_auc_delta': f"{tea_auc_delta:+.4f}",
                 }
                 writer.writerow(row)
                 
@@ -965,6 +1008,9 @@ def evaluate_tests_and_plot(
                 metrics[name]['best_f1'] = best_f1
                 metrics[name]['ambiguity'] = ambiguity
                 metrics[name]['delay_best_thr'] = delay_best
+                metrics[name]['tea_auc'] = tea_auc
+                metrics[name]['tea_best_f1'] = tea_best_f1
+                metrics[name]['tea_auc_delta'] = tea_auc_delta
 
         print(f"Detailed metrics saved to {detailed_metrics_path}")
 
@@ -977,6 +1023,12 @@ def main() -> None:
     args = parse_args()
     if args.eval_only and not args.checkpoint:
         raise ValueError("--eval-only requires --checkpoint to be specified.")
+
+    # Set random seed for reproducibility if provided
+    if args.seed is not None:
+        set_seed(args.seed)
+        print(f"Random seed set to: {args.seed}")
+
     # Force single-GPU / single-process execution. Any torchrun/DDP environment
     # variables are intentionally ignored.
     distributed = False
@@ -990,7 +1042,8 @@ def main() -> None:
         if "RANK" in os.environ or "WORLD_SIZE" in os.environ:
             print("Single-GPU mode enforced; ignoring torchrun/Distributed environment variables.")
 
-        if device.type == "cuda":
+        if device.type == "cuda" and args.seed is None:
+            # Only enable benchmark when not requiring reproducibility
             torch.backends.cudnn.benchmark = True
         cfg.anomaly_weight = float(args.anomaly_weight)
         cfg.lambda_div = float(args.lambda_div)
@@ -1274,9 +1327,10 @@ def main() -> None:
                 auc_str = f" auc={metrics['auc']:.4f}" if 'auc' in metrics else ""
                 f1_str = f" f1={metrics['f1']:.4f}" if 'f1' in metrics else ""
                 div_str = f" div={metrics['divergence']:.6f}" if 'divergence' in metrics else ""
+                tea_str = f" tea_auc={metrics['tea_auc']:.4f}({metrics['tea_auc_delta']:+.4f})" if 'tea_auc' in metrics else ""
                 print(
                     f"  {name:30s}: recon_loss={metrics['recon_loss']:.6f} "
-                    f"anomaly_score={metrics['anomaly_score']:.6f}{div_str}{auc_str}{f1_str}"
+                    f"anomaly_score={metrics['anomaly_score']:.6f}{div_str}{auc_str}{f1_str}{tea_str}"
                 )
 
             if args.eval_only:

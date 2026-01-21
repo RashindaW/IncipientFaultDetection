@@ -1,0 +1,48 @@
+% Encoder Detail Diagram
+\begin{tikzpicture}[
+    scale=0.8,
+    node distance=0.5cm,
+    box/.style={rectangle, draw, rounded corners, minimum width=1.8cm, minimum height=0.6cm, align=center, font=\scriptsize},
+    smallbox/.style={rectangle, draw, rounded corners, minimum width=1.2cm, minimum height=0.5cm, align=center, font=\tiny},
+    arrow/.style={->,>=stealth,thick},
+]
+
+% Temporal Branch
+\node[box, fill=gray!20] (input_t) {$\mathbf{X}$};
+\node[smallbox, below=0.4cm of input_t, fill=yellow!20] (idcnn) {IDCNN};
+\node[box, below=0.4cm of idcnn, fill=temporal!30] (gru) {GRU};
+\node[box, below=0.4cm of gru, fill=temporal!50] (h_temp) {$\mathbf{H}_{temp}$};
+
+\draw[arrow] (input_t) -- (idcnn);
+\draw[arrow] (idcnn) -- (gru);
+\draw[arrow] (gru) -- (h_temp);
+
+\node[left=0.1cm of input_t, font=\tiny, text=gray] {$N \times W$};
+\node[left=0.1cm of h_temp, font=\tiny, text=gray] {$N \times D$};
+
+% Spectral Branch
+\begin{scope}[xshift=3cm]
+    \node[box, fill=gray!20] (input_s) {$\mathbf{X}$};
+    \node[smallbox, below=0.4cm of input_s, fill=spectral!20] (fft) {rFFT};
+    \node[smallbox, below=0.4cm of fft, fill=spectral!30] (log) {Log-Mag};
+    \node[smallbox, below=0.4cm of log, fill=spectral!40] (mlp) {Band MLP};
+    \node[smallbox, below=0.4cm of mlp, fill=spectral!30] (feat) {+Features};
+    \node[box, below=0.4cm of feat, fill=spectral!50] (h_freq) {$\mathbf{H}_{freq}$};
+
+    \draw[arrow] (input_s) -- (fft);
+    \draw[arrow] (fft) -- (log);
+    \draw[arrow] (log) -- (mlp);
+    \draw[arrow] (mlp) -- (feat);
+    \draw[arrow] (feat) -- (h_freq);
+
+    \node[right=0.1cm of h_freq, font=\tiny, text=gray] {$N \times D'$};
+\end{scope}
+
+% Labels
+\node[above=0.1cm of input_t, font=\scriptsize, text=temporal] {\textbf{Temporal}};
+\node[above=0.1cm of input_s, font=\scriptsize, text=spectral] {\textbf{Spectral}};
+
+% Spectral features annotation
+\node[right=0.3cm of feat, font=\tiny, text=gray, align=left] {Centroid\\Bandwidth\\Flatness};
+
+\end{tikzpicture}
