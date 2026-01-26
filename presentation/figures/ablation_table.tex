@@ -1,0 +1,30 @@
+% Ablation Study Table
+\begin{table}[t]
+\centering
+\scriptsize
+\caption{Ablation Study Results (AUC-ROC / F1 / F1*)}
+\label{tab:ablation}
+\begin{tabular}{l|ccc}
+\toprule
+\textbf{Configuration} & \textbf{ASHRAE} & \textbf{IMS} & \textbf{PRONTO} \\
+\midrule
+Full Model (Baseline) & \textbf{0.898} / 0.736 / 0.844 & 0.999 / 0.969 / 0.992 & \textbf{0.907} / \textbf{0.900} / 0.971 \\
+\midrule
+\multicolumn{4}{l}{\textit{Spectral View Components}} \\
+\quad No Spectral View & 0.852 / 0.544 / 0.810 & 0.998 / 0.968 / 0.988 & 0.901 / 0.862 / 0.971 \\
+\quad No Spectral Features & 0.735 / 0.433 / 0.725 & \textbf{1.000} / \textbf{0.975} / 0.996 & 0.905 / 0.894 / 0.971 \\
+\midrule
+\multicolumn{4}{l}{\textit{Band Mixing Strategy}} \\
+\quad Band Mix: None & 0.897 / 0.706 / 0.850 & \textbf{1.000} / \textbf{0.975} / \textbf{1.000} & 0.900 / 0.862 / 0.971 \\
+\quad Band Mix: Conv & 0.735 / 0.433 / 0.725 & \textbf{1.000} / \textbf{0.975} / \textbf{1.000} & 0.904 / 0.893 / 0.971 \\
+\midrule
+\multicolumn{4}{l}{\textit{Fusion Mode}} \\
+\quad Fusion: Sum & 0.894 / 0.711 / 0.842 & \textbf{1.000} / \textbf{0.975} / \textbf{1.000} & 0.904 / 0.893 / 0.971 \\
+\quad Fusion: Gated & 0.864 / 0.665 / 0.809 & 0.970 / 0.911 / 0.932 & 0.903 / 0.889 / 0.971 \\
+\midrule
+\multicolumn{4}{l}{\textit{Divergence Type}} \\
+\quad KL Divergence & 0.735 / 0.433 / 0.725 & 0.982 / 0.950 / 0.965 & \textbf{0.907} / 0.899 / 0.971 \\
+\quad JS ($\lambda$=0.4) & 0.735 / 0.433 / 0.725 & 0.999 / 0.971 / 0.989 & \textbf{0.907} / \textbf{0.900} / 0.971 \\
+\bottomrule
+\end{tabular}
+\end{table}

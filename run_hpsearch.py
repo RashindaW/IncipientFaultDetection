@@ -188,6 +188,53 @@ IMS_ORIGINAL_CONFIG = {
     "freq-embed-dim": 16,
 }
 
+# IMS Raw Accelerometer Dataset Base configuration
+# Uses raw 20kHz vibration signals instead of pre-computed features
+# Ideal for spectral analysis - the spectral encoder can leverage the rich frequency content
+IMS_RAW_BASE_CONFIG = {
+    # Dataset
+    "dataset-key": "ims-raw",
+    # Training
+    "epochs": 200,
+    "batch-size": 64,  # Smaller due to larger per-sample data
+    "learning-rate": 1e-4,
+    "weight-decay": 1e-5,
+    # Window (samples of accelerometer data, 1024 samples ≈ 50ms at 20kHz)
+    "window-size": 1024,
+    "train-stride": 1,
+    "val-stride": 1,
+    "test-stride": 1,
+    # Spectral (key for raw data - the main advantage of using raw signals)
+    "use-spectral-view": True,
+    "freq-embed-dim": 32,  # Larger for richer frequency content
+    "freq-band-mix": "mlp",
+    "freq-use-log": True,
+    "freq-use-spectral-features": True,
+    "fuse-mode": "concat",
+    "divergence-type": "js",
+    # Loss
+    "anomaly-weight": 1.0,
+    "lambda-div": 0.2,
+    # Task
+    "task": "reconstruction",
+    # AMP (helpful for larger data)
+    "use-amp": True,
+}
+
+# IMS Raw User's original configuration for reference
+IMS_RAW_ORIGINAL_CONFIG = {
+    "window-size": 1024,
+    "train-stride": 1,
+    "val-stride": 1,
+    "test-stride": 1,
+    "epochs": 300,
+    "batch-size": 64,
+    "learning-rate": 1e-4,
+    "anomaly-weight": 0.5,
+    "lambda-div": 0.1,
+    "freq-embed-dim": 16,
+}
+
 # PRONTO Dataset Base configuration (balanced baseline)
 PRONTO_BASE_CONFIG = {
     # Dataset
@@ -296,6 +343,27 @@ DATASET_PARAMS = {
         "combo_minimal_window": 18,
         "combo_best_window": 12,
     },
+    "ims-raw": {
+        # Window sizes in samples (at 20kHz: 512=25ms, 1024=50ms, 2048=100ms)
+        "window_small": 512,
+        "window_base": 1024,
+        "window_large": 2048,
+        "window_xlarge": 4096,
+        "epochs_short": 100,
+        "epochs_base": 200,
+        "epochs_long": 300,
+        "stride_dense": (1, 1),
+        "stride_normal": (1, 1),
+        "stride_sparse": (1, 2),
+        "stride_very_sparse": (2, 3),
+        "combo_fast_window": 512,
+        "combo_patient_window": 2048,
+        "combo_regularized_window": 768,
+        "combo_aggressive_window": 512,
+        "combo_dense_window": 1024,
+        "combo_minimal_window": 1536,
+        "combo_best_window": 1024,
+    },
     "pronto": {
         "window_small": 10,
         "window_base": 15,
@@ -325,6 +393,7 @@ def get_base_config(dataset_key: str) -> Dict[str, Any]:
         "ashrae": ASHRAE_BASE_CONFIG,
         "tep": TEP_BASE_CONFIG,
         "ims": IMS_BASE_CONFIG,
+        "ims-raw": IMS_RAW_BASE_CONFIG,
         "pronto": PRONTO_BASE_CONFIG,
     }
     return configs.get(dataset_key, ASHRAE_BASE_CONFIG).copy()
@@ -336,6 +405,7 @@ def get_original_config(dataset_key: str) -> Dict[str, Any]:
         "ashrae": ASHRAE_ORIGINAL_CONFIG,
         "tep": TEP_ORIGINAL_CONFIG,
         "ims": IMS_ORIGINAL_CONFIG,
+        "ims-raw": IMS_RAW_ORIGINAL_CONFIG,
         "pronto": PRONTO_ORIGINAL_CONFIG,
     }
     return configs.get(dataset_key, ASHRAE_ORIGINAL_CONFIG).copy()
@@ -1370,9 +1440,9 @@ Examples:
     parser.add_argument(
         "--dataset-key",
         type=str,
-        choices=["ashrae", "tep", "ims", "pronto"],
+        choices=["ashrae", "tep", "ims", "ims-raw", "pronto"],
         default="ashrae",
-        help="Dataset to use: ashrae, tep, ims, or pronto (default: ashrae)",
+        help="Dataset to use: ashrae, tep, ims, ims-raw, or pronto (default: ashrae)",
     )
     parser.add_argument(
         "--cuda-device",

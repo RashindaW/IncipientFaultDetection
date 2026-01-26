@@ -1,0 +1,91 @@
+% Sensitivity Analysis Tables
+
+% Window Size Sensitivity
+\begin{table}[t]
+\centering
+\scriptsize
+\caption{Window Size Sensitivity (AUC / F1 / F1*)}
+\label{tab:window_sensitivity}
+\begin{tabular}{l|ccc}
+\toprule
+\textbf{Window Size} & \textbf{ASHRAE} & \textbf{IMS} & \textbf{PRONTO} \\
+\midrule
+Small (60/10/10) & 0.653 / 0.265 / 0.489 & \textbf{1.000} / \textbf{0.976} / \textbf{1.000} & 0.911 / 0.892 / 0.966 \\
+Baseline (180/15/15) & 0.898 / 0.736 / 0.844 & 0.999 / 0.969 / 0.992 & 0.907 / \textbf{0.900} / 0.971 \\
+Large (300/20/20) & 0.797 / 0.555 / 0.847 & 0.987 / 0.964 / 0.976 & 0.906 / 0.898 / 0.971 \\
+XLarge (450/30/30) & \textbf{0.878} / \textbf{0.824} / \textbf{0.923} & \textbf{1.000} / \textbf{0.987} / \textbf{1.000} & 0.895 / 0.863 / \textbf{0.973} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% Lambda Divergence Sensitivity
+\begin{table}[t]
+\centering
+\scriptsize
+\caption{Divergence Loss Weight ($\lambda_{div}$) Sensitivity}
+\label{tab:lambda_sensitivity}
+\begin{tabular}{l|ccc}
+\toprule
+\textbf{$\lambda_{div}$} & \textbf{ASHRAE} & \textbf{IMS} & \textbf{PRONTO} \\
+\midrule
+0.0 (No Div) & 0.858 / 0.679 / 0.813 & 0.999 / 0.969 / 0.992 & 0.904 / 0.895 / 0.971 \\
+0.2 (Baseline) & 0.898 / 0.736 / 0.844 & 0.999 / 0.969 / 0.992 & 0.907 / \textbf{0.900} / 0.971 \\
+0.4 & \textbf{0.906} / \textbf{0.743} / \textbf{0.862} & \textbf{1.000} / \textbf{0.975} / \textbf{1.000} & \textbf{0.907} / \textbf{0.900} / 0.971 \\
+0.6 & 0.901 / 0.739 / 0.852 & 0.993 / 0.962 / 0.985 & \textbf{0.907} / \textbf{0.900} / 0.971 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% Embedding Dimension Sensitivity
+\begin{table}[t]
+\centering
+\scriptsize
+\caption{Embedding Dimension Sensitivity}
+\label{tab:embed_sensitivity}
+\begin{tabular}{l|ccc}
+\toprule
+\textbf{Embed Dim} & \textbf{ASHRAE} & \textbf{IMS} & \textbf{PRONTO} \\
+\midrule
+8 (Small) & 0.872 / 0.628 / 0.827 & 0.997 / 0.971 / 0.994 & 0.899 / 0.862 / 0.971 \\
+24 (Baseline) & 0.898 / 0.736 / 0.844 & \textbf{0.999} / 0.969 / 0.992 & \textbf{0.907} / \textbf{0.900} / 0.971 \\
+32 & \textbf{0.927} / \textbf{0.782} / \textbf{0.879} & 0.998 / 0.965 / 0.985 & 0.906 / 0.894 / 0.971 \\
+48 (Large) & 0.735 / 0.433 / 0.725 & 0.990 / 0.957 / 0.974 & 0.904 / 0.892 / 0.971 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% Anomaly Weight Sensitivity
+\begin{table}[t]
+\centering
+\scriptsize
+\caption{Anomaly Weight ($\alpha$) Sensitivity}
+\label{tab:anomaly_sensitivity}
+\begin{tabular}{l|ccc}
+\toprule
+\textbf{Anomaly Wt} & \textbf{ASHRAE} & \textbf{IMS} & \textbf{PRONTO} \\
+\midrule
+0.1 (Low) & \textbf{0.908} / \textbf{0.761} / \textbf{0.863} & \textbf{1.000} / \textbf{0.975} / \textbf{1.000} & 0.906 / 0.898 / 0.971 \\
+1.0 (Baseline) & 0.898 / 0.736 / 0.844 & 0.999 / 0.969 / 0.992 & \textbf{0.907} / \textbf{0.900} / 0.971 \\
+2.0 & 0.841 / 0.636 / 0.801 & 0.999 / 0.969 / 0.992 & \textbf{0.907} / \textbf{0.900} / 0.971 \\
+3.0 & 0.735 / 0.433 / 0.725 & 0.999 / 0.969 / 0.992 & \textbf{0.907} / \textbf{0.900} / 0.971 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% Learning Rate Sensitivity
+\begin{table}[t]
+\centering
+\scriptsize
+\caption{Learning Rate Sensitivity}
+\label{tab:lr_sensitivity}
+\begin{tabular}{l|ccc}
+\toprule
+\textbf{Learning Rate} & \textbf{ASHRAE} & \textbf{IMS} & \textbf{PRONTO} \\
+\midrule
+5e-5 (Low) & 0.735 / 0.433 / 0.725 & 0.980 / 0.949 / 0.965 & \textbf{0.907} / 0.898 / 0.971 \\
+3e-4 (Baseline) & 0.898 / 0.736 / 0.844 & 0.999 / 0.972 / 0.996 & \textbf{0.907} / \textbf{0.900} / 0.971 \\
+8e-4 & 0.898 / 0.724 / 0.844 & 0.999 / 0.972 / 0.996 & 0.905 / 0.886 / 0.971 \\
+1e-3 (High) & \textbf{0.903} / 0.687 / \textbf{0.863} & \textbf{1.000} / \textbf{0.975} / \textbf{1.000} & 0.906 / 0.897 / 0.971 \\
+\bottomrule
+\end{tabular}
+\end{table}
