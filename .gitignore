@@ -35,6 +35,7 @@ checkpoints/
 *.pth
 *.ckpt
 *.pdf
+
 # Datasets and large data directories
 data/
 *.csv
@@ -50,6 +51,19 @@ data/
 outputs/
 results/
 artifacts/
+evaluation_results/
+
+# Paper and research directories
+IMS_Bearing_Paper/
+Paper/
+presentation/
+"PRONTO Dataset Paper"/
+research_paper/
+
+# Media files
+*.html
+*.jpg
+*.jpeg
 
 # Local configs and secrets
 .env.local
