@@ -164,7 +164,7 @@ def parse_args() -> argparse.Namespace:
         help="Weight for spectral/temporal divergence loss during training.",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Optimizer learning rate")
-    parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay (L2 regularization)")
+    parser.add_argument("--weight-decay", type=float, default=1e-3, help="Weight decay (L2 regularization)")
     parser.add_argument(
         "--dataset-key",
         type=str,
@@ -796,7 +796,10 @@ def evaluate_tests_and_plot(
     results_anom: Dict[str, np.ndarray] = {}
     results_mse: Dict[str, np.ndarray] = {}
     results_div: Dict[str, np.ndarray] = {}
-    baseline_scores = None
+    # Separate validation and test baseline scores to prevent data leakage
+    # Per paper (p.11): threshold should be based on 95th percentile of normal VALIDATION set
+    val_baseline_scores = None  # For threshold computation (no leakage)
+    test_baseline_scores = None  # For AUC computation (test normal vs test fault)
 
     # Collect per-sample metrics for each test loader
     for name, loader in loaders.items():
@@ -815,12 +818,22 @@ def evaluate_tests_and_plot(
             results_mse[name] = mse_arr if mse_arr is not None else np.zeros_like(anom_arr)
             results_div[name] = div_arr if div_arr is not None else np.zeros_like(anom_arr)
 
-            # Identify baseline scores for AUC calculation
-            if "baseline" in name.lower() or "fault_free" in name.lower():
-                if baseline_scores is None:
-                    baseline_scores = anom_arr
+            # Identify baseline scores - separate val from test to prevent threshold leakage
+            name_lower = name.lower()
+            if "baseline" in name_lower or "fault_free" in name_lower:
+                # Check if this is validation or test baseline
+                if "val" in name_lower:
+                    # Validation baseline - used for threshold computation
+                    if val_baseline_scores is None:
+                        val_baseline_scores = anom_arr
+                    else:
+                        val_baseline_scores = np.concatenate([val_baseline_scores, anom_arr])
                 else:
-                    baseline_scores = np.concatenate([baseline_scores, anom_arr])
+                    # Test baseline - used for AUC computation
+                    if test_baseline_scores is None:
+                        test_baseline_scores = anom_arr
+                    else:
+                        test_baseline_scores = np.concatenate([test_baseline_scores, anom_arr])
 
     # Save raw scores
     if results_anom:
@@ -900,10 +913,25 @@ def evaluate_tests_and_plot(
                 )
     
     # Second pass: Compute Classification Metrics (AUC, Precision, Recall, F1 variants, Delay, Ambiguity)
-    # Only if we have a baseline to compare against
-    if baseline_scores is not None:
+    # Only if we have baselines to compare against
+    # Require val_baseline for threshold; test_baseline for AUC (fall back to val if no test)
+    if val_baseline_scores is not None:
+        # Use test baseline for AUC if available, otherwise fall back to val baseline
+        auc_baseline_scores = test_baseline_scores if test_baseline_scores is not None else val_baseline_scores
         detailed_metrics_path = os.path.join(output_dir, "detailed_test_metrics.csv")
-        print(f"Calculating AUC/F1 metrics (using baseline N={len(baseline_scores)})...")
+        print(f"Calculating AUC/F1 metrics...")
+        print(f"  Threshold computed from VALIDATION baseline (N={len(val_baseline_scores)}) - no leakage")
+        print(f"  AUC computed using TEST baseline (N={len(auc_baseline_scores)})")
+
+        # Score distribution debug output
+        print(f"\n=== Score Distribution Debug ===")
+        print(f"Baseline: min={np.min(auc_baseline_scores):.4f}, max={np.max(auc_baseline_scores):.4f}, "
+              f"mean={np.mean(auc_baseline_scores):.4f}, p95={np.percentile(auc_baseline_scores, 95):.4f}")
+        for name, scores in results_anom.items():
+            if "baseline" not in name.lower() and "fault_free" not in name.lower():
+                print(f"{name}: min={np.min(scores):.4f}, max={np.max(scores):.4f}, "
+                      f"mean={np.mean(scores):.4f}, p5={np.percentile(scores, 5):.4f}")
+        print(f"================================\n")
         
         with open(detailed_metrics_path, 'w', newline='') as csvfile:
             fieldnames = [
@@ -930,19 +958,20 @@ def evaluate_tests_and_plot(
                 # Skip if it IS the baseline
                 if "baseline" in name.lower() or "fault_free" in name.lower():
                     continue
-                    
-                # Construct labels
-                # Baseline = 0, This Fault = 1
-                y_true = np.concatenate([np.zeros(len(baseline_scores)), np.ones(len(scores))])
-                y_scores = np.concatenate([baseline_scores, scores])
-                
+
+                # Construct labels for AUC computation
+                # Use test baseline (or fallback) = 0, This Fault = 1
+                y_true = np.concatenate([np.zeros(len(auc_baseline_scores)), np.ones(len(scores))])
+                y_scores = np.concatenate([auc_baseline_scores, scores])
+
                 try:
                     auc = roc_auc_score(y_true, y_scores)
                 except ValueError:
                     auc = 0.0
-                
-                # Fixed threshold for F1: 95th percentile of baseline (per paper)
-                threshold = np.percentile(baseline_scores, 95)
+
+                # Fixed threshold for F1: 95th percentile of VALIDATION baseline (per paper p.11)
+                # This prevents data leakage - threshold is set without seeing test data
+                threshold = np.percentile(val_baseline_scores, 95)
                 y_pred = (y_scores > threshold).astype(int)
                 prec, rec, f1, _ = precision_recall_fscore_support(
                     y_true, y_pred, average='binary', zero_division=0
@@ -950,14 +979,12 @@ def evaluate_tests_and_plot(
 
                 # Best F1 (F1*): scan PR curve
                 pr_prec, pr_rec, pr_thresh = precision_recall_curve(y_true, y_scores)
-                f1_curve = 2 * pr_prec * pr_rec / (pr_prec + pr_rec + 1e-12)
+                # Exclude last element (endpoint where recall=0, giving F1=0)
+                f1_curve = 2 * pr_prec[:-1] * pr_rec[:-1] / (pr_prec[:-1] + pr_rec[:-1] + 1e-12)
                 best_idx = int(np.argmax(f1_curve))
                 best_f1 = float(f1_curve[best_idx])
                 # precision_recall_curve returns thresholds len = len(prec)-1
-                if best_idx >= len(pr_thresh):
-                    best_threshold = float(pr_thresh[-1]) if len(pr_thresh) else float(threshold)
-                else:
-                    best_threshold = float(pr_thresh[best_idx])
+                best_threshold = float(pr_thresh[best_idx]) if best_idx < len(pr_thresh) else float(pr_thresh[-1])
 
                 # Detection delay at best_threshold: samples until first detection in fault segment
                 # Using fault scores only (all ones) since baseline prepends zeros.
@@ -972,11 +999,13 @@ def evaluate_tests_and_plot(
                 ambiguity = 1.0 - 2.0 * abs(auc - 0.5)
 
                 # TEA (Temporal Evidence Accumulation) for incipient fault detection
-                # Window sizes: 30 (~5min), 60 (~10min), 180 (~30min) at 10s sampling
+                # Window sizes: 300 (~5min), 600 (~10min), 1800 (~30min) at 1s sampling
+                # PRONTO raw CSV uses 1s intervals (per header: "Interval,1s")
+                # Use test baseline for TEA AUC computation (consistent with raw AUC)
                 tea_metrics = compute_tea_metrics(
-                    baseline_scores,
+                    auc_baseline_scores,
                     scores,
-                    window_sizes=[30, 60, 180],
+                    window_sizes=[300, 600, 1800],
                     return_best_window=True,
                 )
                 tea_auc = tea_metrics['auc']

@@ -247,7 +247,7 @@ class FeatureGraph(nn.Module):
             else:
                 new_edge_index = edge_index
 
-        # attention = F.dropout(attention, p=self.dropout, training=self.training)
+        attention = F.dropout(attention, p=self.dropout, training=self.training)
         if self.learn_sys and not is_undirected(new_edge_index):
              # to_undirected might duplicate edges? 
              # For anomaly detection, usually symmetric relation is preferred?

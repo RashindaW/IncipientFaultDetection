@@ -348,9 +348,12 @@ def compute_tea_metrics(
         best_auc = 0.5
 
     # Best F1
-    precision, recall, _ = precision_recall_curve(labels, scores)
-    f1_curve = 2 * precision * recall / (precision + recall + 1e-8)
-    best_f1 = float(np.max(f1_curve))
+    precision, recall, thresholds = precision_recall_curve(labels, scores)
+    # Exclude last element (endpoint where recall=0, giving F1=0)
+    f1_curve = 2 * precision[:-1] * recall[:-1] / (precision[:-1] + recall[:-1] + 1e-8)
+    best_idx = int(np.argmax(f1_curve))
+    best_f1 = float(f1_curve[best_idx])
+    best_threshold = float(thresholds[best_idx]) if best_idx < len(thresholds) else float(thresholds[-1])
 
     result = {
         'auc': best_auc,

@@ -263,15 +263,14 @@ def main():
     print(f"{'Fault Type':<30} {'AUC':>8} {'F1':>8} {'F1*':>8} {'N':>8}")
     print("-" * 70)
 
+    # Use the new fault key structure from pronto.py
+    # Available keys: baseline, slugging, blockage, leakage, diverted, faults_all
     fault_loaders = {
         "slugging": test_loaders["slugging"],
+        "blockage": test_loaders["blockage"],
+        "leakage": test_loaders["leakage"],
+        "diverted": test_loaders["diverted"],
         "faults_all": test_loaders["faults_all"],
-        "Blockage_120air_01water": test_loaders["Blockage_120air_01water"],
-        "Blockage_150air_05water": test_loaders["Blockage_150air_05water"],
-        "Leakage_120air_01water": test_loaders["Leakage_120air_01water"],
-        "Leakage_150air_05water": test_loaders["Leakage_150air_05water"],
-        "Diverted_120air_01water": test_loaders["Diverted_120air_01water"],
-        "Diverted_150air_05water": test_loaders["Diverted_150air_05water"],
     }
 
     for fault_name, loader in fault_loaders.items():
