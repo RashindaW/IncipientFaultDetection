@@ -86,6 +86,230 @@ class TimeEncode(nn.Module):
         return output
 
 
+class IDCNN(nn.Module):
+    """Enhanced 1D CNN for edge attention preprocessing."""
+    def __init__(self, in_channels=1, hidden_channels=16, out_channels=1, kernel_size=3, num_layers=2):
+        super().__init__()
+        layers = []
+        layers.append(nn.Conv1d(in_channels, hidden_channels, kernel_size, padding=kernel_size//2))
+        layers.append(nn.ReLU())
+        for _ in range(num_layers - 2):
+            layers.append(nn.Conv1d(hidden_channels, hidden_channels, kernel_size, padding=kernel_size//2))
+            layers.append(nn.ReLU())
+        if num_layers > 1:
+            layers.append(nn.Conv1d(hidden_channels, out_channels, kernel_size, padding=kernel_size//2))
+            layers.append(nn.ReLU())
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class EdgeGRU(nn.Module):
+    """Scalar GRU: h_jk^ti = ReLU(GRU-Cell(α_jk^ti, h_jk^(ti-1)))"""
+    def __init__(self):
+        super().__init__()
+        self.gru_cell = nn.GRUCell(input_size=1, hidden_size=1)
+
+    def forward(self, alpha_seq):
+        """alpha_seq: [num_edges, W] -> edge_weights: [num_edges]"""
+        num_edges, w = alpha_seq.shape
+        h = torch.zeros(num_edges, 1, device=alpha_seq.device)
+        for t in range(w):
+            h = self.gru_cell(alpha_seq[:, t:t+1], h)
+            h = F.relu(h)
+        return h.squeeze(-1)
+
+
+class TemporalFeatureGraph(nn.Module):
+    """
+    Memory-efficient: Process timesteps sequentially.
+    At each ti: use hj[ti], hk[ti] (scalars) + temporal encoding
+    e_jk^ti = a^T · LeakyReLU(W · [hj[ti], hk[ti], emb(ti)])
+    """
+    def __init__(self, n_nodes, hidden_dim=64, time_dim=5, dropout=0.3, learn_sys=True):
+        super().__init__()
+        self.n_nodes = n_nodes
+        self.dropout = dropout
+        self.learn_sys = learn_sys
+
+        self.time_encode = TimeEncode(time_dim)
+        # Input: [scalar_j, scalar_k, emb(ti)] = 2 + time_dim
+        self.W = nn.Linear(2 + time_dim, hidden_dim)
+        self.att = nn.Parameter(torch.empty(hidden_dim))
+        nn.init.xavier_uniform_(self.att.unsqueeze(0))
+        self.edge_gru = EdgeGRU()
+
+    def forward(self, h, batch):
+        """
+        h: [B, N, W] - IDCNN output (filtered signal)
+        Returns: edge_index, edge_weights, alpha_seq (for divergence!)
+        """
+        b, n, w = h.shape
+        device = h.device
+
+        # Time encodings for all timesteps
+        t_idx = torch.arange(w, device=device, dtype=torch.float32)
+        time_emb = self.time_encode(t_idx)  # [W, time_dim]
+
+        # Collect attention over time: [B, N, N, W]
+        alpha_seq = torch.zeros(b, n, n, w, device=device)
+
+        for ti in range(w):
+            # Node values at timestep ti: [B, N, 1]
+            h_ti = h[:, :, ti:ti+1]
+
+            # Pairwise scalars: [B, N, N, 2]
+            hj = h_ti.unsqueeze(2).expand(-1, -1, n, -1)  # [B, N, N, 1]
+            hk = h_ti.unsqueeze(1).expand(-1, n, -1, -1)  # [B, N, N, 1]
+            h_pair = torch.cat([hj, hk], dim=-1)  # [B, N, N, 2]
+
+            # Add time encoding: [B, N, N, 2+time_dim]
+            t_enc = time_emb[ti].view(1, 1, 1, -1).expand(b, n, n, -1)
+            v = torch.cat([h_pair, t_enc], dim=-1)
+
+            # GATv2 attention
+            u = F.leaky_relu(self.W(v), 0.2)  # [B, N, N, hidden]
+            e = (u * self.att).sum(dim=-1)    # [B, N, N]
+            alpha = F.softmax(e, dim=2)        # Normalize over neighbors
+
+            if self.training:
+                alpha = F.dropout(alpha, p=self.dropout)
+
+            alpha_seq[:, :, :, ti] = alpha
+
+        # EdgeGRU: aggregate attention over time
+        # [B*N*N, W] -> [B*N*N]
+        alpha_flat = alpha_seq.view(b * n * n, w)
+        edge_weights = self.edge_gru(alpha_flat)
+        edge_weights_dense = edge_weights.view(b, n, n)
+
+        # Convert to sparse (for GNN compatibility)
+        edge_index, edge_weights = self._dense_to_sparse(edge_weights_dense, b, n, device)
+
+        return edge_index, edge_weights, alpha_seq  # Return alpha_seq for divergence!
+
+    def _dense_to_sparse(self, dense, b, n, device):
+        # Symmetrize in dense form if learning symmetric system
+        if self.learn_sys:
+            dense = (dense + dense.transpose(-1, -2)) / 2
+
+        # Exclude self-loops (i ≠ j) - GIN already has (1+ε)·x_i term
+        mask = ~torch.eye(n, dtype=torch.bool, device=device)
+        src, dst = mask.nonzero(as_tuple=True)
+        single = torch.stack([src, dst], dim=0)  # [2, N*(N-1)]
+
+        edge_indices = []
+        edge_weights_list = []
+        for i in range(b):
+            edge_indices.append(single + i * n)
+            edge_weights_list.append(dense[i][mask])
+
+        return torch.cat(edge_indices, dim=1), torch.cat(edge_weights_list)
+
+
+class WeightedGIN(nn.Module):
+    """z_j = MLP((1+ε)·z_j + Σ_k A_jk·z_k) + residual"""
+    def __init__(self, in_channels, out_channels, eps=0.0, train_eps=True):
+        super().__init__()
+        self.eps = nn.Parameter(torch.tensor(eps)) if train_eps else eps
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, out_channels),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(),
+            nn.Linear(out_channels, out_channels),
+        )
+        # Residual connection if dimensions match
+        self.residual = nn.Identity() if in_channels == out_channels else None
+
+    def forward(self, x, edge_index, edge_weight):
+        src, dst = edge_index
+        weighted_msg = x[src] * edge_weight.unsqueeze(-1)
+        aggr = torch.zeros_like(x)
+        aggr.index_add_(0, dst, weighted_msg)
+        out = self.mlp((1 + self.eps) * x + aggr)
+        if self.residual is not None:
+            out = out + self.residual(x)
+        return out
+
+
+class BackwardOCEncoder(nn.Module):
+    """Process OC in reverse: h_c^ti = ReLU(GRU(U^ti, h_c^(ti+1)))"""
+    def __init__(self, in_channels, hidden_dim):
+        super().__init__()
+        self.gru = nn.GRU(in_channels, hidden_dim, batch_first=True)
+
+    def forward(self, u_seq):
+        """u_seq: [B, W, C] -> [B, hidden_dim]"""
+        u_rev = torch.flip(u_seq, dims=[1])
+        _, h = self.gru(u_rev)
+        return F.relu(h.squeeze(0))
+
+
+class SpectralFeatureGraph(nn.Module):
+    """
+    Simpler graph for spectral embeddings (no temporal dimension).
+    Spectral features are already window-aggregated via FFT.
+    """
+    def __init__(self, embed_dim, hidden_dim=64, dropout=0.3, learn_sys=True):
+        super().__init__()
+        self.dropout = dropout
+        self.learn_sys = learn_sys
+
+        # Input: [freq_j, freq_k] concatenated
+        self.W = nn.Linear(2 * embed_dim, hidden_dim)
+        self.att = nn.Parameter(torch.empty(hidden_dim))
+        nn.init.xavier_uniform_(self.att.unsqueeze(0))
+
+    def forward(self, h_freq, batch, n_nodes):
+        """
+        h_freq: [B*N, embed_dim] - spectral embeddings
+        Returns: edge_index, edge_weights, alpha (for divergence!)
+        """
+        device = h_freq.device
+        b = h_freq.shape[0] // n_nodes
+        n = n_nodes
+
+        # Reshape to [B, N, embed_dim]
+        h = h_freq.view(b, n, -1)
+
+        # Pairwise: [B, N, N, 2*embed_dim]
+        hj = h.unsqueeze(2).expand(-1, -1, n, -1)
+        hk = h.unsqueeze(1).expand(-1, n, -1, -1)
+        h_pair = torch.cat([hj, hk], dim=-1)
+
+        # GATv2 attention (no temporal encoding)
+        u = F.leaky_relu(self.W(h_pair), 0.2)  # [B, N, N, hidden]
+        e = (u * self.att).sum(dim=-1)         # [B, N, N]
+        alpha = F.softmax(e, dim=2)
+
+        if self.training:
+            alpha = F.dropout(alpha, p=self.dropout)
+
+        # Convert to sparse
+        edge_index, edge_weights = self._dense_to_sparse(alpha, b, n, device)
+
+        return edge_index, edge_weights, alpha  # Return alpha for divergence!
+
+    def _dense_to_sparse(self, dense, b, n, device):
+        # Symmetrize in dense form if learning symmetric system
+        if self.learn_sys:
+            dense = (dense + dense.transpose(-1, -2)) / 2
+
+        # Exclude self-loops (i ≠ j) - GIN already has (1+ε)·x_i term
+        mask = ~torch.eye(n, dtype=torch.bool, device=device)
+        src, dst = mask.nonzero(as_tuple=True)
+        single = torch.stack([src, dst], dim=0)  # [2, N*(N-1)]
+
+        edge_indices = []
+        edge_weights_list = []
+        for i in range(b):
+            edge_indices.append(single + i * n)
+            edge_weights_list.append(dense[i][mask])
+
+        return torch.cat(edge_indices, dim=1), torch.cat(edge_weights_list)
+
+
 class FeatureGraph(nn.Module):
     def __init__(self,
                  in_channels,
@@ -324,7 +548,8 @@ class GRUEncoder(nn.Module):
                 h0 = h0.unsqueeze(0)
             out, h = self.gru(x, h0)
             # h: [1, b*n, out_dim]
-            h = h.squeeze(0).view(b, n, -1)
+            # Paper: h_j^ti = ReLU(GRU-Cell(x_j^ti, h_j^(ti-1)))
+            h = F.relu(h.squeeze(0)).view(b, n, -1)
             if not isinstance(self.norm, nn.Identity):
                 h_flat = h.reshape(b * n, -1)
                 if isinstance(self.norm, GraphNorm):
@@ -339,7 +564,8 @@ class GRUEncoder(nn.Module):
             if h0 is not None:
                 h0 = h0.unsqueeze(0)
             out, h = self.gru(x, h0)
-            h = h.squeeze(0)
+            # Paper: h_j^ti = ReLU(GRU-Cell(x_j^ti, h_j^(ti-1)))
+            h = F.relu(h.squeeze(0))
             if not isinstance(self.norm, nn.Identity):
                 if isinstance(self.norm, GraphNorm):
                     batch = torch.arange(h.size(0), device=h.device)
@@ -648,6 +874,16 @@ class DySTGAT(nn.Module):
                 norm_func=NORM_LAYER_DICT[encoder_norm_type] if do_encoder_norm else None,
                 mode='multivariate',
             )
+            # Backward OC encoder for decoder initialization (paper requirement)
+            self.backward_oc_encoder = BackwardOCEncoder(
+                in_channels=cfg.dataset.ocvar_dim,
+                hidden_dim=temp_node_embed_dim,
+            )
+            # Project if dimensions differ
+            if temp_node_embed_dim != recon_hidden_dim:
+                self.backward_context_proj = nn.Linear(temp_node_embed_dim, recon_hidden_dim)
+            else:
+                self.backward_context_proj = nn.Identity()
         else:
             self.aug_control = False  # Disable if no control variables
 
@@ -657,7 +893,16 @@ class DySTGAT(nn.Module):
             norm_func=NORM_LAYER_DICT[encoder_norm_type] if do_encoder_norm else None,
             mode=node_encoder_mode,
         )
-        self.idcnn = nn.Conv1d(1, 1, kernel_size=3, padding=1)
+        self.idcnn = IDCNN(in_channels=1, hidden_channels=16, out_channels=1, kernel_size=3, num_layers=2)
+
+        # TemporalFeatureGraph for paper-compliant edge construction with GATv2 + EdgeGRU
+        self.temporal_feature_graph = TemporalFeatureGraph(
+            n_nodes=cfg.dataset.n_nodes,
+            hidden_dim=temp_edge_hid_dim,  # 100
+            time_dim=time_dim,
+            dropout=dropout,
+            learn_sys=learn_sys,
+        )
 
         base_freq_embed_dim = freq_node_embed_dim or temp_node_embed_dim
         self.freq_node_embed_dim = base_freq_embed_dim
@@ -674,6 +919,18 @@ class DySTGAT(nn.Module):
                 use_spectral_features=freq_use_spectral_features,
             )
             self.freq_node_embed_dim = self.spectral_encoder.output_dim
+
+            # SpectralFeatureGraph for spectral branch edge construction
+            self.spectral_feature_graph = SpectralFeatureGraph(
+                embed_dim=self.freq_node_embed_dim,
+                hidden_dim=temp_edge_hid_dim,
+                dropout=dropout,
+                learn_sys=learn_sys,
+            )
+
+            # OC conditioning for spectral branch
+            if self.aug_control and cfg.dataset.ocvar_dim > 0:
+                self.spectral_oc_proj = nn.Linear(temp_node_embed_dim, self.freq_node_embed_dim)
 
         if self.use_spectral_view and freq_topk != topk:
             warnings.warn(
@@ -706,22 +963,11 @@ class DySTGAT(nn.Module):
             # Edge features from TemporalGraph are scalar attention values per timestep
             pass
             
-        # GNN Layers
+        # GNN Layers - WeightedGIN (edge weights as scalar multipliers)
         self.gnn_layers = nn.ModuleList()
         for i in range(num_gnn_layers):
-            # Input dim for first layer is node embed dim
-            # Hidden dim for subsequent
             in_dim = temp_node_embed_dim if i == 0 else gnn_embed_dim
-
-            if gnn_type == 'gin':
-                mlp = nn.Sequential(
-                    nn.Linear(in_dim, gnn_embed_dim),
-                    nn.ReLU(),
-                    nn.Linear(gnn_embed_dim, gnn_embed_dim)
-                )
-                self.gnn_layers.append(GINEConv(mlp, edge_dim=1)) # GINE uses edge attr
-            elif gnn_type == 'gat':
-                self.gnn_layers.append(GATv2Conv(in_dim, gnn_embed_dim, edge_dim=1))
+            self.gnn_layers.append(WeightedGIN(in_dim, gnn_embed_dim, train_eps=True))
 
         if self.use_spectral_view:
             if self.share_gnn_weights:
@@ -730,15 +976,7 @@ class DySTGAT(nn.Module):
                 self.gnn_layers_freq = nn.ModuleList()
                 for i in range(num_gnn_layers):
                     in_dim = self.freq_node_embed_dim if i == 0 else gnn_embed_dim
-                    if gnn_type == 'gin':
-                        mlp = nn.Sequential(
-                            nn.Linear(in_dim, gnn_embed_dim),
-                            nn.ReLU(),
-                            nn.Linear(gnn_embed_dim, gnn_embed_dim)
-                        )
-                        self.gnn_layers_freq.append(GINEConv(mlp, edge_dim=1))
-                    elif gnn_type == 'gat':
-                        self.gnn_layers_freq.append(GATv2Conv(in_dim, gnn_embed_dim, edge_dim=1))
+                    self.gnn_layers_freq.append(WeightedGIN(in_dim, gnn_embed_dim, train_eps=True))
 
         if self.do_gnn_norm:
             norm_cls = NORM_LAYER_DICT[gnn_norm_type]
@@ -846,9 +1084,10 @@ class DySTGAT(nn.Module):
         x, c, edge_index, batch = data.x, data.c, data.edge_index, data.batch
         n_nodes = cfg.dataset.n_nodes
         context_expanded = None
-        
+        c_in = None  # Control input for backward OC encoder
+
         # 1. Encode Control (U) -> Context
-        
+
         # Control Encoder
         if self.aug_control:
             n_ctrl = cfg.dataset.ocvar_dim
@@ -880,60 +1119,71 @@ class DySTGAT(nn.Module):
         # x comes in as [B*N, W]. Reshape to [B, N, W] before encoding.
         b = x.shape[0] // n_nodes
         x_nodes = x.view(b, n_nodes, -1)
-        x_nodes_conv = self.idcnn(x_nodes.view(b * n_nodes, 1, -1)).view(b, n_nodes, -1)
+
+        # IDCNN for edge construction only (paper requirement)
+        x_idcnn = self.idcnn(x_nodes.view(b * n_nodes, 1, -1)).view(b, n_nodes, -1)
+
+        # Node GRU takes RAW x (paper requirement)
         h_temp = self.node_encoder(
-            x_nodes_conv,
-            h0=context_expanded if (self.aug_control and context_expanded is not None) else None,
+            x_nodes,
+            h0=context_expanded if self.aug_control else None,
         )           # [B, N, Dim]
         h_temp = torch.nan_to_num(h_temp, nan=0.0, posinf=0.0, neginf=0.0)
         h_temp = h_temp.view(b * n_nodes, -1)         # flatten for GNN input
         
-        # 3. Learn Temporal Graph
-        # Input: [B*N, Dim]
-        # Output: edge_index [2, E], edge_attr [E]
-        # This `learn_graph` internally reshapes to [B, N, D] and calls FeatureGraph
-        adj_temp, attn_temp, _ = self.learn_graph(h_temp, batch, branch="temporal")
+        # 3. Learn Temporal Graph using TemporalFeatureGraph (paper-compliant)
+        # Use IDCNN output for edge construction
+        adj_temp, attn_temp, alpha_temp = self.temporal_feature_graph(x_idcnn, batch)
         attn_temp = torch.nan_to_num(attn_temp, nan=0.0, posinf=0.0, neginf=0.0)
-        attn_temp = attn_temp.view(-1, 1)  # [E, 1]
         
         # 4. Spectral Branch
         h_freq = None
         adj_freq, attn_freq = None, None
+        alpha_freq = None
         div_loss = torch.tensor(0.0, device=x.device)
         div_score = None
         if self.use_spectral_view:
             # Input x: [B*N, W]
             # Reshape to [B, N, W] for SpectralEncoder
-            # b = c.shape[0]  <-- THIS WAS DANGEROUS if c was reshaped above.
-            # Use batch calculation from nodes
             n = cfg.dataset.n_nodes
-            b = x.shape[0] // n
-            
-            x_reshaped = x.view(b, n, -1)
-            
-            h_freq_batch = self.spectral_encoder(x_reshaped) # [B, N, Dim]
-            h_freq_batch = torch.nan_to_num(h_freq_batch, nan=0.0, posinf=0.0, neginf=0.0)
-            h_freq = h_freq_batch.view(b*n, -1) # Flatten
-            
-            # Learn Spectral Graph
-            adj_freq, attn_freq, _ = self.learn_graph(h_freq, batch, branch="spectral")
-            attn_freq = torch.nan_to_num(attn_freq, nan=0.0, posinf=0.0, neginf=0.0)
-            attn_freq = attn_freq.view(-1, 1)  # [E, 1]
+            b_spectral = x.shape[0] // n
 
-            # Divergence between temporal and spectral attentions
+            x_reshaped = x.view(b_spectral, n, -1)
+
+            h_freq_batch = self.spectral_encoder(x_reshaped)  # [B, N, Dim]
+            h_freq_batch = torch.nan_to_num(h_freq_batch, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Add OC conditioning to spectral embeddings
+            if self.aug_control and context is not None:
+                # context: [B, temp_node_embed_dim] from control_encoder
+                oc_spectral = self.spectral_oc_proj(context)  # [B, freq_embed_dim]
+                oc_spectral = oc_spectral.unsqueeze(1).expand(-1, n, -1)  # [B, N, freq_embed_dim]
+                h_freq_batch = h_freq_batch + oc_spectral  # Additive conditioning
+
+            h_freq = h_freq_batch.view(b_spectral * n, -1)  # Flatten
+
+            # Use SpectralFeatureGraph (paper-compliant)
+            adj_freq, attn_freq, alpha_freq = self.spectral_feature_graph(h_freq, batch, n)
+            attn_freq = torch.nan_to_num(attn_freq, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Compute divergence (YOUR NOVEL CONTRIBUTION!)
+            # alpha_temp: [B, N, N, W] - temporal attention over time
+            # alpha_freq: [B, N, N] - spectral attention (no temporal dim)
+            # For divergence: average alpha_temp over time to match shape
             try:
-                div_loss, div_score = self._compute_view_divergence(
-                    adj_temp, attn_temp, adj_freq, attn_freq, batch
+                alpha_temp_avg = alpha_temp.mean(dim=-1)  # [B, N, N]
+                div_loss, div_score = self._compute_divergence_from_alpha(
+                    alpha_temp_avg, alpha_freq
                 )
             except Exception:
                 div_loss = torch.tensor(0.0, device=x.device)
                 div_score = None
             
-        # 5. GNN Layers
+        # 5. GNN Layers - WeightedGIN (edge weights as scalar multipliers)
         # Temporal GNN
         z_temp = h_temp
         for i, conv in enumerate(self.gnn_layers):
-            z_temp = conv(z_temp, adj_temp, attn_temp) # GINE/GATv2
+            z_temp = conv(z_temp, adj_temp, attn_temp)  # WeightedGIN: edge_weight, not edge_attr
             if self.do_gnn_norm:
                 z_temp = self._apply_norm(self.gnn_norms[i], z_temp, batch)
             z_temp = torch.nan_to_num(z_temp, nan=0.0, posinf=0.0, neginf=0.0)
@@ -943,8 +1193,9 @@ class DySTGAT(nn.Module):
         z_freq = None
         if self.use_spectral_view:
             z_freq = h_freq
+            attn_freq_flat = attn_freq.view(-1) if attn_freq is not None else None
             for i, conv in enumerate(self.gnn_layers_freq):
-                z_freq = conv(z_freq, adj_freq, attn_freq)
+                z_freq = conv(z_freq, adj_freq, attn_freq_flat)  # WeightedGIN
                 if self.do_gnn_norm:
                     z_freq = self._apply_norm(self.gnn_norms_freq[i], z_freq, batch)
                 z_freq = torch.nan_to_num(z_freq, nan=0.0, posinf=0.0, neginf=0.0)
@@ -952,11 +1203,12 @@ class DySTGAT(nn.Module):
 
         # 6. Fusion
         z_fused = z_temp
-        
+        gate_values = None  # For monitoring gated fusion
+
         if self.use_spectral_view:
             # Compute Divergence Loss (JS/KL between attn_temp and attn_freq)
             # attn are [E] weights. Structure might differ if KNN differs?
-            # If topk is same, edges might correspond? 
+            # If topk is same, edges might correspond?
             # No, KNN selects different neighbors.
             # Divergence requires comparable distributions.
             # Usually dense adjacency or intersection.
@@ -964,7 +1216,7 @@ class DySTGAT(nn.Module):
             # If KNN, it's harder.
             # Paper uses "dense attention matrix" for divergence?
             # Or just alignment?
-            
+
             # Fusion
             if self.fuse_mode == "concat":
                 z_cat = torch.cat([z_temp, z_freq], dim=-1)
@@ -975,6 +1227,7 @@ class DySTGAT(nn.Module):
                 z_cat = torch.cat([z_temp, z_freq], dim=-1)
                 g = self.gate(z_cat)
                 z_fused = g * z_temp + (1-g) * z_freq
+                gate_values = g  # Store for diagnostics
 
         # 7. Decode / Reconstruct
         # Reconstruct X: reshape back to [B, N, D] for decoder
@@ -987,14 +1240,21 @@ class DySTGAT(nn.Module):
         output_window = cfg.dataset.window_size
         if self.task == "prediction" and self.pred_horizon:
             output_window = self.pred_horizon
+
+        # Backward OC context for decoder initialization (paper requirement)
+        decoder_h0 = None
+        if self.aug_control and c_in is not None:
+            backward_ctx = self.backward_oc_encoder(c_in)
+            backward_ctx = self.backward_context_proj(backward_ctx)
+            decoder_h0 = backward_ctx.repeat_interleave(n_nodes, dim=0)
+
         recon = self.decoder.reconstruct(
             z_fused_nodes,
             output_window,
-            h0=context_expanded if (self.aug_control and context_expanded is not None) else None,
-            flip_output=self.flip_output,
+            h0=decoder_h0,
+            flip_output=False,  # We handle reversal manually
         )
-        # recon is [B*N, W] (ReconstructionModel now returns flattened)
-        # recon = recon.view(-1, cfg.dataset.window_size) # Redundant but okay
+        recon = torch.flip(recon.view(b * n_nodes, -1), dims=[1])  # Reverse output
         
         if return_graph:
             aux = {}
@@ -1004,6 +1264,11 @@ class DySTGAT(nn.Module):
                     aux["divergence_score"] = div_score
                 aux["adj_freq"] = adj_freq
                 aux["attn_freq"] = attn_freq
+                # Gate diagnostics for monitoring spectral branch contribution
+                if gate_values is not None:
+                    aux["gate_mean"] = gate_values.mean().item()
+                    aux["gate_std"] = gate_values.std().item()
+                    aux["z_freq_norm"] = z_freq.norm().item() if z_freq is not None else 0.0
             return recon, adj_temp, attn_temp, aux
             
         return recon
@@ -1108,6 +1373,29 @@ class DySTGAT(nn.Module):
 
         return per_graph.mean(), per_graph.detach()
 
+    def _compute_divergence_from_alpha(
+        self,
+        alpha_temp: torch.Tensor,
+        alpha_freq: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Compute divergence directly from alpha matrices (dense attention).
+        alpha_temp: [B, N, N] - temporal attention (averaged over time)
+        alpha_freq: [B, N, N] - spectral attention
+        Returns (loss_scalar, per_graph_scores).
+        """
+        if alpha_temp is None or alpha_freq is None:
+            device = alpha_temp.device if alpha_temp is not None else alpha_freq.device
+            return torch.tensor(0.0, device=device), None
+
+        divergence_type = (self.divergence_type or "js").lower()
+        if divergence_type == "kl":
+            per_graph = self._kl_divergence(alpha_temp, alpha_freq)
+        else:
+            per_graph = self._js_divergence(alpha_temp, alpha_freq)
+
+        return per_graph.mean(), per_graph.detach()
+
     def _topology_scores_per_graph(
         self,
         x_true: torch.Tensor,
@@ -1117,39 +1405,28 @@ class DySTGAT(nn.Module):
     ) -> torch.Tensor:
         """
         Compute topology-aware reconstruction error per graph in the batch.
+        Paper requirement: L1 error / degree (r_j = |x̂_j - x_j| / d_j)
         """
         x_true, x_recon = self._align_target_and_recon(x_true, x_recon)
+        n = cfg.dataset.n_nodes
+        b = x_true.shape[0] // n
         device = x_true.device
 
-        # Base per-node reconstruction error
-        node_err = ((x_true - x_recon) ** 2).mean(dim=-1)  # [B*N]
+        # L1 error (paper requirement)
+        node_err = (x_true - x_recon).abs().mean(dim=-1)  # [B*N]
 
-        n = cfg.dataset.n_nodes
-        if n <= 0:
-            return node_err.mean()
-
-        # Fallback: if no edges, just return mean node error per graph
-        if edge_index is None or edge_weight is None:
-            b = node_err.numel() // n
-            return node_err.view(b, n).mean(dim=1)
-
-        b = max(int(node_err.numel() // n), 1)
-
-        src = edge_index[0]
-        dst = edge_index[1]
-        weights = torch.nan_to_num(edge_weight.view(-1), nan=0.0, posinf=0.0, neginf=0.0).abs()
-
+        # Compute degree
         num_nodes = node_err.numel()
-        weighted_in = torch.zeros(num_nodes, device=device)
-        weighted_in.index_add_(0, dst, node_err[src] * weights)
+        degree = torch.zeros(num_nodes, device=device, dtype=node_err.dtype)
+        if edge_index is not None and edge_weight is not None:
+            src, dst = edge_index
+            weights = edge_weight.abs().to(device=device, dtype=node_err.dtype)
+            degree.index_add_(0, src, weights)
+            degree.index_add_(0, dst, weights)
 
-        degree = torch.zeros(num_nodes, device=device)
-        degree.index_add_(0, dst, weights)
-        degree.index_add_(0, src, weights)
-
-        mask = degree > 0
-        node_scores = torch.zeros_like(node_err)
-        node_scores[mask] = weighted_in[mask] / degree[mask]
+        # Own error / degree (paper: r_j = |x̂_j - x_j| / d_j)
+        eps = 1e-8
+        node_scores = node_err / (degree + eps)
 
         return node_scores.view(b, n).mean(dim=1)
 

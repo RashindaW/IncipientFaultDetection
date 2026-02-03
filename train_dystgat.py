@@ -267,6 +267,13 @@ def parse_args() -> argparse.Namespace:
         choices=["nccl", "gloo", "mpi"],
         help="Distributed backend to use when launched with torchrun.",
     )
+    parser.add_argument(
+        "--loss-type",
+        type=str,
+        choices=["l1", "l2"],
+        default="l1",
+        help="Loss function type: 'l1' (L1/MAE) or 'l2' (MSE). Paper uses L1.",
+    )
     args = parser.parse_args()
     if args.dataset_key is None:
         parser.error(
@@ -532,7 +539,7 @@ def train_epoch(
     distributed: bool = False,
     scaler: Optional[GradScaler] = None,
     amp_enabled: bool = False,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, float, Optional[dict]]:
     model.train()
     base_model = unwrap_model(model)
     task = getattr(cfg.dataset, "task", "reconstruction")
@@ -543,6 +550,11 @@ def train_epoch(
     running_anom = 0.0
     running_div = 0.0
     sample_count = 0
+    # Gate diagnostics for gated fusion mode
+    gate_mean_sum = 0.0
+    gate_std_sum = 0.0
+    z_freq_norm_sum = 0.0
+    gate_batch_count = 0
 
     for raw_batch in loader:
         optimizer.zero_grad(set_to_none=True)
@@ -594,6 +606,13 @@ def train_epoch(
         running_div += div_loss.detach().item() * batch_size
         sample_count += batch_size
 
+        # Track gate diagnostics for gated fusion mode
+        if use_graph and "gate_mean" in aux:
+            gate_mean_sum += aux["gate_mean"]
+            gate_std_sum += aux["gate_std"]
+            z_freq_norm_sum += aux["z_freq_norm"]
+            gate_batch_count += 1
+
     totals = torch.tensor(
         [running_total_loss, running_recon_loss, running_anom, running_div, sample_count],
         device=device,
@@ -604,11 +623,22 @@ def train_epoch(
 
     total_loss, total_recon, total_anom, total_div, total_samples = totals.tolist()
     denom = max(total_samples, 1.0)
+
+    # Compute gate diagnostics (only for gated fusion mode)
+    gate_diagnostics = None
+    if gate_batch_count > 0:
+        gate_diagnostics = {
+            "gate_mean": gate_mean_sum / gate_batch_count,
+            "gate_std": gate_std_sum / gate_batch_count,
+            "z_freq_norm": z_freq_norm_sum / gate_batch_count,
+        }
+
     return (
         float(total_loss / denom),
         float(total_recon / denom),
         float(total_anom / denom),
         float(total_div / denom),
+        gate_diagnostics,
     )
 
 
@@ -1147,7 +1177,11 @@ def main() -> None:
                     print(f"  Unexpected keys: {load_result.unexpected_keys}")
 
         base_model = unwrap_model(model)
-        criterion = torch.nn.MSELoss()
+        # Select loss function based on --loss-type (paper uses L1)
+        if args.loss_type == "l1":
+            criterion = torch.nn.L1Loss()
+        else:
+            criterion = torch.nn.MSELoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
         scaler = GradScaler("cuda") if args.use_amp and device.type == "cuda" else None
@@ -1210,7 +1244,7 @@ def main() -> None:
 
             for epoch in range(1, args.epochs + 1):
                 start_time = time.time()
-                train_total_loss, train_recon_loss, train_anom, train_div = train_epoch(
+                train_total_loss, train_recon_loss, train_anom, train_div, gate_diag = train_epoch(
                     model,
                     train_loader,
                     optimizer,
@@ -1232,15 +1266,46 @@ def main() -> None:
                 elapsed = time.time() - start_time
 
                 if is_main_process:
-                    print(
+                    log_msg = (
                         f"[Epoch {epoch:03d}] train_total={train_total_loss:.6f} "
                         f"train_recon={train_recon_loss:.6f} train_anom={train_anom:.6f} train_div={train_div:.6f} "
                         f"val_loss={val_loss:.6f} val_anom={val_score:.6f} val_div={val_div:.6f} "
                         f"time={elapsed:.1f}s"
                     )
+                    print(log_msg)
+                    # Gate diagnostics for monitoring spectral branch contribution (gated fusion only)
+                    if gate_diag is not None:
+                        gate_mean = gate_diag["gate_mean"]
+                        gate_std = gate_diag["gate_std"]
+                        z_freq_norm = gate_diag["z_freq_norm"]
+                        # Warn if gate is extreme (spectral branch may be underutilized)
+                        gate_warning = ""
+                        if gate_mean > 0.9:
+                            gate_warning = " [!] spectral underutilized"
+                        elif gate_mean < 0.1:
+                            gate_warning = " [!] temporal underutilized"
+                        print(
+                            f"  ↳ gate: mean={gate_mean:.3f} std={gate_std:.3f} "
+                            f"z_freq_norm={z_freq_norm:.2f}{gate_warning}"
+                        )
                     if checkpoint_manager is not None:
                         train_rmse = math.sqrt(train_recon_loss)
                         val_rmse = math.sqrt(val_loss)
+                        extra_state = {
+                            "train_mse": f"{train_recon_loss:.6f}",
+                            "train_rmse": f"{train_rmse:.6f}",
+                            "train_div": f"{train_div:.6f}",
+                            "train_anom": f"{train_anom:.6f}",
+                            "val_mse": f"{val_loss:.6f}",
+                            "val_rmse": f"{val_rmse:.6f}",
+                            "val_div": f"{val_div:.6f}",
+                            "val_anom": f"{val_score:.6f}",
+                        }
+                        # Include gate diagnostics in checkpoint (gated fusion only)
+                        if gate_diag is not None:
+                            extra_state["gate_mean"] = f"{gate_diag['gate_mean']:.3f}"
+                            extra_state["gate_std"] = f"{gate_diag['gate_std']:.3f}"
+                            extra_state["z_freq_norm"] = f"{gate_diag['z_freq_norm']:.2f}"
                         checkpoint_path = checkpoint_manager.save_epoch(
                             epoch=epoch,
                             model=base_model,
@@ -1248,16 +1313,7 @@ def main() -> None:
                             val_loss=val_loss,
                             val_anom=val_score,
                             elapsed_time=elapsed,
-                            extra_state={
-                                "train_mse": f"{train_recon_loss:.6f}",
-                                "train_rmse": f"{train_rmse:.6f}",
-                                "train_div": f"{train_div:.6f}",
-                                "train_anom": f"{train_anom:.6f}",
-                                "val_mse": f"{val_loss:.6f}",
-                                "val_rmse": f"{val_rmse:.6f}",
-                                "val_div": f"{val_div:.6f}",
-                                "val_anom": f"{val_score:.6f}",
-                            },
+                            extra_state=extra_state,
                         )
                         print(f"  ↳ checkpoint saved: {checkpoint_path.name}")
 
