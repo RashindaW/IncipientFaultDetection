@@ -1,8 +1,8 @@
 """
-PRONTO Dataset Adapter
+PRONTO Merged Dataset Adapter (15 Variables)
 
-Provides DataLoader factory for the PRONTO benchmark dataset,
-loading data from raw CSV files to ensure consistent column order.
+Provides DataLoader factory for the PRONTO benchmark dataset using
+preprocessed merged CSV files with 15 variables (4 conditioning + 11 measurement).
 """
 from __future__ import annotations
 
@@ -13,33 +13,41 @@ from torch.utils.data import ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 from typing import Dict, List, Tuple, Optional
 
-from dystgat.src.data.pronto_column_config import MEASUREMENT_VARS, CONTROL_VARS
-from dystgat.src.data.pronto_dataset import PRONTODataset, PRONTODatasetLegacy
-from dystgat.src.data.pronto_raw_loader import DATA_SPLITS
+from dystgat.src.data.pronto_merged_config import (
+    MEASUREMENT_VARS,
+    CONDITIONING_VARS,
+)
+from dystgat.src.data.pronto_merged_dataset import PRONTOMergedDataset
 from .registry import DatasetAdapter, register_adapter
 
 
 def _resolve_split_files(split_key: str) -> List[str]:
     """
-    Resolve split key to list of source identifiers.
+    Resolve split key to list of source identifiers for merged dataset.
 
-    This is used by reconstruction/plotting scripts for backward compatibility.
-    Returns split names that can be used with the new CSV-based loader.
+    Returns:
+        List of fault type names
     """
     if split_key == "train":
         return ["train"]
     elif split_key == "val":
         return ["val"]
     elif split_key == "test":
-        return ["test_baseline", "test_slugging", "test_blockage", "test_leakage", "test_diverted"]
-    elif split_key == "slug" or split_key == "slugging":
-        return ["test_slugging"]
+        return ["normal", "slugging", "air_blockage", "air_leakage", "diverted_flow"]
+    elif split_key == "test_normal":
+        return ["test_normal"]
+    elif split_key == "normal":
+        return ["normal"]
+    elif split_key == "slugging" or split_key == "slug":
+        return ["slugging"]
+    elif split_key == "air_blockage" or split_key == "blockage":
+        return ["air_blockage"]
+    elif split_key == "air_leakage" or split_key == "leakage":
+        return ["air_leakage"]
+    elif split_key == "diverted_flow" or split_key == "diverted":
+        return ["diverted_flow"]
     elif split_key == "faults":
-        return ["test_blockage", "test_leakage", "test_diverted"]
-    elif split_key == "baseline":
-        return ["test_baseline"]
-    elif split_key in DATA_SPLITS:
-        return [split_key]
+        return ["air_blockage", "air_leakage", "diverted_flow"]
     else:
         return []
 
@@ -60,14 +68,18 @@ def _create_dataloaders(
     feature_option: str | None = None,
     fault_keys: List[str] | None = None,
     pred_horizon: int | None = None,
-    split_mode: str = 'window_shuffle',
-    split_ratios: Tuple[float, float, float] = (0.7, 0.15, 0.15),
+    split_mode: str = 'segment_shuffle',
+    n_segments: int = 10,
+    split_ratios: Tuple[float, float, float] = (0.7, 0.2, 0.1),
     random_seed: int = 42,
+    train_segments: List[int] | None = None,
+    val_segments: List[int] | None = None,
+    test_segments: List[int] | None = None,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     """
-    Create train, validation, and test DataLoaders for PRONTO dataset.
+    Create train, validation, and test DataLoaders for PRONTO merged dataset.
 
-    Uses raw CSV loading to ensure consistent column order matching DyEdgeGAT.
+    Uses preprocessed merged CSV files with 15 variables.
 
     Args:
         window_size: Number of timesteps per window
@@ -75,25 +87,25 @@ def _create_dataloaders(
         train_stride: Stride between windows for training
         val_stride: Stride between windows for validation
         test_stride: Stride between windows for testing (defaults to val_stride)
-        data_dir: Path to PRONTO benchmark data directory
+        data_dir: Path to 15var_merged directory
         num_workers: Number of workers for DataLoader
         distributed: Whether to use distributed training
         rank: Process rank for distributed training
         world_size: Number of processes for distributed training
         baseline_from: Unused (kept for backward compatibility)
-        severity_range: Unused with raw CSV loading
+        severity_range: Unused with merged dataset
         feature_option: Unused (kept for backward compatibility)
         fault_keys: Unused (kept for backward compatibility)
         pred_horizon: Number of future timesteps for prediction
         split_mode: How to split data:
-            - 'temporal': Traditional temporal split
-            - 'window_shuffle': Two-stage split with temporal test hold-out (default)
-              Stage 1: Last 15% held out temporally for test_baseline
-              Stage 2: First 85% windowed, shuffled, split into train/val
-        split_ratios: Ratios for train/val/test_baseline when using window_shuffle
-                     (default: 70% train, 15% val, 15% test_baseline)
-                     Note: train+val windows are shuffled; test_baseline is temporal
-        random_seed: Random seed for window shuffling (for reproducibility)
+            - 'temporal': Traditional 70/30 temporal split
+            - 'segment_shuffle': Shuffle segments to balance operating conditions (default)
+        n_segments: Number of segments for segment_shuffle mode (default: 10)
+        split_ratios: Ratios for train/val/test when using segment_shuffle (default: 0.7/0.2/0.1)
+        random_seed: Random seed for reproducibility
+        train_segments: Explicit list of segment indices for training (overrides split_ratios)
+        val_segments: Explicit list of segment indices for validation (overrides split_ratios)
+        test_segments: Explicit list of segment indices for testing (overrides split_ratios)
 
     Returns:
         Tuple of (train_loader, val_loader, test_loaders_dict)
@@ -101,29 +113,31 @@ def _create_dataloaders(
     if test_stride is None:
         test_stride = val_stride
 
-    # Data directory should point to pronto_benchmark folder
-    # which contains the scenario folders (C0, C1, C2, C3)
+    # Data directory should point to 15var_merged folder
     if not os.path.exists(data_dir):
-        raise FileNotFoundError(f"PRONTO data directory not found: {data_dir}")
+        raise FileNotFoundError(f"PRONTO merged data directory not found: {data_dir}")
 
-    print("=" * 70)
-    print(f"CREATING PRONTO DATALOADERS (mode={split_mode})")
-    print("=" * 70)
-
-    # Common kwargs for window_shuffle mode
+    # Common kwargs for split mode
     shuffle_kwargs = {
         'split_mode': split_mode,
+        'n_segments': n_segments,
         'split_ratios': split_ratios,
         'random_seed': random_seed,
+        'train_segments': train_segments,
+        'val_segments': val_segments,
+        'test_segments': test_segments,
     }
 
-    # 1. Training Dataset
-    if split_mode == 'window_shuffle':
-        print(f"[1/3] Loading TRAINING dataset (window_shuffle: {split_ratios[0]*100:.0f}% of all normal)...")
-    else:
-        print("[1/3] Loading TRAINING dataset (temporal split)...")
+    print("=" * 70)
+    print(f"CREATING PRONTO MERGED DATALOADERS (15 Variables, mode={split_mode})")
+    print("=" * 70)
 
-    train_dataset = PRONTODataset(
+    # 1. Training Dataset (Normal only - no fault data in training)
+    if split_mode == 'segment_shuffle':
+        print(f"[1/3] Loading TRAINING dataset (segment_shuffle: {split_ratios[0]*100:.0f}% of normal)...")
+    else:
+        print("[1/3] Loading TRAINING dataset (temporal: 70% of normal)...")
+    train_dataset = PRONTOMergedDataset(
         data_dir=data_dir,
         split='train',
         window_size=window_size,
@@ -132,15 +146,14 @@ def _create_dataloaders(
         pred_horizon=pred_horizon or 0,
         **shuffle_kwargs,
     )
-    norm_stats = train_dataset.get_normalization_stats()
+    norm_stats = train_dataset.compute_normalization_stats()
 
-    # 2. Validation Dataset
-    if split_mode == 'window_shuffle':
-        print(f"[2/3] Loading VALIDATION dataset (window_shuffle: {split_ratios[1]*100:.0f}% of all normal)...")
+    # 2. Validation Dataset (Normal only)
+    if split_mode == 'segment_shuffle':
+        print(f"[2/3] Loading VALIDATION dataset (segment_shuffle: {split_ratios[1]*100:.0f}% of normal)...")
     else:
-        print("[2/3] Loading VALIDATION dataset (temporal split)...")
-
-    val_dataset = PRONTODataset(
+        print("[2/3] Loading VALIDATION dataset (temporal: 30% of normal)...")
+    val_dataset = PRONTOMergedDataset(
         data_dir=data_dir,
         split='val',
         window_size=window_size,
@@ -156,80 +169,90 @@ def _create_dataloaders(
     print("[3/3] Loading TEST datasets...")
     test_datasets = {}
 
-    # Baseline - uses window_shuffle mode if enabled (with temporal hold-out)
-    if split_mode == 'window_shuffle':
-        print(f"    test_baseline: temporal hold-out (last {split_ratios[2]*100:.0f}% of data)")
-    test_datasets["baseline"] = PRONTODataset(
+    # Test Normal - uses segment shuffle mode if enabled (for baseline comparison)
+    if split_mode == 'segment_shuffle':
+        print(f"    test_normal: segment_shuffle (remaining {split_ratios[2]*100:.0f}% of normal)")
+        test_datasets["normal"] = PRONTOMergedDataset(
+            data_dir=data_dir,
+            split='test_normal',
+            window_size=window_size,
+            stride=test_stride,
+            normalize=True,
+            normalization_stats=norm_stats,
+            require_stats=True,
+            pred_horizon=pred_horizon or 0,
+            **shuffle_kwargs,
+        )
+    else:
+        test_datasets["normal"] = PRONTOMergedDataset(
+            data_dir=data_dir,
+            split='normal',
+            window_size=window_size,
+            stride=test_stride,
+            normalize=True,
+            normalization_stats=norm_stats,
+            require_stats=True,
+            pred_horizon=pred_horizon or 0,
+            split_mode='temporal',  # Fault sets always use temporal
+        )
+
+    # Slugging - full file, temporal mode
+    test_datasets["slugging"] = PRONTOMergedDataset(
         data_dir=data_dir,
-        split='test_baseline',
+        split='slugging',
         window_size=window_size,
         stride=test_stride,
         normalize=True,
         normalization_stats=norm_stats,
         require_stats=True,
         pred_horizon=pred_horizon or 0,
-        **shuffle_kwargs,
+        split_mode='temporal',  # Fault sets always use temporal
     )
 
-    # Anomaly test sets always use temporal mode (they're separate fault categories)
-    # Slugging (Novel OC from Test9)
-    test_datasets["slugging"] = PRONTODataset(
+    # Air Blockage - full file, temporal mode
+    test_datasets["air_blockage"] = PRONTOMergedDataset(
         data_dir=data_dir,
-        split='test_slugging',
+        split='air_blockage',
         window_size=window_size,
         stride=test_stride,
         normalize=True,
         normalization_stats=norm_stats,
         require_stats=True,
         pred_horizon=pred_horizon or 0,
-        split_mode='temporal',  # Anomaly sets always use temporal
+        split_mode='temporal',  # Fault sets always use temporal
     )
 
-    # Blockage Faults (Test2 + Test3)
-    test_datasets["blockage"] = PRONTODataset(
+    # Air Leakage - full file, temporal mode
+    test_datasets["air_leakage"] = PRONTOMergedDataset(
         data_dir=data_dir,
-        split='test_blockage',
+        split='air_leakage',
         window_size=window_size,
         stride=test_stride,
         normalize=True,
         normalization_stats=norm_stats,
         require_stats=True,
         pred_horizon=pred_horizon or 0,
-        split_mode='temporal',  # Anomaly sets always use temporal
+        split_mode='temporal',  # Fault sets always use temporal
     )
 
-    # Leakage Faults (Test4 + Test5 + Test6)
-    test_datasets["leakage"] = PRONTODataset(
+    # Diverted Flow - full file, temporal mode
+    test_datasets["diverted_flow"] = PRONTOMergedDataset(
         data_dir=data_dir,
-        split='test_leakage',
+        split='diverted_flow',
         window_size=window_size,
         stride=test_stride,
         normalize=True,
         normalization_stats=norm_stats,
         require_stats=True,
         pred_horizon=pred_horizon or 0,
-        split_mode='temporal',  # Anomaly sets always use temporal
+        split_mode='temporal',  # Fault sets always use temporal
     )
 
-    # Diverted Flow Faults (Test7 + Test8)
-    test_datasets["diverted"] = PRONTODataset(
-        data_dir=data_dir,
-        split='test_diverted',
-        window_size=window_size,
-        stride=test_stride,
-        normalize=True,
-        normalization_stats=norm_stats,
-        require_stats=True,
-        pred_horizon=pred_horizon or 0,
-        split_mode='temporal',  # Anomaly sets always use temporal
-    )
-
-    # Combined faults for convenience (blockage + leakage + diverted)
-    # Uses ConcatDataset to create a single dataset from individual fault datasets
+    # Combined faults for convenience (air_blockage + air_leakage + diverted_flow)
     test_datasets["faults_all"] = ConcatDataset([
-        test_datasets["blockage"],
-        test_datasets["leakage"],
-        test_datasets["diverted"],
+        test_datasets["air_blockage"],
+        test_datasets["air_leakage"],
+        test_datasets["diverted_flow"],
     ])
     print(f"    faults_all samples: {len(test_datasets['faults_all'])}")
 
@@ -296,15 +319,15 @@ def _create_dataloaders(
 
 register_adapter(
     DatasetAdapter(
-        key="pronto",
-        description="PRONTO Benchmark Dataset (Consolidated CSV loading).",
-        default_data_dir=os.path.join("data", "Pronto_data"),
+        key="pronto_merged",
+        description="PRONTO Benchmark Dataset (15 Variables - Merged/Preprocessed CSV).",
+        default_data_dir=os.path.join("data", "pronto", "pronto_benchmark", "Pre-processed data", "Process data", "15var_merged"),
         measurement_vars=MEASUREMENT_VARS,
-        dataset_cls=PRONTODataset,
-        control_names_fn=lambda _, __=None: CONTROL_VARS.copy(),
+        dataset_cls=PRONTOMergedDataset,
+        control_names_fn=lambda _, __=None: CONDITIONING_VARS.copy(),
         dataloader_factory=_create_dataloaders,
         resolve_split_files_fn=_resolve_split_files,
-        list_fault_keys_fn=lambda: ["blockage", "leakage", "diverted", "slugging"],
+        list_fault_keys_fn=lambda: ["air_blockage", "air_leakage", "diverted_flow", "slugging", "normal"],
         supports_training=True,
         supports_testing=True,
         supports_plotting=True,

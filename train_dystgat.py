@@ -274,6 +274,69 @@ def parse_args() -> argparse.Namespace:
         default="l1",
         help="Loss function type: 'l1' (L1/MAE) or 'l2' (MSE). Paper uses L1.",
     )
+    # Split mode arguments (primarily for pronto_merged dataset)
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        choices=["temporal", "segment_shuffle"],
+        default="segment_shuffle",
+        help="Data split strategy: 'temporal' for sequential splits, "
+             "'segment_shuffle' (default) shuffles segments to balance operating conditions.",
+    )
+    parser.add_argument(
+        "--n-segments",
+        type=int,
+        default=10,
+        help="Number of segments for segment_shuffle mode (default: 10).",
+    )
+    parser.add_argument(
+        "--split-ratios",
+        type=str,
+        default="0.7,0.2,0.1",
+        help="Train/val/test ratios as comma-separated values (default: '0.7,0.2,0.1').",
+    )
+    parser.add_argument(
+        "--data-seed",
+        type=int,
+        default=42,
+        help="Random seed for data splitting (default: 42). Separate from --seed for reproducibility.",
+    )
+    parser.add_argument(
+        "--train-segments",
+        type=str,
+        default=None,
+        help="Explicit segment indices for training (e.g., '0,1,2,5,7,8,9'). Overrides --split-ratios.",
+    )
+    parser.add_argument(
+        "--val-segments",
+        type=str,
+        default=None,
+        help="Explicit segment indices for validation (e.g., '3,6'). Overrides --split-ratios.",
+    )
+    parser.add_argument(
+        "--test-segments",
+        type=str,
+        default=None,
+        help="Explicit segment indices for testing (e.g., '4'). Overrides --split-ratios.",
+    )
+    # Early stopping arguments
+    parser.add_argument(
+        "--early-stopping",
+        action="store_true",
+        help="Enable early stopping based on validation loss.",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=20,
+        help="Number of epochs with no improvement before stopping (default: 20).",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum improvement in validation loss to reset patience (default: 1e-4).",
+    )
     args = parser.parse_args()
     if args.dataset_key is None:
         parser.error(
@@ -1209,6 +1272,28 @@ def main() -> None:
                     "Expected 'min,max' (e.g., '10,20')"
                 )
 
+        # Parse split ratios if provided
+        split_ratios = tuple(float(x) for x in args.split_ratios.split(','))
+        if len(split_ratios) != 3 or abs(sum(split_ratios) - 1.0) > 0.01:
+            raise ValueError(
+                f"Invalid --split-ratios: '{args.split_ratios}'. "
+                "Expected 3 values that sum to 1.0 (e.g., '0.7,0.2,0.1')"
+            )
+
+        # Parse explicit segment assignments if provided
+        train_segments = None
+        val_segments = None
+        test_segments = None
+        if args.train_segments and args.val_segments and args.test_segments:
+            train_segments = [int(x) for x in args.train_segments.split(',')]
+            val_segments = [int(x) for x in args.val_segments.split(',')]
+            test_segments = [int(x) for x in args.test_segments.split(',')]
+            if is_main_process:
+                print(f"Using explicit segment assignment:")
+                print(f"  Train: {train_segments}")
+                print(f"  Val: {val_segments}")
+                print(f"  Test: {test_segments}")
+
         train_loader, val_loader, test_loaders = adapter.create_dataloaders(
             window_size=cfg.dataset.window_size,
             batch_size=args.batch_size,
@@ -1225,12 +1310,24 @@ def main() -> None:
             feature_option=feature_option,
             fault_keys=ashrae_faults,
             pred_horizon=args.pred_horizon,
+            # Split mode parameters (used by pronto_merged dataset)
+            split_mode=args.split_mode,
+            n_segments=args.n_segments,
+            split_ratios=split_ratios,
+            random_seed=args.data_seed,
+            train_segments=train_segments,
+            val_segments=val_segments,
+            test_segments=test_segments,
         )
 
         best_val_loss = float("inf")
         best_val_anom = float("inf")
         best_state = None
         checkpoint_manager = None
+
+        # Early stopping state
+        patience_counter = 0
+        early_stop_triggered = False
 
         if not args.eval_only:
             checkpoint_manager = EpochCheckpointManager(
@@ -1328,10 +1425,22 @@ def main() -> None:
                     best_val_anom = val_score
                     best_val_loss = val_loss
                     best_state = {k: v.cpu().clone() for k, v in base_model.state_dict().items()}
+                    patience_counter = 0  # Reset early stopping counter
                     if is_main_process:
                         print(
                             f"  ↳ new best model (val_anom={best_val_anom:.6f}, val_loss={best_val_loss:.6f})"
                         )
+                else:
+                    # Early stopping check
+                    if args.early_stopping:
+                        patience_counter += 1
+                        if is_main_process and patience_counter > 0:
+                            print(f"  ↳ no improvement for {patience_counter}/{args.patience} epochs")
+                        if patience_counter >= args.patience:
+                            if is_main_process:
+                                print(f"\n⏹ Early stopping triggered at epoch {epoch} (no improvement for {args.patience} epochs)")
+                            early_stop_triggered = True
+                            break
 
             if best_state is not None:
                 base_model.load_state_dict(best_state)

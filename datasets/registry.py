@@ -104,6 +104,7 @@ class DatasetAdapter:
         feature_option: Optional[str] = None,
         fault_keys: Optional[List[str]] = None,
         pred_horizon: Optional[int] = None,
+        **kwargs,
     ):
         self.ensure("training")
         if self.dataloader_factory is None:
@@ -124,6 +125,7 @@ class DatasetAdapter:
             feature_option,
             fault_keys,
             pred_horizon,
+            **kwargs,
         )
 
     def resolve_split_files(self, split_key: str) -> List[str]:

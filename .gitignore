@@ -89,3 +89,8 @@ build/
 dist/
 *.egg-info/
 *.egg
+
+# Text and LaTeX files
+*.txt
+!requirements.txt
+*.tex
