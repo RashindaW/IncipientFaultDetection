@@ -1170,10 +1170,31 @@ class DySTGAT(nn.Module):
             # alpha_temp: [B, N, N, W] - temporal attention over time
             # alpha_freq: [B, N, N] - spectral attention (no temporal dim)
             # For divergence: average alpha_temp over time to match shape
+            # IMPORTANT: align with post-symmetrized GNN graph (S6 fix)
             try:
                 alpha_temp_avg = alpha_temp.mean(dim=-1)  # [B, N, N]
+
+                # Apply same symmetrization as _dense_to_sparse
+                if self.temporal_feature_graph.learn_sys:
+                    alpha_temp_avg = (alpha_temp_avg + alpha_temp_avg.transpose(-1, -2)) / 2
+                if self.spectral_feature_graph.learn_sys:
+                    alpha_freq_sym = (alpha_freq + alpha_freq.transpose(-1, -2)) / 2
+                else:
+                    alpha_freq_sym = alpha_freq
+
+                # Remove self-loops (matching _dense_to_sparse behavior)
+                diag_mask = torch.eye(alpha_temp_avg.size(-1), device=alpha_temp_avg.device, dtype=torch.bool)
+                alpha_temp_avg = alpha_temp_avg.masked_fill(diag_mask.unsqueeze(0), 0.0)
+                alpha_freq_sym = alpha_freq_sym.masked_fill(diag_mask.unsqueeze(0), 0.0)
+
+                # Safe row renormalization (zero rows stay zero)
+                row_sum_t = alpha_temp_avg.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                alpha_temp_avg = alpha_temp_avg / row_sum_t
+                row_sum_f = alpha_freq_sym.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                alpha_freq_sym = alpha_freq_sym / row_sum_f
+
                 div_loss, div_score = self._compute_divergence_from_alpha(
-                    alpha_temp_avg, alpha_freq
+                    alpha_temp_avg, alpha_freq_sym
                 )
             except Exception:
                 div_loss = torch.tensor(0.0, device=x.device)
