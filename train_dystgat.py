@@ -163,6 +163,8 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Weight for spectral/temporal divergence loss during training.",
     )
+    parser.add_argument("--div-fusion-beta", type=float, default=0.0,
+        help="Weight for divergence score in fused anomaly score (0=disabled).")
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Optimizer learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-3, help="Weight decay (L2 regularization)")
     parser.add_argument(
@@ -880,6 +882,7 @@ def evaluate_tests_and_plot(
     *,
     distributed: bool = False,
     amp_enabled: bool = False,
+    div_fusion_beta: float = 0.0,
 ) -> Dict[str, Dict[str, float]]:
     metrics: Dict[str, Dict[str, float]] = {}
     os.makedirs(output_dir, exist_ok=True)
@@ -893,6 +896,8 @@ def evaluate_tests_and_plot(
     # Per paper (p.11): threshold should be based on 95th percentile of normal VALIDATION set
     val_baseline_scores = None  # For threshold computation (no leakage)
     test_baseline_scores = None  # For AUC computation (test normal vs test fault)
+    val_baseline_div = None  # Divergence scores for validation baseline
+    test_baseline_div = None  # Divergence scores for test baseline
 
     # Collect per-sample metrics for each test loader
     for name, loader in loaders.items():
@@ -919,14 +924,18 @@ def evaluate_tests_and_plot(
                     # Validation baseline - used for threshold computation
                     if val_baseline_scores is None:
                         val_baseline_scores = anom_arr
+                        val_baseline_div = div_arr if div_arr is not None else np.zeros_like(anom_arr)
                     else:
                         val_baseline_scores = np.concatenate([val_baseline_scores, anom_arr])
+                        val_baseline_div = np.concatenate([val_baseline_div, div_arr if div_arr is not None else np.zeros_like(anom_arr)])
                 else:
                     # Test baseline - used for AUC computation
                     if test_baseline_scores is None:
                         test_baseline_scores = anom_arr
+                        test_baseline_div = div_arr if div_arr is not None else np.zeros_like(anom_arr)
                     else:
                         test_baseline_scores = np.concatenate([test_baseline_scores, anom_arr])
+                        test_baseline_div = np.concatenate([test_baseline_div, div_arr if div_arr is not None else np.zeros_like(anom_arr)])
 
     # Save raw scores
     if results_anom:
@@ -1011,10 +1020,19 @@ def evaluate_tests_and_plot(
     if val_baseline_scores is not None:
         # Use test baseline for AUC if available, otherwise fall back to val baseline
         auc_baseline_scores = test_baseline_scores if test_baseline_scores is not None else val_baseline_scores
+        auc_baseline_div = test_baseline_div if test_baseline_div is not None else val_baseline_div
         detailed_metrics_path = os.path.join(output_dir, "detailed_test_metrics.csv")
         print(f"Calculating AUC/F1 metrics...")
         print(f"  Threshold computed from VALIDATION baseline (N={len(val_baseline_scores)}) - no leakage")
         print(f"  AUC computed using TEST baseline (N={len(auc_baseline_scores)})")
+        if div_fusion_beta > 0:
+            print(f"  Divergence fusion enabled (beta={div_fusion_beta})")
+
+        # Z-score statistics from validation baseline (no leakage)
+        anom_mu = val_baseline_scores.mean()
+        anom_sigma = val_baseline_scores.std() + 1e-8
+        div_mu = val_baseline_div.mean() if val_baseline_div is not None else 0.0
+        div_sigma = (val_baseline_div.std() + 1e-8) if val_baseline_div is not None else 1.0
 
         # Score distribution debug output
         print(f"\n=== Score Distribution Debug ===")
@@ -1025,11 +1043,12 @@ def evaluate_tests_and_plot(
                 print(f"{name}: min={np.min(scores):.4f}, max={np.max(scores):.4f}, "
                       f"mean={np.mean(scores):.4f}, p5={np.percentile(scores, 5):.4f}")
         print(f"================================\n")
-        
+
         with open(detailed_metrics_path, 'w', newline='') as csvfile:
             fieldnames = [
                 'test_set',
                 'auc_roc',
+                'fused_auc',         # AUC with divergence fusion (0 if beta=0)
                 'precision',
                 'recall',
                 'f1_score',          # F1 at fixed threshold (95th percentile)
@@ -1046,7 +1065,7 @@ def evaluate_tests_and_plot(
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            
+
             for name, scores in results_anom.items():
                 # Skip if it IS the baseline
                 if "baseline" in name.lower() or "fault_free" in name.lower():
@@ -1056,6 +1075,25 @@ def evaluate_tests_and_plot(
                 # Use test baseline (or fallback) = 0, This Fault = 1
                 y_true = np.concatenate([np.zeros(len(auc_baseline_scores)), np.ones(len(scores))])
                 y_scores = np.concatenate([auc_baseline_scores, scores])
+
+                # Fused scores: z-score normalize anom + beta * z-score normalize div
+                fused_auc = 0.0
+                if div_fusion_beta > 0 and name in results_div and auc_baseline_div is not None:
+                    div_scores = results_div[name]
+                    # Z-normalize anomaly scores
+                    anom_fault_z = (scores - anom_mu) / anom_sigma
+                    anom_base_z = (auc_baseline_scores - anom_mu) / anom_sigma
+                    # Z-normalize divergence scores
+                    div_fault_z = (div_scores - div_mu) / div_sigma
+                    div_base_z = (auc_baseline_div - div_mu) / div_sigma
+                    # Fuse
+                    fused_fault = anom_fault_z + div_fusion_beta * div_fault_z
+                    fused_baseline = anom_base_z + div_fusion_beta * div_base_z
+                    y_scores_fused = np.concatenate([fused_baseline, fused_fault])
+                    try:
+                        fused_auc = roc_auc_score(y_true, y_scores_fused)
+                    except ValueError:
+                        fused_auc = 0.0
 
                 try:
                     auc = roc_auc_score(y_true, y_scores)
@@ -1109,6 +1147,7 @@ def evaluate_tests_and_plot(
                 row = {
                     'test_set': name,
                     'auc_roc': f"{auc:.4f}",
+                    'fused_auc': f"{fused_auc:.4f}",
                     'precision': f"{prec:.4f}",
                     'recall': f"{rec:.4f}",
                     'f1_score': f"{f1:.4f}",
@@ -1126,6 +1165,7 @@ def evaluate_tests_and_plot(
                 
                 # Update the returned metrics dict for printing
                 metrics[name]['auc'] = auc
+                metrics[name]['fused_auc'] = fused_auc
                 metrics[name]['f1'] = f1
                 metrics[name]['best_f1'] = best_f1
                 metrics[name]['ambiguity'] = ambiguity
@@ -1504,7 +1544,10 @@ def main() -> None:
 
             eval_loaders = {"baseline_val": val_loader}
             for name, loader in test_loaders.items():
-                key = "baseline_test" if name == "baseline" else name
+                if name in ("baseline", "normal"):
+                    key = "baseline_test"
+                else:
+                    key = name
                 eval_loaders[key] = loader
 
             test_scores = evaluate_tests_and_plot(
@@ -1515,16 +1558,18 @@ def main() -> None:
                 output_dir=plot_dir,
                 distributed=distributed,
                 amp_enabled=amp_enabled,
+                div_fusion_beta=args.div_fusion_beta,
             )
 
             for name, metrics in test_scores.items():
                 auc_str = f" auc={metrics['auc']:.4f}" if 'auc' in metrics else ""
+                fused_str = f" fused_auc={metrics['fused_auc']:.4f}" if metrics.get('fused_auc', 0) > 0 else ""
                 f1_str = f" f1={metrics['f1']:.4f}" if 'f1' in metrics else ""
                 div_str = f" div={metrics['divergence']:.6f}" if 'divergence' in metrics else ""
                 tea_str = f" tea_auc={metrics['tea_auc']:.4f}({metrics['tea_auc_delta']:+.4f})" if 'tea_auc' in metrics else ""
                 print(
                     f"  {name:30s}: recon_loss={metrics['recon_loss']:.6f} "
-                    f"anomaly_score={metrics['anomaly_score']:.6f}{div_str}{auc_str}{f1_str}{tea_str}"
+                    f"anomaly_score={metrics['anomaly_score']:.6f}{div_str}{auc_str}{fused_str}{f1_str}{tea_str}"
                 )
 
             if args.eval_only:
