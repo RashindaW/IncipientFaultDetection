@@ -606,7 +606,7 @@ def train_epoch(
     model.train()
     base_model = unwrap_model(model)
     task = getattr(cfg.dataset, "task", "reconstruction")
-    use_graph = getattr(cfg, "anomaly_weight", 0.0) > 0.0
+    use_graph = getattr(cfg, "anomaly_weight", 0.0) > 0.0 or getattr(cfg, "lambda_div", 0.0) > 0.0
     div_weight = getattr(cfg, "lambda_div", 0.0)
     running_total_loss = 0.0
     running_recon_loss = 0.0
@@ -642,7 +642,7 @@ def train_epoch(
             recon_loss = criterion(recon, target)
             anom_score = torch.tensor(0.0, device=device)
             div_loss = aux.get("divergence_loss", torch.tensor(0.0, device=device))
-            if use_graph:
+            if use_graph and cfg.anomaly_weight > 0:
                 anom_score = base_model.compute_topology_aware_anomaly_score(
                     target, recon, edge_index, edge_attr
                 )
