@@ -344,6 +344,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-scheduler", type=str, default="cosine",
         choices=["none", "cosine", "plateau"],
         help="Learning rate scheduler type.")
+    parser.add_argument("--topology-mode", type=str, default="neighbor_propagation",
+        choices=["own_error_degree", "neighbor_propagation", "plain_error"],
+        help="Topology scoring formula.")
     args = parser.parse_args()
     if args.dataset_key is None:
         parser.error(
@@ -475,6 +478,7 @@ def init_model(
     share_gnn_weights = bool(getattr(model_args, "share_gnn_weights", False)) if model_args is not None else False
     fuse_mode = getattr(model_args, "fuse_mode", "concat") if model_args is not None else "concat"
     divergence_type = getattr(model_args, "divergence_type", "js") if model_args is not None else "js"
+    topology_mode = getattr(model_args, "topology_mode", "neighbor_propagation") if model_args is not None else "neighbor_propagation"
 
     model = DySTGAT(
         feat_input_node=1,
@@ -520,6 +524,7 @@ def init_model(
         share_gnn_weights=share_gnn_weights,
         fuse_mode=fuse_mode,
         divergence_type=divergence_type,
+        topology_mode=topology_mode,
         flip_output=(task == "reconstruction"),
         task=task,
         pred_horizon=pred_horizon,

@@ -846,6 +846,7 @@ class DySTGAT(nn.Module):
         share_gnn_weights=False,
         fuse_mode="concat",  # concat | sum | gated
         divergence_type="js",  # js | kl
+        topology_mode="neighbor_propagation",  # own_error_degree | neighbor_propagation | plain_error
         task="reconstruction",  # reconstruction | prediction
         pred_horizon=0,
     ):
@@ -859,6 +860,7 @@ class DySTGAT(nn.Module):
         self.share_gnn_weights = share_gnn_weights
         self.fuse_mode = fuse_mode
         self.divergence_type = divergence_type
+        self.topology_mode = topology_mode
         self.task = task
         self.pred_horizon = pred_horizon
         self.div_eps = 1e-8
@@ -1425,18 +1427,31 @@ class DySTGAT(nn.Module):
         edge_weight: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute topology-aware reconstruction error per graph in the batch.
-        Paper requirement: L1 error / degree (r_j = |x̂_j - x_j| / d_j)
+        Route to the appropriate topology scoring method based on self.topology_mode.
         """
+        mode = getattr(self, 'topology_mode', 'own_error_degree')
+        if mode == 'neighbor_propagation':
+            return self._topology_scores_neighbor_propagation(x_true, x_recon, edge_index, edge_weight)
+        elif mode == 'plain_error':
+            return self._topology_scores_plain_error(x_true, x_recon)
+        else:
+            return self._topology_scores_own_error_degree(x_true, x_recon, edge_index, edge_weight)
+
+    def _topology_scores_own_error_degree(
+        self,
+        x_true: torch.Tensor,
+        x_recon: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """Original: own error / degree (r_j = |x̂_j - x_j| / d_j)"""
         x_true, x_recon = self._align_target_and_recon(x_true, x_recon)
         n = cfg.dataset.n_nodes
         b = x_true.shape[0] // n
         device = x_true.device
 
-        # L1 error (paper requirement)
         node_err = (x_true - x_recon).abs().mean(dim=-1)  # [B*N]
 
-        # Compute degree
         num_nodes = node_err.numel()
         degree = torch.zeros(num_nodes, device=device, dtype=node_err.dtype)
         if edge_index is not None and edge_weight is not None:
@@ -1445,11 +1460,46 @@ class DySTGAT(nn.Module):
             degree.index_add_(0, src, weights)
             degree.index_add_(0, dst, weights)
 
-        # Own error / degree (paper: r_j = |x̂_j - x_j| / d_j)
         eps = 1e-8
         node_scores = node_err / (degree + eps)
-
         return node_scores.view(b, n).mean(dim=1)
+
+    def _topology_scores_neighbor_propagation(
+        self,
+        x_true: torch.Tensor,
+        x_recon: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """Neighbor-error propagation: weighted in-degree of neighbor errors."""
+        x_true, x_recon = self._align_target_and_recon(x_true, x_recon)
+        n = cfg.dataset.n_nodes
+        b = x_true.shape[0] // n
+        node_err = (x_true - x_recon).abs().mean(dim=-1)  # [B*N]
+
+        num_nodes = node_err.numel()
+        weighted_in = torch.zeros(num_nodes, device=node_err.device)
+        in_degree = torch.zeros(num_nodes, device=node_err.device)
+        if edge_index is not None and edge_weight is not None:
+            src, dst = edge_index
+            w = edge_weight.abs()
+            weighted_in.index_add_(0, dst, node_err[src] * w)
+            in_degree.index_add_(0, dst, w)
+
+        node_scores = weighted_in / (in_degree + 1e-8)
+        return node_scores.view(b, n).mean(dim=1)
+
+    def _topology_scores_plain_error(
+        self,
+        x_true: torch.Tensor,
+        x_recon: torch.Tensor,
+    ) -> torch.Tensor:
+        """Plain L1 error without topology weighting."""
+        x_true, x_recon = self._align_target_and_recon(x_true, x_recon)
+        n = cfg.dataset.n_nodes
+        b = x_true.shape[0] // n
+        node_err = (x_true - x_recon).abs().mean(dim=-1)  # [B*N]
+        return node_err.view(b, n).mean(dim=1)
 
     def compute_topology_aware_anomaly_score(
         self,
