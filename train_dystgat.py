@@ -339,6 +339,11 @@ def parse_args() -> argparse.Namespace:
         default=1e-4,
         help="Minimum improvement in validation loss to reset patience (default: 1e-4).",
     )
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0,
+        help="Max gradient norm for clipping (0=disabled).")
+    parser.add_argument("--lr-scheduler", type=str, default="cosine",
+        choices=["none", "cosine", "plateau"],
+        help="Learning rate scheduler type.")
     args = parser.parse_args()
     if args.dataset_key is None:
         parser.error(
@@ -658,10 +663,15 @@ def train_epoch(
 
         if scaler is not None:
             scaler.scale(loss).backward()
+            if cfg.grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            if cfg.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip_norm)
             optimizer.step()
 
         batch_size = batch_obj.num_graphs
@@ -1209,6 +1219,7 @@ def main() -> None:
             torch.backends.cudnn.benchmark = True
         cfg.anomaly_weight = float(args.anomaly_weight)
         cfg.lambda_div = float(args.lambda_div)
+        cfg.grad_clip_norm = float(args.grad_clip_norm)
 
         adapter = get_adapter(args.dataset_key)
         adapter.ensure("training")
@@ -1286,6 +1297,14 @@ def main() -> None:
         else:
             criterion = torch.nn.MSELoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+        # LR scheduler
+        if args.lr_scheduler == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-7)
+        elif args.lr_scheduler == "plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+        else:
+            scheduler = None
 
         scaler = GradScaler("cuda") if args.use_amp and device.type == "cuda" else None
         amp_enabled = scaler is not None
@@ -1402,12 +1421,13 @@ def main() -> None:
                 )
                 elapsed = time.time() - start_time
 
+                current_lr = optimizer.param_groups[0]['lr']
                 if is_main_process:
                     log_msg = (
                         f"[Epoch {epoch:03d}] train_total={train_total_loss:.6f} "
                         f"train_recon={train_recon_loss:.6f} train_anom={train_anom:.6f} train_div={train_div:.6f} "
                         f"val_loss={val_loss:.6f} val_anom={val_score:.6f} val_div={val_div:.6f} "
-                        f"time={elapsed:.1f}s"
+                        f"lr={current_lr:.2e} time={elapsed:.1f}s"
                     )
                     print(log_msg)
                     # Gate diagnostics for monitoring spectral branch contribution (gated fusion only)
@@ -1437,6 +1457,7 @@ def main() -> None:
                             "val_rmse": f"{val_rmse:.6f}",
                             "val_div": f"{val_div:.6f}",
                             "val_anom": f"{val_score:.6f}",
+                            "lr": f"{current_lr:.2e}",
                         }
                         # Include gate diagnostics in checkpoint (gated fusion only)
                         if gate_diag is not None:
@@ -1481,6 +1502,13 @@ def main() -> None:
                                 print(f"\n⏹ Early stopping triggered at epoch {epoch} (no improvement for {args.patience} epochs)")
                             early_stop_triggered = True
                             break
+
+                # Step LR scheduler
+                if scheduler is not None:
+                    if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        scheduler.step(val_loss)
+                    else:
+                        scheduler.step()
 
             if best_state is not None:
                 base_model.load_state_dict(best_state)
