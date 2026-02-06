@@ -101,6 +101,11 @@ def _create_dataloaders(
     if test_stride is None:
         test_stride = val_stride
 
+    # Prevent train/val window overlap in window_shuffle mode
+    if split_mode == 'window_shuffle' and val_stride != train_stride:
+        print(f"WARNING: Forcing val_stride={train_stride} in window_shuffle mode to prevent leakage")
+        val_stride = train_stride
+
     # Data directory should point to pronto_benchmark folder
     # which contains the scenario folders (C0, C1, C2, C3)
     if not os.path.exists(data_dir):
