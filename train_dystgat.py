@@ -347,6 +347,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topology-mode", type=str, default="neighbor_propagation",
         choices=["own_error_degree", "neighbor_propagation", "plain_error"],
         help="Topology scoring formula.")
+    parser.add_argument("--disable-tea", action="store_true", default=True,
+        help="Disable TEA (Temporal Evidence Accumulation) metrics (default: disabled).")
+    parser.add_argument("--enable-tea", dest="disable_tea", action="store_false",
+        help="Enable TEA metrics computation.")
     args = parser.parse_args()
     if args.dataset_key is None:
         parser.error(
@@ -898,6 +902,7 @@ def evaluate_tests_and_plot(
     distributed: bool = False,
     amp_enabled: bool = False,
     div_fusion_beta: float = 0.0,
+    disable_tea: bool = True,
 ) -> Dict[str, Dict[str, float]]:
     metrics: Dict[str, Dict[str, float]] = {}
     os.makedirs(output_dir, exist_ok=True)
@@ -1072,12 +1077,15 @@ def evaluate_tests_and_plot(
                 'threshold',         # fixed threshold (95th percentile of baseline)
                 'best_threshold',    # threshold achieving best_f1
                 'delay_best_thr',    # detection delay (samples) at best_threshold
-                # TEA (Temporal Evidence Accumulation) metrics
-                'tea_auc',           # AUC with TEA post-processing
-                'tea_best_f1',       # Best F1 with TEA
-                'tea_best_window',   # Window size that achieved best TEA AUC
-                'tea_auc_delta',     # Improvement in AUC from TEA
             ]
+            # Conditionally include TEA columns
+            if not disable_tea:
+                fieldnames += [
+                    'tea_auc',           # AUC with TEA post-processing
+                    'tea_best_f1',       # Best F1 with TEA
+                    'tea_best_window',   # Window size that achieved best TEA AUC
+                    'tea_auc_delta',     # Improvement in AUC from TEA
+                ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
 
@@ -1144,21 +1152,6 @@ def evaluate_tests_and_plot(
                 # Ambiguity (for Pronto novel OCs; harmless for others)
                 ambiguity = 1.0 - 2.0 * abs(auc - 0.5)
 
-                # TEA (Temporal Evidence Accumulation) for incipient fault detection
-                # Window sizes: 300 (~5min), 600 (~10min), 1800 (~30min) at 1s sampling
-                # PRONTO raw CSV uses 1s intervals (per header: "Interval,1s")
-                # Use test baseline for TEA AUC computation (consistent with raw AUC)
-                tea_metrics = compute_tea_metrics(
-                    auc_baseline_scores,
-                    scores,
-                    window_sizes=[300, 600, 1800],
-                    return_best_window=True,
-                )
-                tea_auc = tea_metrics['auc']
-                tea_best_f1 = tea_metrics['best_f1']
-                tea_best_window = tea_metrics['best_window']
-                tea_auc_delta = tea_auc - auc
-
                 row = {
                     'test_set': name,
                     'auc_roc': f"{auc:.4f}",
@@ -1171,13 +1164,27 @@ def evaluate_tests_and_plot(
                     'threshold': f"{threshold:.6f}",
                     'best_threshold': f"{best_threshold:.6f}",
                     'delay_best_thr': delay_best,
-                    'tea_auc': f"{tea_auc:.4f}",
-                    'tea_best_f1': f"{tea_best_f1:.4f}",
-                    'tea_best_window': tea_best_window,
-                    'tea_auc_delta': f"{tea_auc_delta:+.4f}",
                 }
+
+                # TEA (Temporal Evidence Accumulation) for incipient fault detection
+                if not disable_tea:
+                    tea_metrics = compute_tea_metrics(
+                        auc_baseline_scores,
+                        scores,
+                        window_sizes=[300, 600, 1800],
+                        return_best_window=True,
+                    )
+                    tea_auc = tea_metrics['auc']
+                    tea_best_f1 = tea_metrics['best_f1']
+                    tea_best_window = tea_metrics['best_window']
+                    tea_auc_delta = tea_auc - auc
+                    row['tea_auc'] = f"{tea_auc:.4f}"
+                    row['tea_best_f1'] = f"{tea_best_f1:.4f}"
+                    row['tea_best_window'] = tea_best_window
+                    row['tea_auc_delta'] = f"{tea_auc_delta:+.4f}"
+
                 writer.writerow(row)
-                
+
                 # Update the returned metrics dict for printing
                 metrics[name]['auc'] = auc
                 metrics[name]['fused_auc'] = fused_auc
@@ -1185,9 +1192,10 @@ def evaluate_tests_and_plot(
                 metrics[name]['best_f1'] = best_f1
                 metrics[name]['ambiguity'] = ambiguity
                 metrics[name]['delay_best_thr'] = delay_best
-                metrics[name]['tea_auc'] = tea_auc
-                metrics[name]['tea_best_f1'] = tea_best_f1
-                metrics[name]['tea_auc_delta'] = tea_auc_delta
+                if not disable_tea:
+                    metrics[name]['tea_auc'] = tea_auc
+                    metrics[name]['tea_best_f1'] = tea_best_f1
+                    metrics[name]['tea_auc_delta'] = tea_auc_delta
 
         print(f"Detailed metrics saved to {detailed_metrics_path}")
 
@@ -1592,6 +1600,7 @@ def main() -> None:
                 distributed=distributed,
                 amp_enabled=amp_enabled,
                 div_fusion_beta=args.div_fusion_beta,
+                disable_tea=args.disable_tea,
             )
 
             for name, metrics in test_scores.items():
