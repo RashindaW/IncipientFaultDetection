@@ -117,7 +117,7 @@ class EdgeGRU(nn.Module):
         h = torch.zeros(num_edges, 1, device=alpha_seq.device)
         for t in range(w):
             h = self.gru_cell(alpha_seq[:, t:t+1], h)
-            h = F.relu(h)
+            h = F.softplus(h)
         return h.squeeze(-1)
 
 
@@ -227,7 +227,14 @@ class WeightedGIN(nn.Module):
         weighted_msg = x[src] * edge_weight.unsqueeze(-1)
         aggr = torch.zeros_like(x)
         aggr.index_add_(0, dst, weighted_msg)
-        out = self.mlp((1 + self.eps) * x + aggr)
+
+        self_term = (1 + self.eps) * x
+        # Diagnostic: track message-vs-self contribution (eval only)
+        if not self.training:
+            self._last_aggr_norm = aggr.detach().norm().item()
+            self._last_self_norm = self_term.detach().norm().item()
+
+        out = self.mlp(self_term + aggr)
         if self.residual is not None:
             out = out + self.residual(x)
         return out
@@ -526,15 +533,16 @@ class TemporalGraph(nn.Module):
         return None
 
 class GRUEncoder(nn.Module):
-    def __init__(self, in_channels, out_channels, norm_func=None, mode='univariate'):
+    def __init__(self, in_channels, out_channels, norm_func=None, mode='univariate', dropout=0.0):
         super().__init__()
         self.mode = mode
         if mode == 'univariate':
             self.gru = nn.GRU(in_channels, out_channels, batch_first=True)
         elif mode == 'multivariate':
             self.gru = nn.GRU(in_channels, out_channels, batch_first=True)
-            
+
         self.norm = norm_func(out_channels) if norm_func else nn.Identity()
+        self.feat_dropout = nn.Dropout(dropout)
         
     def forward(self, x, h0=None):
         # x: [batch, nodes, window] (univariate) or [batch, window, feats] (multivariate)
@@ -549,7 +557,7 @@ class GRUEncoder(nn.Module):
             out, h = self.gru(x, h0)
             # h: [1, b*n, out_dim]
             # Paper: h_j^ti = ReLU(GRU-Cell(x_j^ti, h_j^(ti-1)))
-            h = F.relu(h.squeeze(0)).view(b, n, -1)
+            h = self.feat_dropout(F.relu(h.squeeze(0))).view(b, n, -1)
             if not isinstance(self.norm, nn.Identity):
                 h_flat = h.reshape(b * n, -1)
                 if isinstance(self.norm, GraphNorm):
@@ -565,7 +573,7 @@ class GRUEncoder(nn.Module):
                 h0 = h0.unsqueeze(0)
             out, h = self.gru(x, h0)
             # Paper: h_j^ti = ReLU(GRU-Cell(x_j^ti, h_j^(ti-1)))
-            h = F.relu(h.squeeze(0))
+            h = self.feat_dropout(F.relu(h.squeeze(0)))
             if not isinstance(self.norm, nn.Identity):
                 if isinstance(self.norm, GraphNorm):
                     batch = torch.arange(h.size(0), device=h.device)
@@ -867,6 +875,7 @@ class DySTGAT(nn.Module):
         self.do_encoder_norm = do_encoder_norm
         self.do_gnn_norm = do_gnn_norm
         self.do_decoder_norm = do_decoder_norm
+        self.feat_dropout = nn.Dropout(dropout)
 
         # Only create control encoder if we have control variables
         if self.aug_control and cfg.dataset.ocvar_dim > 0:
@@ -875,6 +884,7 @@ class DySTGAT(nn.Module):
                 out_channels=temp_node_embed_dim,
                 norm_func=NORM_LAYER_DICT[encoder_norm_type] if do_encoder_norm else None,
                 mode='multivariate',
+                dropout=dropout,
             )
             # Backward OC encoder for decoder initialization (paper requirement)
             self.backward_oc_encoder = BackwardOCEncoder(
@@ -894,6 +904,7 @@ class DySTGAT(nn.Module):
             out_channels=temp_node_embed_dim,
             norm_func=NORM_LAYER_DICT[encoder_norm_type] if do_encoder_norm else None,
             mode=node_encoder_mode,
+            dropout=dropout,
         )
         self.idcnn = IDCNN(in_channels=1, hidden_channels=16, out_channels=1, kernel_size=3, num_layers=2)
 
@@ -1211,6 +1222,7 @@ class DySTGAT(nn.Module):
                 z_temp = self._apply_norm(self.gnn_norms[i], z_temp, batch)
             z_temp = torch.nan_to_num(z_temp, nan=0.0, posinf=0.0, neginf=0.0)
             z_temp = F.relu(z_temp)
+            z_temp = self.feat_dropout(z_temp)
 
         # Spectral GNN
         z_freq = None
@@ -1223,6 +1235,7 @@ class DySTGAT(nn.Module):
                     z_freq = self._apply_norm(self.gnn_norms_freq[i], z_freq, batch)
                 z_freq = torch.nan_to_num(z_freq, nan=0.0, posinf=0.0, neginf=0.0)
                 z_freq = F.relu(z_freq)
+                z_freq = self.feat_dropout(z_freq)
 
         # 6. Fusion
         z_fused = z_temp

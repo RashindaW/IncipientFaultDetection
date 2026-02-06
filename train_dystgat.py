@@ -344,7 +344,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-scheduler", type=str, default="cosine",
         choices=["none", "cosine", "plateau"],
         help="Learning rate scheduler type.")
-    parser.add_argument("--topology-mode", type=str, default="neighbor_propagation",
+    parser.add_argument("--topology-mode", type=str, default="own_error_degree",
         choices=["own_error_degree", "neighbor_propagation", "plain_error"],
         help="Topology scoring formula.")
     parser.add_argument("--disable-tea", action="store_true", default=True,
@@ -482,7 +482,7 @@ def init_model(
     share_gnn_weights = bool(getattr(model_args, "share_gnn_weights", False)) if model_args is not None else False
     fuse_mode = getattr(model_args, "fuse_mode", "concat") if model_args is not None else "concat"
     divergence_type = getattr(model_args, "divergence_type", "js") if model_args is not None else "js"
-    topology_mode = getattr(model_args, "topology_mode", "neighbor_propagation") if model_args is not None else "neighbor_propagation"
+    topology_mode = getattr(model_args, "topology_mode", "own_error_degree") if model_args is not None else "own_error_degree"
 
     model = DySTGAT(
         feat_input_node=1,
@@ -634,6 +634,11 @@ def train_epoch(
     gate_std_sum = 0.0
     z_freq_norm_sum = 0.0
     gate_batch_count = 0
+    # Edge weight diagnostics
+    ew_min_acc = float("inf")
+    ew_mean_acc = 0.0
+    ew_max_acc = float("-inf")
+    ew_batch_count = 0
 
     for raw_batch in loader:
         optimizer.zero_grad(set_to_none=True)
@@ -690,6 +695,14 @@ def train_epoch(
         running_div += div_loss.detach().item() * batch_size
         sample_count += batch_size
 
+        # Track edge weight diagnostics
+        if edge_attr is not None:
+            ew = edge_attr.detach()
+            ew_min_acc = min(ew_min_acc, ew.min().item())
+            ew_mean_acc += ew.mean().item()
+            ew_max_acc = max(ew_max_acc, ew.max().item())
+            ew_batch_count += 1
+
         # Track gate diagnostics for gated fusion mode
         if use_graph and "gate_mean" in aux:
             gate_mean_sum += aux["gate_mean"]
@@ -717,12 +730,22 @@ def train_epoch(
             "z_freq_norm": z_freq_norm_sum / gate_batch_count,
         }
 
+    # Edge weight diagnostics
+    edge_diagnostics = None
+    if ew_batch_count > 0:
+        edge_diagnostics = {
+            "ew_min": ew_min_acc,
+            "ew_mean": ew_mean_acc / ew_batch_count,
+            "ew_max": ew_max_acc,
+        }
+
     return (
         float(total_loss / denom),
         float(total_recon / denom),
         float(total_anom / denom),
         float(total_div / denom),
         gate_diagnostics,
+        edge_diagnostics,
     )
 
 
@@ -1109,9 +1132,18 @@ def evaluate_tests_and_plot(
                     # Z-normalize divergence scores
                     div_fault_z = (div_scores - div_mu) / div_sigma
                     div_base_z = (auc_baseline_div - div_mu) / div_sigma
-                    # Fuse
-                    fused_fault = anom_fault_z + div_fusion_beta * div_fault_z
-                    fused_baseline = anom_base_z + div_fusion_beta * div_base_z
+                    # Fuse — guard against degenerate (zero-variance) scores
+                    anom_degenerate = anom_sigma < 1e-6
+                    div_degenerate = div_sigma < 1e-6
+                    if anom_degenerate and div_degenerate:
+                        fused_fault = np.zeros_like(scores)
+                        fused_baseline = np.zeros_like(auc_baseline_scores)
+                    elif anom_degenerate:
+                        fused_fault = div_fusion_beta * div_fault_z
+                        fused_baseline = div_fusion_beta * div_base_z
+                    else:
+                        fused_fault = anom_fault_z + div_fusion_beta * div_fault_z
+                        fused_baseline = anom_base_z + div_fusion_beta * div_base_z
                     y_scores_fused = np.concatenate([fused_baseline, fused_fault])
                     try:
                         fused_auc = roc_auc_score(y_true, y_scores_fused)
@@ -1413,7 +1445,7 @@ def main() -> None:
 
             for epoch in range(1, args.epochs + 1):
                 start_time = time.time()
-                train_total_loss, train_recon_loss, train_anom, train_div, gate_diag = train_epoch(
+                train_total_loss, train_recon_loss, train_anom, train_div, gate_diag, edge_diag = train_epoch(
                     model,
                     train_loader,
                     optimizer,
@@ -1458,6 +1490,19 @@ def main() -> None:
                             f"  ↳ gate: mean={gate_mean:.3f} std={gate_std:.3f} "
                             f"z_freq_norm={z_freq_norm:.2f}{gate_warning}"
                         )
+                    # Edge weight diagnostics
+                    if edge_diag is not None:
+                        print(
+                            f"  ↳ edge_w: min={edge_diag['ew_min']:.4f} "
+                            f"mean={edge_diag['ew_mean']:.4f} max={edge_diag['ew_max']:.4f}"
+                        )
+                    # Message-vs-self ratio from eval (GNN usage diagnostic)
+                    if hasattr(base_model, 'gnn_layers') and len(base_model.gnn_layers) > 0:
+                        gnn0 = base_model.gnn_layers[0]
+                        aggr_n = getattr(gnn0, '_last_aggr_norm', 0.0)
+                        self_n = getattr(gnn0, '_last_self_norm', 1e-8)
+                        msg_ratio = aggr_n / (self_n + 1e-8)
+                        print(f"  ↳ msg_ratio={msg_ratio:.4f} (>0.1 means graph is being used)")
                     if checkpoint_manager is not None:
                         train_rmse = math.sqrt(train_recon_loss)
                         val_rmse = math.sqrt(val_loss)
