@@ -106,7 +106,7 @@ class IDCNN(nn.Module):
 
 
 class EdgeGRU(nn.Module):
-    """Scalar GRU: h_jk^ti = ReLU(GRU-Cell(α_jk^ti, h_jk^(ti-1)))"""
+    """Scalar GRU that aggregates per-timestep attention into a single edge weight."""
     def __init__(self):
         super().__init__()
         self.gru_cell = nn.GRUCell(input_size=1, hidden_size=1)
@@ -117,8 +117,7 @@ class EdgeGRU(nn.Module):
         h = torch.zeros(num_edges, 1, device=alpha_seq.device)
         for t in range(w):
             h = self.gru_cell(alpha_seq[:, t:t+1], h)
-            h = F.softplus(h)
-        return h.squeeze(-1)
+        return F.softplus(h.squeeze(-1))
 
 
 class TemporalFeatureGraph(nn.Module):
@@ -831,6 +830,7 @@ class DySTGAT(nn.Module):
         gnn_embed_dim=16,
         gnn_type='gin',
         dropout=0.3,
+        feat_dropout=0.0,
         do_encoder_norm=True,
         do_gnn_norm=True,
         do_decoder_norm=True,
@@ -854,7 +854,7 @@ class DySTGAT(nn.Module):
         share_gnn_weights=False,
         fuse_mode="concat",  # concat | sum | gated
         divergence_type="js",  # js | kl
-        topology_mode="neighbor_propagation",  # own_error_degree | neighbor_propagation | plain_error
+        topology_mode="own_error_degree",  # own_error_degree | neighbor_propagation | plain_error
         task="reconstruction",  # reconstruction | prediction
         pred_horizon=0,
     ):
@@ -875,7 +875,7 @@ class DySTGAT(nn.Module):
         self.do_encoder_norm = do_encoder_norm
         self.do_gnn_norm = do_gnn_norm
         self.do_decoder_norm = do_decoder_norm
-        self.feat_dropout = nn.Dropout(dropout)
+        self.feat_dropout = nn.Dropout(feat_dropout)
 
         # Only create control encoder if we have control variables
         if self.aug_control and cfg.dataset.ocvar_dim > 0:
@@ -884,7 +884,7 @@ class DySTGAT(nn.Module):
                 out_channels=temp_node_embed_dim,
                 norm_func=NORM_LAYER_DICT[encoder_norm_type] if do_encoder_norm else None,
                 mode='multivariate',
-                dropout=dropout,
+                dropout=feat_dropout,
             )
             # Backward OC encoder for decoder initialization (paper requirement)
             self.backward_oc_encoder = BackwardOCEncoder(
@@ -904,7 +904,7 @@ class DySTGAT(nn.Module):
             out_channels=temp_node_embed_dim,
             norm_func=NORM_LAYER_DICT[encoder_norm_type] if do_encoder_norm else None,
             mode=node_encoder_mode,
-            dropout=dropout,
+            dropout=feat_dropout,
         )
         self.idcnn = IDCNN(in_channels=1, hidden_channels=16, out_channels=1, kernel_size=3, num_layers=2)
 
@@ -1495,8 +1495,8 @@ class DySTGAT(nn.Module):
         in_degree = torch.zeros(num_nodes, device=node_err.device)
         if edge_index is not None and edge_weight is not None:
             src, dst = edge_index
-            w = edge_weight.abs()
-            weighted_in.index_add_(0, dst, node_err[src] * w)
+            w = edge_weight.abs().float()
+            weighted_in.index_add_(0, dst, node_err[src].float() * w)
             in_degree.index_add_(0, dst, w)
 
         node_scores = weighted_in / (in_degree + 1e-8)

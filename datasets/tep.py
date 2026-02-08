@@ -10,6 +10,8 @@ from dystgat.src.data.tep_column_config import (
     CONTROL_VARS,
     FAULT_FREE_TEST_FILE,
     FAULT_FREE_TRAIN_FILE,
+    FAULT_LABELS,
+    FAULT_ONSET_SAMPLE_TEST,
     FAULTY_TEST_FILE,
     MEASUREMENT_VARS,
 )
@@ -32,7 +34,7 @@ def _resolve_split_files(split_key: str) -> List[str]:
 
 
 def _list_fault_keys() -> List[str]:
-    return ["test_all_faults"]
+    return [f"fault_{i:02d}" for i in FAULT_LABELS]
 
 
 def _create_dataloaders(
@@ -87,8 +89,9 @@ def _create_dataloaders(
         run_filter=range(1, 251),  # First half of runs for validation
     )
 
-    # Testing on fault-free + all faults
-    print("\n[3/3] Loading TEST datasets...")
+    # Testing on fault-free + individual faults
+    n_fault_loaders = len(FAULT_LABELS)
+    print(f"\n[3/3] Loading TEST datasets (baseline + {n_fault_loaders} faults)...")
     test_datasets = {}
 
     # 1. Baseline (Normal) - Use runs 251-500 (separate from validation)
@@ -107,21 +110,22 @@ def _create_dataloaders(
     )
     test_datasets["baseline"] = baseline_test
 
-    # 2. Combined Faulty Test Set
-    # This loads EVERYTHING in TEP_Faulty_Testing.RData (Faults 0, 1-20)
-    # without filtering, preserving the natural sequence.
-    print("  - Combined Faulty Test Set (All Faults + Interspersed Normal)")
-    combined_test = TEPDataset(
-        data_files=[FAULTY_TEST_FILE],
-        window_size=window_size,
-        stride=test_stride,
-        data_dir=data_dir,
-        normalize=True,
-        normalization_stats=norm_stats,
-        fault_filter=None, # No filter = load everything
-        pred_horizon=pred_horizon or 0,
-    )
-    test_datasets["test_all_faults"] = combined_test
+    # 2. Per-fault test sets (pre-fault normal samples are dropped)
+    for fault_id in FAULT_LABELS:
+        key = f"fault_{fault_id:02d}"
+        print(f"  - {key} (post-onset only, samples >= {FAULT_ONSET_SAMPLE_TEST})")
+        fault_ds = TEPDataset(
+            data_files=[FAULTY_TEST_FILE],
+            window_size=window_size,
+            stride=test_stride,
+            data_dir=data_dir,
+            normalize=True,
+            normalization_stats=norm_stats,
+            fault_filter=[fault_id],
+            pred_horizon=pred_horizon or 0,
+            fault_onset_sample=FAULT_ONSET_SAMPLE_TEST,
+        )
+        test_datasets[key] = fault_ds
 
     pin_memory = torch.cuda.is_available()
 

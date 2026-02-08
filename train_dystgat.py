@@ -280,9 +280,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split-mode",
         type=str,
-        choices=["temporal", "segment_shuffle"],
+        choices=["temporal", "window_shuffle", "segment_shuffle"],
         default="segment_shuffle",
         help="Data split strategy: 'temporal' for sequential splits, "
+             "'window_shuffle' shuffles windows (two-stage with temporal test hold-out), "
              "'segment_shuffle' (default) shuffles segments to balance operating conditions.",
     )
     parser.add_argument(
@@ -341,7 +342,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--grad-clip-norm", type=float, default=1.0,
         help="Max gradient norm for clipping (0=disabled).")
-    parser.add_argument("--lr-scheduler", type=str, default="cosine",
+    parser.add_argument("--dropout", type=float, default=0.0,
+        help="Feature dropout rate (0=disabled).")
+    parser.add_argument("--lr-scheduler", type=str, default="none",
         choices=["none", "cosine", "plateau"],
         help="Learning rate scheduler type.")
     parser.add_argument("--topology-mode", type=str, default="own_error_degree",
@@ -507,6 +510,7 @@ def init_model(
         gnn_embed_dim=40,
         gnn_type="gin",
         dropout=0.3,
+        feat_dropout=getattr(model_args, "dropout", 0.0),
         do_encoder_norm=True,
         do_gnn_norm=True,
         do_decoder_norm=True,
@@ -618,7 +622,7 @@ def train_epoch(
     distributed: bool = False,
     scaler: Optional[GradScaler] = None,
     amp_enabled: bool = False,
-) -> Tuple[float, float, float, float, Optional[dict]]:
+) -> Tuple[float, float, float, float, Optional[dict], Optional[dict]]:
     model.train()
     base_model = unwrap_model(model)
     task = getattr(cfg.dataset, "task", "reconstruction")
@@ -1136,19 +1140,24 @@ def evaluate_tests_and_plot(
                     anom_degenerate = anom_sigma < 1e-6
                     div_degenerate = div_sigma < 1e-6
                     if anom_degenerate and div_degenerate:
-                        fused_fault = np.zeros_like(scores)
-                        fused_baseline = np.zeros_like(auc_baseline_scores)
-                    elif anom_degenerate:
-                        fused_fault = div_fusion_beta * div_fault_z
-                        fused_baseline = div_fusion_beta * div_base_z
+                        fused_auc = 0.0  # Both scores degenerate — skip
                     else:
-                        fused_fault = anom_fault_z + div_fusion_beta * div_fault_z
-                        fused_baseline = anom_base_z + div_fusion_beta * div_base_z
-                    y_scores_fused = np.concatenate([fused_baseline, fused_fault])
-                    try:
-                        fused_auc = roc_auc_score(y_true, y_scores_fused)
-                    except ValueError:
-                        fused_auc = 0.0
+                        if anom_degenerate:
+                            # Anomaly constant — divergence only
+                            fused_fault = div_fusion_beta * div_fault_z
+                            fused_baseline = div_fusion_beta * div_base_z
+                        elif div_degenerate:
+                            # Divergence constant — anomaly only
+                            fused_fault = anom_fault_z
+                            fused_baseline = anom_base_z
+                        else:
+                            fused_fault = anom_fault_z + div_fusion_beta * div_fault_z
+                            fused_baseline = anom_base_z + div_fusion_beta * div_base_z
+                        y_scores_fused = np.concatenate([fused_baseline, fused_fault])
+                        try:
+                            fused_auc = roc_auc_score(y_true, y_scores_fused)
+                        except ValueError:
+                            fused_auc = 0.0
 
                 try:
                     auc = roc_auc_score(y_true, y_scores)
@@ -1534,10 +1543,10 @@ def main() -> None:
                         print(f"  ↳ checkpoint saved: {checkpoint_path.name}")
 
                 improved = False
-                # Use a slightly more robust improvement check
-                if val_score < best_val_anom - 1e-9:
+                # Primary: val_loss; tiebreak: val_anom
+                if val_loss < best_val_loss - 1e-9:
                     improved = True
-                elif abs(val_score - best_val_anom) <= 1e-9 and val_loss < best_val_loss:
+                elif abs(val_loss - best_val_loss) <= 1e-9 and val_score < best_val_anom:
                     improved = True
 
                 if improved:
@@ -1549,6 +1558,9 @@ def main() -> None:
                         print(
                             f"  ↳ new best model (val_anom={best_val_anom:.6f}, val_loss={best_val_loss:.6f})"
                         )
+                        if save_model_path is not None:
+                            torch.save(best_state, save_model_path)
+                            print(f"  ↳ best.pt saved: {save_model_path.as_posix()}")
                 else:
                     # Early stopping check
                     if args.early_stopping:

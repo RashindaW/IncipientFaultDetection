@@ -63,6 +63,10 @@ def _create_dataloaders(
     split_mode: str = 'window_shuffle',
     split_ratios: Tuple[float, float, float] = (0.7, 0.15, 0.15),
     random_seed: int = 42,
+    n_segments: int = 10,
+    train_segments: List[int] | None = None,
+    val_segments: List[int] | None = None,
+    test_segments: List[int] | None = None,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     """
     Create train, validation, and test DataLoaders for PRONTO dataset.
@@ -90,10 +94,15 @@ def _create_dataloaders(
             - 'window_shuffle': Two-stage split with temporal test hold-out (default)
               Stage 1: Last 15% held out temporally for test_baseline
               Stage 2: First 85% windowed, shuffled, split into train/val
+            - 'segment_shuffle': Divide normal data into N segments, assign to splits
         split_ratios: Ratios for train/val/test_baseline when using window_shuffle
                      (default: 70% train, 15% val, 15% test_baseline)
                      Note: train+val windows are shuffled; test_baseline is temporal
         random_seed: Random seed for window shuffling (for reproducibility)
+        n_segments: Number of segments for segment_shuffle mode (default: 10)
+        train_segments: Explicit segment indices for training (overrides split_ratios)
+        val_segments: Explicit segment indices for validation (overrides split_ratios)
+        test_segments: Explicit segment indices for testing (overrides split_ratios)
 
     Returns:
         Tuple of (train_loader, val_loader, test_loaders_dict)
@@ -115,16 +124,22 @@ def _create_dataloaders(
     print(f"CREATING PRONTO DATALOADERS (mode={split_mode})")
     print("=" * 70)
 
-    # Common kwargs for window_shuffle mode
+    # Common kwargs for split mode
     shuffle_kwargs = {
         'split_mode': split_mode,
         'split_ratios': split_ratios,
         'random_seed': random_seed,
+        'n_segments': n_segments,
+        'train_segments': train_segments,
+        'val_segments': val_segments,
+        'test_segments': test_segments,
     }
 
     # 1. Training Dataset
     if split_mode == 'window_shuffle':
         print(f"[1/3] Loading TRAINING dataset (window_shuffle: {split_ratios[0]*100:.0f}% of all normal)...")
+    elif split_mode == 'segment_shuffle':
+        print(f"[1/3] Loading TRAINING dataset (segment_shuffle: n_segments={n_segments})...")
     else:
         print("[1/3] Loading TRAINING dataset (temporal split)...")
 
@@ -142,6 +157,8 @@ def _create_dataloaders(
     # 2. Validation Dataset
     if split_mode == 'window_shuffle':
         print(f"[2/3] Loading VALIDATION dataset (window_shuffle: {split_ratios[1]*100:.0f}% of all normal)...")
+    elif split_mode == 'segment_shuffle':
+        print(f"[2/3] Loading VALIDATION dataset (segment_shuffle)...")
     else:
         print("[2/3] Loading VALIDATION dataset (temporal split)...")
 
@@ -161,9 +178,12 @@ def _create_dataloaders(
     print("[3/3] Loading TEST datasets...")
     test_datasets = {}
 
-    # Baseline - uses window_shuffle mode if enabled (with temporal hold-out)
+    # Baseline - uses window_shuffle/segment_shuffle mode if enabled
     if split_mode == 'window_shuffle':
         print(f"    test_baseline: temporal hold-out (last {split_ratios[2]*100:.0f}% of data)")
+    elif split_mode == 'segment_shuffle':
+        seg_info = test_segments if test_segments else "by ratio"
+        print(f"    test_baseline: segment_shuffle (segments={seg_info})")
     test_datasets["baseline"] = PRONTODataset(
         data_dir=data_dir,
         split='test_baseline',
