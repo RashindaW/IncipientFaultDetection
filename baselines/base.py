@@ -26,22 +26,55 @@ class BaselineModel(ABC, nn.Module):
         window_size: Temporal window size
     """
 
-    def __init__(self, name: str, n_features: int, window_size: int):
+    def __init__(self, name: str, n_features: int, window_size: int,
+                 n_measurement_vars: int = None):
         """Initialize the baseline model.
 
         Args:
             name: Model name for logging and identification
-            n_features: Number of input features (e.g., 4 for IMS bearings)
+            n_features: Number of input features (measurement + control)
             window_size: Temporal window size (e.g., 1024 for IMS-raw)
+            n_measurement_vars: Number of measurement variables for scoring.
+                If None, all features are used for scoring.
         """
         super().__init__()
         self.name = name
         self.n_features = n_features
         self.window_size = window_size
+        self.n_measurement_vars = n_measurement_vars or n_features
 
         # Track training state
         self._is_fitted = False
         self._train_stats: Dict[str, Any] = {}
+
+    def _extract_batch(self, batch, device: torch.device) -> torch.Tensor:
+        """Extract input tensor from a batch, concatenating x + c if available.
+
+        Args:
+            batch: PyG Data batch or tuple batch
+            device: Device to move tensors to
+
+        Returns:
+            Input tensor of shape [batch_size, n_features, window_size]
+        """
+        if hasattr(batch, 'x'):
+            x = batch.x.to(device)
+            batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
+            n_nodes = x.shape[0] // batch_size
+            x = x.view(batch_size, n_nodes, -1)  # [B, N_meas, W]
+
+            # Concatenate control variables if available
+            if hasattr(batch, 'c') and batch.c is not None:
+                c = batch.c.to(device)  # [B, C, W] or [B*C, W]
+                if c.dim() == 2:
+                    # Flat format: [B*C, W] -> [B, C, W]
+                    n_ctrl = c.shape[0] // batch_size
+                    c = c.view(batch_size, n_ctrl, -1)
+                x = torch.cat([x, c], dim=1)  # [B, N_meas+C, W]
+        else:
+            x = batch[0].to(device)
+
+        return x
 
     @abstractmethod
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -99,20 +132,12 @@ class BaselineModel(ABC, nn.Module):
 
         with torch.no_grad():
             for batch in data_loader:
-                # Handle PyG Data objects
-                if hasattr(batch, 'x'):
-                    x = batch.x.to(device)
-                    # Reshape from [B*N, W] to [B, N, W]
-                    batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
-                    n_nodes = x.shape[0] // batch_size
-                    x = x.view(batch_size, n_nodes, -1)
+                x = self._extract_batch(batch, device)
 
-                    if hasattr(batch, 'y') and batch.y is not None:
-                        labels_list.append(batch.y.cpu().numpy())
-                else:
-                    x = batch[0].to(device)
-                    if len(batch) > 1:
-                        labels_list.append(batch[1].cpu().numpy())
+                if hasattr(batch, 'y') and batch.y is not None:
+                    labels_list.append(batch.y.cpu().numpy())
+                elif not hasattr(batch, 'x') and len(batch) > 1:
+                    labels_list.append(batch[1].cpu().numpy())
 
                 # Compute per-sample scores
                 batch_scores = self._compute_batch_anomaly_scores(x)
@@ -128,7 +153,8 @@ class BaselineModel(ABC, nn.Module):
     def _compute_batch_anomaly_scores(self, x: torch.Tensor) -> torch.Tensor:
         """Compute anomaly scores for a batch of samples.
 
-        Default implementation uses reconstruction error.
+        Default implementation uses reconstruction error on measurement
+        channels only (excludes control variables from scoring).
         Override this method for model-specific scoring.
 
         Args:
@@ -138,9 +164,67 @@ class BaselineModel(ABC, nn.Module):
             Anomaly scores tensor of shape [batch_size]
         """
         recon = self.forward(x)
-        # MSE per sample
-        mse = torch.mean((x - recon) ** 2, dim=(1, 2))
+        # Score only on measurement channels
+        n_m = self.n_measurement_vars
+        mse = torch.mean((x[:, :n_m] - recon[:, :n_m]) ** 2, dim=(1, 2))
         return mse
+
+    def compute_per_feature_residuals(
+        self,
+        data_loader: DataLoader,
+        device: torch.device,
+    ) -> np.ndarray:
+        """Compute per-feature mean absolute residuals for each window.
+
+        Used for unified IQR-normalized scoring (GDN's scoring function applied
+        to all baselines, per DyEdgeGAT paper Section V.B).
+
+        Args:
+            data_loader: DataLoader containing samples
+            device: Device to run inference on
+
+        Returns:
+            Per-feature residuals array of shape [N, n_measurement_vars]
+        """
+        self.eval()
+        all_residuals = []
+
+        with torch.no_grad():
+            for batch in data_loader:
+                x = self._extract_batch(batch, device)
+                recon = self.forward(x)
+
+                n_m = self.n_measurement_vars
+                # Per-feature MAE averaged over time: [batch, n_meas]
+                residuals = torch.mean(
+                    torch.abs(x[:, :n_m] - recon[:, :n_m]), dim=2
+                )
+                all_residuals.append(residuals.cpu().numpy())
+
+        return np.concatenate(all_residuals, axis=0)
+
+    @staticmethod
+    def iqr_normalize_scores(
+        residuals: np.ndarray,
+        val_median: np.ndarray,
+        val_iqr: np.ndarray,
+    ) -> np.ndarray:
+        """Normalize per-feature residuals using validation IQR and aggregate.
+
+        Per-feature normalization followed by mean aggregation, matching
+        the unified scoring in DyEdgeGAT paper (Section V.B).
+
+        Args:
+            residuals: Per-feature residuals [N, n_meas]
+            val_median: Validation median per feature [n_meas]
+            val_iqr: Validation IQR per feature [n_meas]
+
+        Returns:
+            Per-window scalar scores [N]
+        """
+        normalized = (residuals - val_median) / val_iqr
+        scores = np.mean(normalized, axis=1)
+        return scores
 
     def fit(
         self,
@@ -240,15 +324,7 @@ class BaselineModel(ABC, nn.Module):
         for batch in train_loader:
             optimizer.zero_grad()
 
-            # Handle PyG Data objects
-            if hasattr(batch, 'x'):
-                x = batch.x.to(device)
-                # Reshape from [B*N, W] to [B, N, W]
-                batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
-                n_nodes = x.shape[0] // batch_size
-                x = x.view(batch_size, n_nodes, -1)
-            else:
-                x = batch[0].to(device)
+            x = self._extract_batch(batch, device)
 
             # Forward pass
             recon = self.forward(x)
@@ -285,14 +361,7 @@ class BaselineModel(ABC, nn.Module):
 
         with torch.no_grad():
             for batch in data_loader:
-                # Handle PyG Data objects
-                if hasattr(batch, 'x'):
-                    x = batch.x.to(device)
-                    batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
-                    n_nodes = x.shape[0] // batch_size
-                    x = x.view(batch_size, n_nodes, -1)
-                else:
-                    x = batch[0].to(device)
+                x = self._extract_batch(batch, device)
 
                 recon = self.forward(x)
                 loss, _ = self.compute_loss(x, recon)

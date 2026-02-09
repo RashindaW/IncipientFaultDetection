@@ -60,6 +60,7 @@ def _create_dataloaders(
     feature_option: Optional[str] = None,
     fault_keys: Optional[List[str]] = None,
     pred_horizon: Optional[int] = None,
+    **kwargs,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     """
     Create train/val/test dataloaders for IMS Bearing dataset.

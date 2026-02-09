@@ -53,6 +53,7 @@ def _create_dataloaders(
     feature_option: str | None = None,
     fault_keys: List[str] | None = None,
     pred_horizon: int | None = None,
+    **kwargs,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     if test_stride is None:
         test_stride = val_stride

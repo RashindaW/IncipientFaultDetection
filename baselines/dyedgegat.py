@@ -18,6 +18,7 @@ Without the spectral view, this model does not benefit from:
 from typing import Dict, Any, Optional
 import torch
 from torch.utils.data import DataLoader
+from torch_geometric.data import Data
 
 from .base import BaselineModel
 
@@ -46,11 +47,12 @@ class DyEdgeGAT(BaselineModel):
         dropout: float = 0.3,
         # Additional control
         ocvar_dim: int = 0,
+        n_measurement_vars: int = None,
     ):
         """Initialize DyEdgeGAT model.
 
         Args:
-            n_features: Number of input features (nodes)
+            n_features: Number of measurement features (nodes)
             window_size: Temporal window size
             node_encoder_hidden: Node encoder hidden dimension
             gnn_embed_dim: GNN embedding dimension
@@ -60,12 +62,21 @@ class DyEdgeGAT(BaselineModel):
             temp_node_embed_dim: Temporal node embedding dim
             topk: Number of neighbors in inferred graph
             dropout: Dropout rate
-            ocvar_dim: Control variable dimension
+            ocvar_dim: Control variable dimension (auto-detected if n_measurement_vars set)
+            n_measurement_vars: Number of measurement variables
         """
+        # DyEdgeGAT uses only measurement vars as nodes, control vars separately
+        if n_measurement_vars is not None and n_measurement_vars < n_features:
+            ocvar_dim = n_features - n_measurement_vars
+            actual_n_features = n_measurement_vars
+        else:
+            actual_n_features = n_features
+
         super().__init__(
             name="DyEdgeGAT",
-            n_features=n_features,
+            n_features=actual_n_features,
             window_size=window_size,
+            n_measurement_vars=actual_n_features,
         )
 
         self.node_encoder_hidden = node_encoder_hidden
@@ -160,11 +171,12 @@ class DyEdgeGAT(BaselineModel):
                 f"Import error: {e}"
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, control: torch.Tensor = None) -> torch.Tensor:
         """Forward pass through DySTGAT (temporal only).
 
         Args:
-            x: Input [batch, n_features, window_size]
+            x: Input [batch, n_features, window_size] (measurement vars only)
+            control: Control variables [batch, ocvar_dim, window_size] or None
 
         Returns:
             Reconstruction [batch, n_features, window_size]
@@ -181,17 +193,24 @@ class DyEdgeGAT(BaselineModel):
             self.n_features
         )
 
-        # Create minimal control variables if needed
-        if self.ocvar_dim > 0:
-            control = torch.zeros(batch_size, self.ocvar_dim, device=x.device)
+        # Build control tensor for DySTGAT: [batch*ocvar_dim, window_size]
+        if self.ocvar_dim > 0 and control is not None:
+            # control: [batch, ocvar_dim, window_size]
+            ctrl_flat = control.reshape(batch_size * self.ocvar_dim, self.window_size)
         else:
-            control = None
+            ctrl_flat = torch.zeros(batch_size, 0, device=x.device)
+
+        # Construct PyG Data object expected by DySTGAT.forward()
+        data = Data(
+            x=x_flat,
+            c=ctrl_flat,
+            edge_index=torch.empty(2, 0, dtype=torch.long, device=x.device),
+            batch=batch_tensor,
+        )
 
         # Forward through DySTGAT
         recon_flat = self._model(
-            x_flat,
-            batch=batch_tensor,
-            control=control,
+            data,
             return_graph=False,
         )
 
@@ -222,11 +241,57 @@ class DyEdgeGAT(BaselineModel):
             'total_loss': mse_loss,
         }
 
-    def _compute_batch_anomaly_scores(self, x: torch.Tensor) -> torch.Tensor:
+    def compute_per_feature_residuals(self, data_loader, device):
+        """Override: DyEdgeGAT needs separate measurement/control extraction."""
+        self.eval()
+        all_residuals = []
+
+        with torch.no_grad():
+            for batch in data_loader:
+                x = self._extract_measurement(batch, device)
+                control = self._extract_control(batch, device)
+
+                recon = self.forward(x, control=control)
+
+                # Per-feature MAE averaged over time: [batch, n_features]
+                residuals = torch.mean(torch.abs(x - recon), dim=2)
+                all_residuals.append(residuals.cpu().numpy())
+
+        import numpy as np
+        return np.concatenate(all_residuals, axis=0)
+
+    def compute_anomaly_scores(self, data_loader, device, return_labels=False):
+        """Override to handle DyEdgeGAT's separate measurement/control extraction."""
+        self.eval()
+        scores_list = []
+        labels_list = []
+
+        with torch.no_grad():
+            for batch in data_loader:
+                x = self._extract_measurement(batch, device)
+                control = self._extract_control(batch, device)
+
+                if hasattr(batch, 'y') and batch.y is not None:
+                    labels_list.append(batch.y.cpu().numpy())
+
+                batch_scores = self._compute_batch_anomaly_scores_with_ctrl(x, control)
+                scores_list.append(batch_scores.cpu().numpy())
+
+        import numpy as np
+        scores = np.concatenate(scores_list, axis=0)
+        if return_labels and labels_list:
+            labels = np.concatenate(labels_list, axis=0)
+            return scores, labels
+        return scores
+
+    def _compute_batch_anomaly_scores_with_ctrl(
+        self, x: torch.Tensor, control: torch.Tensor = None
+    ) -> torch.Tensor:
         """Compute anomaly scores using DySTGAT's topology-aware scoring.
 
         Args:
-            x: Input [batch, n_features, window_size]
+            x: Measurement input [batch, n_features, window_size]
+            control: Control variables [batch, ocvar_dim, window_size] or None
 
         Returns:
             Anomaly scores [batch]
@@ -236,20 +301,28 @@ class DyEdgeGAT(BaselineModel):
         batch_size = x.shape[0]
 
         # Reshape for DySTGAT
-        x_flat = x.view(batch_size * self.n_features, self.window_size)
+        x_flat = x.reshape(batch_size * self.n_features, self.window_size)
         batch_tensor = torch.arange(batch_size, device=x.device).repeat_interleave(
             self.n_features
         )
 
-        control = None
-        if self.ocvar_dim > 0:
-            control = torch.zeros(batch_size, self.ocvar_dim, device=x.device)
+        # Build control tensor for DySTGAT: [batch*ocvar_dim, window_size]
+        if self.ocvar_dim > 0 and control is not None:
+            ctrl_flat = control.reshape(batch_size * self.ocvar_dim, self.window_size)
+        else:
+            ctrl_flat = torch.zeros(batch_size, 0, device=x.device)
+
+        # Construct PyG Data object expected by DySTGAT.forward()
+        data = Data(
+            x=x_flat,
+            c=ctrl_flat,
+            edge_index=torch.empty(2, 0, dtype=torch.long, device=x.device),
+            batch=batch_tensor,
+        )
 
         # Forward with graph
         outputs = self._model(
-            x_flat,
-            batch=batch_tensor,
-            control=control,
+            data,
             return_graph=True,
         )
 
@@ -258,7 +331,6 @@ class DyEdgeGAT(BaselineModel):
         else:
             recon_flat = outputs
 
-        # Compute per-sample anomaly scores
         target_flat = x_flat
 
         if hasattr(self._model, 'compute_anomaly_scores_per_sample'):
@@ -266,7 +338,6 @@ class DyEdgeGAT(BaselineModel):
                 target_flat, recon_flat, edge_index, edge_attr
             )
         else:
-            # Fallback to MSE
             recon = recon_flat.view(batch_size, self.n_features, self.window_size)
             scores = torch.mean((x - recon) ** 2, dim=(1, 2))
 
@@ -348,6 +419,26 @@ class DyEdgeGAT(BaselineModel):
 
         return self
 
+    def _extract_control(self, batch, device):
+        """Extract control variables from batch."""
+        if hasattr(batch, 'c') and batch.c is not None:
+            c = batch.c.to(device)
+            batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
+            if c.dim() == 2:
+                n_ctrl = c.shape[0] // batch_size
+                c = c.view(batch_size, n_ctrl, -1)
+            return c
+        return None
+
+    def _extract_measurement(self, batch, device):
+        """Extract measurement variables from batch."""
+        if hasattr(batch, 'x'):
+            x = batch.x.to(device)
+            batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
+            n_nodes = x.shape[0] // batch_size
+            return x.view(batch_size, n_nodes, -1)
+        return batch[0].to(device)
+
     def _train_epoch_dystgat(
         self,
         train_loader: DataLoader,
@@ -362,15 +453,10 @@ class DyEdgeGAT(BaselineModel):
         for batch in train_loader:
             optimizer.zero_grad()
 
-            if hasattr(batch, 'x'):
-                x = batch.x.to(device)
-                batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
-                n_nodes = x.shape[0] // batch_size
-                x = x.view(batch_size, n_nodes, -1)
-            else:
-                x = batch[0].to(device)
+            x = self._extract_measurement(batch, device)
+            control = self._extract_control(batch, device)
 
-            recon = self.forward(x)
+            recon = self.forward(x, control=control)
             loss, _ = self.compute_loss(x, recon)
 
             loss.backward()
@@ -389,15 +475,10 @@ class DyEdgeGAT(BaselineModel):
 
         with torch.no_grad():
             for batch in data_loader:
-                if hasattr(batch, 'x'):
-                    x = batch.x.to(device)
-                    batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
-                    n_nodes = x.shape[0] // batch_size
-                    x = x.view(batch_size, n_nodes, -1)
-                else:
-                    x = batch[0].to(device)
+                x = self._extract_measurement(batch, device)
+                control = self._extract_control(batch, device)
 
-                recon = self.forward(x)
+                recon = self.forward(x, control=control)
                 loss, _ = self.compute_loss(x, recon)
 
                 total_loss += loss.item()

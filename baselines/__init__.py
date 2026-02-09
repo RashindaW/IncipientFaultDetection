@@ -104,6 +104,7 @@ _DEFAULT_HYPERPARAMS: Dict[str, Dict[str, Any]] = {
         "temp_node_embed_dim": 16,
         "topk": 20,
         "dropout": 0.3,
+        "ocvar_dim": 6,
     },
 }
 
@@ -149,22 +150,25 @@ def create_baseline(
     method: str,
     n_features: int,
     window_size: int,
+    n_measurement_vars: int = None,
     **kwargs
 ) -> BaselineModel:
     """Create a baseline model instance.
 
     Args:
         method: Baseline method name (e.g., "lstm_vae", "usad", "gdn")
-        n_features: Number of input features/channels
+        n_features: Number of input features/channels (measurement + control)
         window_size: Temporal window size
+        n_measurement_vars: Number of measurement variables for scoring.
+            If None, defaults to n_features.
         **kwargs: Additional method-specific hyperparameters
 
     Returns:
         Initialized baseline model
 
     Example:
-        >>> model = create_baseline("lstm_vae", n_features=4, window_size=1024)
-        >>> model = create_baseline("gdn", n_features=4, window_size=1024, topk=5)
+        >>> model = create_baseline("lstm_vae", n_features=17, window_size=1024,
+        ...                         n_measurement_vars=11)
     """
     if method not in _BASELINE_REGISTRY:
         raise ValueError(
@@ -181,6 +185,7 @@ def create_baseline(
     model = model_class(
         n_features=n_features,
         window_size=window_size,
+        n_measurement_vars=n_measurement_vars,
         **hyperparams
     )
 

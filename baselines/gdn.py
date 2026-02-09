@@ -1,13 +1,15 @@
 """GDN: Graph Deviation Network for Multivariate Time Series Anomaly Detection.
 
 Based on: Deng & Hooi 2021 - "Graph Neural Network-Based Anomaly Detection in
-Multivariate Time Series"
+Multivariate Time Series" (AAAI 2021)
+
+Reference: https://github.com/d-ailin/GDN
 
 Architecture:
 - Learn sensor dependency graph via node embedding similarity
 - Graph attention for feature aggregation
-- Forecasting-based anomaly detection
-- Attention-weighted prediction errors for scoring
+- FORECASTING-based: input [t-W..t-1] -> predict value at t (Bug fix #1)
+- Per-node error normalized by validation median/IQR (Bug fix #3)
 """
 
 from typing import Dict, Optional, Tuple
@@ -23,39 +25,24 @@ from .base import BaselineModel
 class GraphStructureLearning(nn.Module):
     """Learn graph structure from node embeddings."""
 
-    def __init__(
-        self,
-        n_nodes: int,
-        embed_dim: int,
-        topk: int = 10,
-    ):
+    def __init__(self, n_nodes: int, embed_dim: int, topk: int = 10):
         super().__init__()
         self.n_nodes = n_nodes
         self.embed_dim = embed_dim
         self.topk = min(topk, n_nodes - 1)
 
-        # Learnable node embeddings
         self.node_embedding = nn.Parameter(
             torch.randn(n_nodes, embed_dim) * 0.1
         )
 
     def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute adjacency matrix from embeddings.
-
-        Returns:
-            Tuple of (adjacency_matrix, attention_weights)
-        """
-        # Cosine similarity
         norm_emb = F.normalize(self.node_embedding, p=2, dim=-1)
         similarity = torch.mm(norm_emb, norm_emb.t())
 
-        # Remove self-loops
         similarity = similarity - torch.eye(self.n_nodes, device=similarity.device) * 1e9
 
-        # Top-k selection
         topk_values, topk_indices = torch.topk(similarity, self.topk, dim=-1)
 
-        # Create sparse adjacency
         adj = torch.zeros_like(similarity)
         for i in range(self.n_nodes):
             adj[i, topk_indices[i]] = F.softmax(topk_values[i], dim=-1)
@@ -66,13 +53,8 @@ class GraphStructureLearning(nn.Module):
 class GraphAttentionLayer(nn.Module):
     """Graph attention layer for feature aggregation."""
 
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        n_heads: int = 4,
-        dropout: float = 0.1,
-    ):
+    def __init__(self, in_features: int, out_features: int, n_heads: int = 4,
+                 dropout: float = 0.1):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = out_features // n_heads
@@ -82,11 +64,7 @@ class GraphAttentionLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.leaky_relu = nn.LeakyReLU(0.2)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        adj: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         """Apply graph attention.
 
         Args:
@@ -98,88 +76,35 @@ class GraphAttentionLayer(nn.Module):
         """
         batch_size, n_nodes, _ = x.shape
 
-        # Linear transformation
-        h = self.W(x)  # [batch, n_nodes, out_features]
+        h = self.W(x)
         h = h.view(batch_size, n_nodes, self.n_heads, self.head_dim)
 
-        # Compute attention scores
         h_i = h.unsqueeze(2).expand(-1, -1, n_nodes, -1, -1)
         h_j = h.unsqueeze(1).expand(-1, n_nodes, -1, -1, -1)
-        h_concat = torch.cat([h_i, h_j], dim=-1)  # [batch, n, n, heads, 2*head_dim]
+        h_concat = torch.cat([h_i, h_j], dim=-1)
 
-        # Attention coefficients
-        e = torch.sum(h_concat * self.attention, dim=-1)  # [batch, n, n, heads]
+        e = torch.sum(h_concat * self.attention, dim=-1)
         e = self.leaky_relu(e)
 
-        # Mask with adjacency
         mask = (adj == 0).unsqueeze(0).unsqueeze(-1)
         e = e.masked_fill(mask, float('-inf'))
 
-        # Softmax attention
         alpha = F.softmax(e, dim=2)
         alpha = self.dropout(alpha)
 
-        # Aggregate
         h_prime = torch.einsum('bijk,bjkd->bikd', alpha, h)
         h_prime = h_prime.reshape(batch_size, n_nodes, -1)
 
         return h_prime
 
 
-class FeatureEncoder(nn.Module):
-    """Encode temporal features for each node."""
-
-    def __init__(
-        self,
-        window_size: int,
-        hidden_dim: int,
-        n_layers: int = 2,
-    ):
-        super().__init__()
-
-        self.conv_layers = nn.ModuleList()
-        self.conv_layers.append(
-            nn.Conv1d(1, hidden_dim, kernel_size=7, padding=3)
-        )
-        for _ in range(n_layers - 1):
-            self.conv_layers.append(
-                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
-            )
-
-        self.pool = nn.AdaptiveAvgPool1d(1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode temporal features.
-
-        Args:
-            x: Input [batch, n_nodes, window_size]
-
-        Returns:
-            Node features [batch, n_nodes, hidden_dim]
-        """
-        batch_size, n_nodes, window_size = x.shape
-
-        # Process each node
-        x = x.view(batch_size * n_nodes, 1, window_size)
-
-        for conv in self.conv_layers:
-            x = F.relu(conv(x))
-
-        # Pool to single vector
-        x = self.pool(x).squeeze(-1)
-
-        x = x.view(batch_size, n_nodes, -1)
-        return x
-
-
 class GDN(BaselineModel):
     """Graph Deviation Network for anomaly detection.
 
-    This model:
-    1. Learns sensor dependency graph via node embeddings
-    2. Uses graph attention for feature aggregation
-    3. Forecasts next values based on graph context
-    4. Computes attention-weighted deviation scores
+    Fixed implementation:
+    - Forecasting model: predict next timestep (Bug fix #1)
+    - Raw windowed features as input (Bug fix #2)
+    - Validation-based normalization for scoring (Bug fix #3)
     """
 
     def __init__(
@@ -191,22 +116,13 @@ class GDN(BaselineModel):
         n_heads: int = 4,
         topk: int = 10,
         dropout: float = 0.1,
+        n_measurement_vars: int = None,
     ):
-        """Initialize GDN model.
-
-        Args:
-            n_features: Number of sensors/nodes
-            window_size: Temporal window size
-            embed_dim: Node embedding dimension
-            hidden_dim: Hidden layer dimension
-            n_heads: Number of attention heads
-            topk: Number of neighbors in learned graph
-            dropout: Dropout rate
-        """
         super().__init__(
             name="GDN",
             n_features=n_features,
             window_size=window_size,
+            n_measurement_vars=n_measurement_vars,
         )
 
         self.embed_dim = embed_dim
@@ -220,11 +136,10 @@ class GDN(BaselineModel):
             topk=topk,
         )
 
-        # Feature encoder
-        self.feature_encoder = FeatureEncoder(
-            window_size=window_size,
-            hidden_dim=hidden_dim,
-        )
+        # Feature projection: raw window -> hidden_dim per node
+        # Bug fix #2: use linear projection on raw features, not CNN
+        # Input is W-1 timesteps (we hold out last for target)
+        self.feature_proj = nn.Linear(window_size - 1, hidden_dim)
 
         # Graph attention
         self.gat = GraphAttentionLayer(
@@ -234,62 +149,67 @@ class GDN(BaselineModel):
             dropout=dropout,
         )
 
-        # Prediction head (forecast next window)
+        # Prediction head: forecast 1 value per node (Bug fix #1)
         self.predictor = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, window_size),
+            nn.Linear(hidden_dim, 1),
         )
 
         # For storing learned graph
         self._adj = None
-        self._attention_weights = None
+
+        # Validation-based normalization statistics (Bug fix #3)
+        self.register_buffer('_val_median', torch.zeros(n_features))
+        self.register_buffer('_val_iqr', torch.ones(n_features))
+        self._val_stats_computed = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass for reconstruction/forecasting.
+        """Forward pass for forecasting.
 
-        Args:
-            x: Input [batch, n_features, window_size]
+        Input: [batch, n_features, window_size]
+        Uses x[:, :, :-1] as input, predicts x[:, :, -1]
 
         Returns:
-            Prediction [batch, n_features, window_size]
+            Prediction [batch, n_features, 1]
         """
-        # Learn graph structure
-        adj, sim = self.graph_learner()
-        self._adj = adj
-        self._attention_weights = sim
+        # Split input/target: use first W-1 steps as input
+        x_input = x[:, :, :-1]  # [batch, n_features, W-1]
 
-        # Encode temporal features
-        node_features = self.feature_encoder(x)  # [batch, n_nodes, hidden_dim]
+        # Learn graph structure
+        adj, _ = self.graph_learner()
+        self._adj = adj
+
+        # Project each node's time series to hidden dim
+        node_features = self.feature_proj(x_input)  # [batch, n_features, hidden_dim]
 
         # Graph attention aggregation
         graph_features = self.gat(node_features, adj)
 
-        # Predict output
-        predictions = self.predictor(graph_features)  # [batch, n_nodes, window_size]
+        # Predict next timestep for each node
+        predictions = self.predictor(graph_features)  # [batch, n_features, 1]
 
         return predictions
 
     def compute_loss(
         self,
         x: torch.Tensor,
-        recon: torch.Tensor,
+        pred: torch.Tensor,
         **kwargs
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute forecasting loss.
 
         Args:
-            x: Original input (target for forecasting)
-            recon: Predicted output
-
-        Returns:
-            Tuple of (loss, loss_components)
+            x: Full input [batch, n_features, window_size] (target = last step)
+            pred: Predicted output [batch, n_features, 1]
         """
-        # MSE loss
-        mse_loss = F.mse_loss(recon, x, reduction='mean')
+        # Target is last timestep
+        target = x[:, :, -1:]  # [batch, n_features, 1]
 
-        # Graph regularization (encourage sparsity)
+        mse_loss = F.mse_loss(pred, target, reduction='mean')
+
+        # Graph regularization
         if self._adj is not None:
             graph_reg = torch.norm(self._adj, p=1) / (self.n_features ** 2)
         else:
@@ -303,44 +223,140 @@ class GDN(BaselineModel):
             'total_loss': total_loss,
         }
 
+    def _compute_val_normalization(self, val_loader, device):
+        """Compute per-node median and IQR from validation set (Bug fix #3)."""
+        self.eval()
+        all_errors = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                x = self._extract_batch(batch, device)
+                pred = self.forward(x)
+                target = x[:, :, -1:]
+
+                # Per-node absolute error [batch, n_features]
+                errors = torch.abs(pred - target).squeeze(-1)
+                all_errors.append(errors.cpu())
+
+        all_errors = torch.cat(all_errors, dim=0)  # [N, n_features]
+
+        # Per-node median and IQR
+        self._val_median = all_errors.median(dim=0).values.to(device)
+        q75 = torch.quantile(all_errors.float(), 0.75, dim=0).to(device)
+        q25 = torch.quantile(all_errors.float(), 0.25, dim=0).to(device)
+        self._val_iqr = (q75 - q25).clamp(min=1e-8)
+        self._val_stats_computed = True
+
+    def compute_per_feature_residuals(self, data_loader, device):
+        """Override: GDN forecasts next timestep, so residual = |target - pred|."""
+        self.eval()
+        all_residuals = []
+
+        with torch.no_grad():
+            for batch in data_loader:
+                x = self._extract_batch(batch, device)
+                pred = self.forward(x)  # [batch, n_features, 1]
+                target = x[:, :, -1:]   # [batch, n_features, 1]
+
+                n_m = self.n_measurement_vars
+                # Per-feature absolute error: [batch, n_meas]
+                residuals = torch.abs(
+                    pred[:, :n_m] - target[:, :n_m]
+                ).squeeze(-1)
+                all_residuals.append(residuals.cpu().numpy())
+
+        return np.concatenate(all_residuals, axis=0)
+
     def _compute_batch_anomaly_scores(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute attention-weighted deviation scores.
+        """Compute anomaly scores with per-node normalization (Bug fix #3).
 
-        Args:
-            x: Input [batch, n_features, window_size]
-
-        Returns:
-            Anomaly scores [batch]
+        Per the paper: normalize each node's error by validation statistics,
+        then aggregate via max across nodes.
+        Only scores measurement channels.
         """
-        # Get predictions
         pred = self.forward(x)
+        target = x[:, :, -1:]  # [batch, n_features, 1]
 
-        # Per-node deviation
-        deviation = (x - pred) ** 2  # [batch, n_nodes, window_size]
-        node_scores = deviation.mean(dim=-1)  # [batch, n_nodes]
+        # Per-node absolute error
+        errors = torch.abs(pred - target).squeeze(-1)  # [batch, n_features]
 
-        # Weight by graph importance (node degree/attention)
-        if self._adj is not None:
-            # Node importance = sum of outgoing attention
-            node_importance = self._adj.sum(dim=1)  # [n_nodes]
-            node_importance = F.softmax(node_importance, dim=0)
+        n_m = self.n_measurement_vars
 
-            # Weighted sum
-            weighted_scores = node_scores * node_importance.unsqueeze(0)
-            anomaly_score = weighted_scores.sum(dim=-1)
+        if self._val_stats_computed:
+            # Normalize by validation median/IQR (Bug fix #3)
+            normalized = (errors[:, :n_m] - self._val_median[:n_m]) / self._val_iqr[:n_m]
         else:
-            anomaly_score = node_scores.mean(dim=-1)
+            normalized = errors[:, :n_m]
+
+        # Aggregate via max across measurement nodes (per paper)
+        anomaly_score = normalized.max(dim=-1).values
 
         return anomaly_score
 
+    def fit(
+        self,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        epochs: int,
+        device: torch.device,
+        learning_rate: float = 1e-3,
+        weight_decay: float = 1e-5,
+        early_stopping_patience: int = 10,
+        verbose: bool = True
+    ) -> "GDN":
+        """Train GDN and compute validation normalization statistics."""
+        # Call parent fit for training
+        self.to(device)
+        optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+
+        best_val_loss = float('inf')
+        best_state = None
+        patience_counter = 0
+
+        for epoch in range(1, epochs + 1):
+            train_loss, _ = self._train_epoch(train_loader, optimizer, device)
+            val_loss, _ = self._evaluate(val_loader, device)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {k: v.cpu().clone() for k, v in self.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if verbose and epoch % 10 == 0:
+                print(
+                    f"[{self.name}] Epoch {epoch:3d}/{epochs}: "
+                    f"Train Loss={train_loss:.6f}, Val Loss={val_loss:.6f}"
+                )
+
+            if patience_counter >= early_stopping_patience:
+                if verbose:
+                    print(f"Early stopping at epoch {epoch}")
+                break
+
+        if best_state is not None:
+            self.load_state_dict(best_state)
+
+        # Compute validation normalization statistics (Bug fix #3)
+        self._compute_val_normalization(val_loader, device)
+
+        self._is_fitted = True
+        self._train_stats['best_val_loss'] = best_val_loss
+        self._train_stats['final_epoch'] = epoch
+
+        return self
+
     def get_learned_graph(self) -> Optional[np.ndarray]:
-        """Get the learned adjacency matrix."""
         if self._adj is not None:
             return self._adj.detach().cpu().numpy()
         return None
 
     def get_model_info(self) -> Dict:
-        """Get model information."""
         info = super().get_model_info()
         info.update({
             'embed_dim': self.embed_dim,

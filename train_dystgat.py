@@ -350,6 +350,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topology-mode", type=str, default="own_error_degree",
         choices=["own_error_degree", "neighbor_propagation", "plain_error"],
         help="Topology scoring formula.")
+    parser.add_argument("--best-model-by", type=str, default="val_loss",
+        choices=["val_loss", "val_anom"],
+        help="Primary metric for best model checkpoint selection.")
+    parser.add_argument("--node-gru-input", type=str, default="raw",
+        choices=["raw", "filtered"],
+        help="GRU encoder input: 'raw' signal or 'filtered' (IDCNN-processed).")
+    parser.add_argument("--gru-activation", type=str, default="relu",
+        choices=["relu", "none"],
+        help="Activation on GRU encoder output: 'relu' or 'none'.")
+    parser.add_argument("--topology-error", type=str, default="l1",
+        choices=["l1", "l2"],
+        help="Error metric for topology scoring: 'l1' (abs) or 'l2' (squared).")
     parser.add_argument("--disable-tea", action="store_true", default=True,
         help="Disable TEA (Temporal Evidence Accumulation) metrics (default: disabled).")
     parser.add_argument("--enable-tea", dest="disable_tea", action="store_false",
@@ -486,6 +498,9 @@ def init_model(
     fuse_mode = getattr(model_args, "fuse_mode", "concat") if model_args is not None else "concat"
     divergence_type = getattr(model_args, "divergence_type", "js") if model_args is not None else "js"
     topology_mode = getattr(model_args, "topology_mode", "own_error_degree") if model_args is not None else "own_error_degree"
+    node_gru_input = getattr(model_args, "node_gru_input", "raw") if model_args is not None else "raw"
+    gru_activation = getattr(model_args, "gru_activation", "relu") if model_args is not None else "relu"
+    topology_error = getattr(model_args, "topology_error", "l1") if model_args is not None else "l1"
 
     model = DySTGAT(
         feat_input_node=1,
@@ -533,6 +548,9 @@ def init_model(
         fuse_mode=fuse_mode,
         divergence_type=divergence_type,
         topology_mode=topology_mode,
+        node_gru_input=node_gru_input,
+        gru_activation=gru_activation,
+        topology_error=topology_error,
         flip_output=(task == "reconstruction"),
         task=task,
         pred_horizon=pred_horizon,
@@ -1543,11 +1561,18 @@ def main() -> None:
                         print(f"  ↳ checkpoint saved: {checkpoint_path.name}")
 
                 improved = False
-                # Primary: val_loss; tiebreak: val_anom
-                if val_loss < best_val_loss - 1e-9:
-                    improved = True
-                elif abs(val_loss - best_val_loss) <= 1e-9 and val_score < best_val_anom:
-                    improved = True
+                if args.best_model_by == "val_anom":
+                    # Primary: val_anom; tiebreak: val_loss
+                    if val_score < best_val_anom - 1e-9:
+                        improved = True
+                    elif abs(val_score - best_val_anom) <= 1e-9 and val_loss < best_val_loss:
+                        improved = True
+                else:
+                    # Primary: val_loss; tiebreak: val_anom
+                    if val_loss < best_val_loss - 1e-9:
+                        improved = True
+                    elif abs(val_loss - best_val_loss) <= 1e-9 and val_score < best_val_anom:
+                        improved = True
 
                 if improved:
                     best_val_anom = val_score

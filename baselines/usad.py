@@ -1,13 +1,16 @@
 """USAD: UnSupervised Anomaly Detection on Multivariate Time Series.
 
 Based on: Audibert et al. 2020 - "USAD: UnSupervised Anomaly Detection on
-Multivariate Time Series"
+Multivariate Time Series" (KDD 2020)
+
+Reference: https://github.com/manigalati/usad
 
 Architecture:
 - Shared encoder E
 - Two decoders G1, G2
-- Phase 1: Train AE1 = G1(E(x)), AE2 = G2(E(G1(E(x))))
-- Phase 2: Adversarial training
+- Two optimizers: opt1 for (E, G1), opt2 for (E, G2)
+- L_AE1 = (1/n)||W - AE1(W)|| + (1-1/n)||W - AE2(AE1(W))||
+- L_AE2 = (1/n)||W - AE2(W)|| - (1-1/n)||W - AE2(AE1(W))||
 - Score: α * ||x - AE1(x)|| + β * ||x - AE2(AE1(x))||
 """
 
@@ -69,12 +72,9 @@ class USADDecoder(nn.Module):
 class USAD(BaselineModel):
     """USAD: UnSupervised Anomaly Detection.
 
-    This model uses adversarial training between two autoencoders:
-    - AE1: Standard autoencoder (E + G1)
-    - AE2: Tries to distinguish real from reconstructed (E + G2)
-
-    The adversarial objective makes AE1 produce better reconstructions
-    while AE2 learns to detect anomalies.
+    Two-optimizer adversarial training between:
+    - AE1 = G1(E(W)): standard autoencoder
+    - AE2 = G2(E(W)): second decoder that also discriminates
     """
 
     def __init__(
@@ -85,21 +85,13 @@ class USAD(BaselineModel):
         latent_dim: int = 32,
         alpha: float = 1.0,
         beta: float = 1.0,
+        n_measurement_vars: int = None,
     ):
-        """Initialize USAD model.
-
-        Args:
-            n_features: Number of input features
-            window_size: Temporal window size
-            hidden_dims: List of hidden layer dimensions
-            latent_dim: Latent space dimension
-            alpha: Weight for AE1 reconstruction loss in anomaly score
-            beta: Weight for AE2 discriminator loss in anomaly score
-        """
         super().__init__(
             name="USAD",
             n_features=n_features,
             window_size=window_size,
+            n_measurement_vars=n_measurement_vars,
         )
 
         if hidden_dims is None:
@@ -108,6 +100,7 @@ class USAD(BaselineModel):
         self.latent_dim = latent_dim
         self.alpha = alpha
         self.beta = beta
+        self.hidden_dims = hidden_dims
 
         # Input dimension is flattened window
         input_dim = n_features * window_size
@@ -119,9 +112,9 @@ class USAD(BaselineModel):
         self.decoder1 = USADDecoder(latent_dim, hidden_dims, input_dim)
         self.decoder2 = USADDecoder(latent_dim, hidden_dims, input_dim)
 
-        # Training epoch counter for adversarial schedule
+        # Training epoch counter
         self._epoch = 0
-        self._n_epochs = 100  # Will be set during training
+        self._n_epochs = 100
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass returning AE1 reconstruction.
@@ -133,44 +126,27 @@ class USAD(BaselineModel):
             Reconstruction [batch, n_features, window_size]
         """
         batch_size = x.shape[0]
-
-        # Flatten input
         x_flat = x.view(batch_size, -1)
-
-        # AE1: E -> G1
         z = self.encoder(x_flat)
         recon1 = self.decoder1(z)
+        return recon1.view(batch_size, self.n_features, self.window_size)
 
-        # Reshape back
-        recon = recon1.view(batch_size, self.n_features, self.window_size)
+    def forward_ae1(self, x_flat: torch.Tensor) -> torch.Tensor:
+        """AE1(W) = G1(E(W))."""
+        z = self.encoder(x_flat)
+        return self.decoder1(z)
 
-        return recon
+    def forward_ae2(self, x_flat: torch.Tensor) -> torch.Tensor:
+        """AE2(W) = G2(E(W))."""
+        z = self.encoder(x_flat)
+        return self.decoder2(z)
 
-    def forward_full(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Full forward pass returning both AE outputs.
-
-        Args:
-            x: Input tensor [batch, n_features, window_size]
-
-        Returns:
-            Tuple of (x_flat, recon1, recon2)
-        """
-        batch_size = x.shape[0]
-
-        # Flatten
-        x_flat = x.view(batch_size, -1)
-
-        # AE1: x -> E -> G1
+    def forward_ae2_ae1(self, x_flat: torch.Tensor) -> torch.Tensor:
+        """AE2(AE1(W)) = G2(E(G1(E(W))))."""
         z = self.encoder(x_flat)
         recon1 = self.decoder1(z)
-
-        # AE2: recon1 -> E -> G2
         z_recon = self.encoder(recon1)
-        recon2 = self.decoder2(z_recon)
-
-        return x_flat, recon1, recon2
+        return self.decoder2(z_recon)
 
     def compute_loss(
         self,
@@ -178,66 +154,52 @@ class USAD(BaselineModel):
         recon: torch.Tensor,
         **kwargs
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute USAD training loss.
+        """Not used directly - training uses two-optimizer loop.
 
-        The loss varies based on training phase (epoch number).
-        Phase 1: Standard AE reconstruction
-        Phase 2: Adversarial training
-
-        Args:
-            x: Original input [batch, n_features, window_size]
-            recon: Not used (we compute full forward here)
-
-        Returns:
-            Tuple of (total_loss, loss_components)
+        This computes a combined loss for validation purposes only.
         """
-        # Full forward pass
-        x_flat, recon1, recon2 = self.forward_full(x)
+        batch_size = x.shape[0]
+        x_flat = x.view(batch_size, -1)
 
-        # Reconstruction losses
-        loss_ae1 = F.mse_loss(recon1, x_flat)  # AE1 wants to reconstruct x
-        loss_ae2_real = F.mse_loss(recon2, x_flat)  # AE2 also reconstructs from AE1's output
+        ae1_out = self.forward_ae1(x_flat)
+        ae2_out = self.forward_ae2(x_flat)
+        ae2_ae1_out = self.forward_ae2_ae1(x_flat)
 
-        # Adversarial component: schedule based on epoch
-        # n = epoch / total_epochs
-        n = self._epoch / max(self._n_epochs, 1)
+        n = 1.0 / max(self._epoch, 1)
 
-        # AE1 loss: minimize reconstruction + fool AE2
-        # AE2 loss: minimize its reconstruction + catch AE1's fakes
-        loss_ae1_total = (1 - n) * loss_ae1 + n * loss_ae2_real
-        loss_ae2_total = (1 - n) * loss_ae2_real + n * loss_ae1
+        loss_ae1 = n * F.mse_loss(ae1_out, x_flat) + (1 - n) * F.mse_loss(ae2_ae1_out, x_flat)
+        loss_ae2 = n * F.mse_loss(ae2_out, x_flat) - (1 - n) * F.mse_loss(ae2_ae1_out, x_flat)
 
-        # Combined loss (we train both simultaneously)
-        total_loss = loss_ae1_total + loss_ae2_total
+        total_loss = loss_ae1 + loss_ae2
 
-        loss_components = {
+        return total_loss, {
             'loss_ae1': loss_ae1,
-            'loss_ae2': loss_ae2_real,
+            'loss_ae2': loss_ae2,
             'total_loss': total_loss,
         }
-
-        return total_loss, loss_components
 
     def _compute_batch_anomaly_scores(self, x: torch.Tensor) -> torch.Tensor:
         """Compute USAD anomaly scores.
 
         Score = α * ||x - AE1(x)|| + β * ||x - AE2(AE1(x))||
-
-        Args:
-            x: Input tensor [batch, n_features, window_size]
-
-        Returns:
-            Anomaly scores [batch]
+        Scored on measurement channels only.
         """
-        x_flat, recon1, recon2 = self.forward_full(x)
+        batch_size = x.shape[0]
+        x_flat = x.view(batch_size, -1)
 
-        # Per-sample reconstruction errors
-        error_ae1 = torch.mean((x_flat - recon1) ** 2, dim=-1)
-        error_ae2 = torch.mean((x_flat - recon2) ** 2, dim=-1)
+        ae1_out = self.forward_ae1(x_flat)
+        ae2_ae1_out = self.forward_ae2_ae1(x_flat)
 
-        # Combined anomaly score
+        # Reshape back
+        ae1_recon = ae1_out.view(batch_size, self.n_features, self.window_size)
+        ae2_ae1_recon = ae2_ae1_out.view(batch_size, self.n_features, self.window_size)
+
+        # Score only on measurement channels
+        n_m = self.n_measurement_vars
+        error_ae1 = torch.mean((x[:, :n_m] - ae1_recon[:, :n_m]) ** 2, dim=(1, 2))
+        error_ae2 = torch.mean((x[:, :n_m] - ae2_ae1_recon[:, :n_m]) ** 2, dim=(1, 2))
+
         anomaly_score = self.alpha * error_ae1 + self.beta * error_ae2
-
         return anomaly_score
 
     def fit(
@@ -251,27 +213,26 @@ class USAD(BaselineModel):
         early_stopping_patience: int = 10,
         verbose: bool = True
     ) -> "USAD":
-        """Train USAD with epoch-based adversarial scheduling.
+        """Train USAD with two-optimizer adversarial training.
 
-        Args:
-            train_loader: Training data loader
-            val_loader: Validation data loader
-            epochs: Number of epochs
-            device: Training device
-            learning_rate: Learning rate
-            weight_decay: L2 regularization
-            early_stopping_patience: Patience for early stopping
-            verbose: Print progress
-
-        Returns:
-            Self
+        Per the paper:
+        - opt1 updates E + G1 with L_AE1
+        - opt2 updates E + G2 with L_AE2
+        - Epoch schedule: n = 1/epoch (harmonic)
         """
         self._n_epochs = epochs
         self._epoch = 0
 
         self.to(device)
-        optimizer = torch.optim.Adam(
-            self.parameters(),
+
+        # Two separate optimizers (Bug fix #1)
+        opt1 = torch.optim.Adam(
+            list(self.encoder.parameters()) + list(self.decoder1.parameters()),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+        opt2 = torch.optim.Adam(
+            list(self.encoder.parameters()) + list(self.decoder2.parameters()),
             lr=learning_rate,
             weight_decay=weight_decay
         )
@@ -283,8 +244,13 @@ class USAD(BaselineModel):
         for epoch in range(1, epochs + 1):
             self._epoch = epoch
 
+            # Harmonic schedule: n = 1/epoch (Bug fix #4)
+            n = 1.0 / epoch
+
             # Training
-            train_loss = self._train_epoch_usad(train_loader, optimizer, device)
+            train_loss = self._train_epoch_usad(
+                train_loader, opt1, opt2, n, device
+            )
 
             # Validation
             val_loss = self._evaluate_usad(val_loader, device)
@@ -319,33 +285,55 @@ class USAD(BaselineModel):
     def _train_epoch_usad(
         self,
         train_loader: DataLoader,
-        optimizer: torch.optim.Optimizer,
-        device: torch.device
+        opt1: torch.optim.Optimizer,
+        opt2: torch.optim.Optimizer,
+        n: float,
+        device: torch.device,
     ) -> float:
-        """Run one USAD training epoch."""
+        """Run one USAD training epoch with two-optimizer loop.
+
+        Per the paper, each batch has two separate forward/backward passes:
+        1. Forward pass 1: compute L_AE1, update E + G1
+        2. Forward pass 2: compute L_AE2, update E + G2
+        """
         self.train()
         total_loss = 0.0
         n_batches = 0
 
         for batch in train_loader:
-            optimizer.zero_grad()
+            x = self._extract_batch(batch, device)
+            batch_size = x.shape[0]
+            x_flat = x.view(batch_size, -1)
 
-            # Handle PyG Data objects
-            if hasattr(batch, 'x'):
-                x = batch.x.to(device)
-                batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
-                n_nodes = x.shape[0] // batch_size
-                x = x.view(batch_size, n_nodes, -1)
-            else:
-                x = batch[0].to(device)
+            # === Forward pass 1: Update E + G1 (Bug fix #5) ===
+            opt1.zero_grad()
 
-            # Compute loss
-            loss, _ = self.compute_loss(x, None)
+            ae1_out = self.forward_ae1(x_flat)
+            ae2_ae1_out = self.forward_ae2_ae1(x_flat)
 
-            loss.backward()
-            optimizer.step()
+            # L_AE1 = (1/n)||W - AE1(W)|| + (1-1/n)||W - AE2(AE1(W))||
+            loss_ae1 = (n * F.mse_loss(ae1_out, x_flat)
+                        + (1 - n) * F.mse_loss(ae2_ae1_out, x_flat))
 
-            total_loss += loss.item()
+            loss_ae1.backward()
+            opt1.step()
+
+            # === Forward pass 2: Update E + G2 (Bug fix #5) ===
+            opt2.zero_grad()
+
+            # Fresh forward pass (Bug fix #5: separate forward passes)
+            ae2_out = self.forward_ae2(x_flat)  # Bug fix #2: AE2(W) term
+            ae2_ae1_out = self.forward_ae2_ae1(x_flat)
+
+            # L_AE2 = (1/n)||W - AE2(W)|| - (1-1/n)||W - AE2(AE1(W))||
+            # Bug fix #3: minus sign
+            loss_ae2 = (n * F.mse_loss(ae2_out, x_flat)
+                        - (1 - n) * F.mse_loss(ae2_ae1_out, x_flat))
+
+            loss_ae2.backward()
+            opt2.step()
+
+            total_loss += (loss_ae1.item() + loss_ae2.item())
             n_batches += 1
 
         return total_loss / n_batches
@@ -358,22 +346,22 @@ class USAD(BaselineModel):
 
         with torch.no_grad():
             for batch in data_loader:
-                if hasattr(batch, 'x'):
-                    x = batch.x.to(device)
-                    batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else 1
-                    n_nodes = x.shape[0] // batch_size
-                    x = x.view(batch_size, n_nodes, -1)
-                else:
-                    x = batch[0].to(device)
+                x = self._extract_batch(batch, device)
+                batch_size = x.shape[0]
+                x_flat = x.view(batch_size, -1)
 
-                loss, _ = self.compute_loss(x, None)
+                ae1_out = self.forward_ae1(x_flat)
+                ae2_ae1_out = self.forward_ae2_ae1(x_flat)
+
+                # Validation loss: reconstruction quality
+                loss = F.mse_loss(ae1_out, x_flat) + F.mse_loss(ae2_ae1_out, x_flat)
+
                 total_loss += loss.item()
                 n_batches += 1
 
         return total_loss / n_batches
 
     def get_model_info(self) -> Dict:
-        """Get model information."""
         info = super().get_model_info()
         info.update({
             'latent_dim': self.latent_dim,

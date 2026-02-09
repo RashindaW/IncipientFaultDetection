@@ -134,6 +134,7 @@ def _create_dataloaders(
     fault_keys: List[str] | None = None,
     pred_horizon: int | None = None,
     max_time_gap: float = 12.0,
+    **kwargs,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     """
     Create train, validation, and test dataloaders for ASHRAE dataset.

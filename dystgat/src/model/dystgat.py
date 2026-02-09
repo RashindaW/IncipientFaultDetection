@@ -532,7 +532,7 @@ class TemporalGraph(nn.Module):
         return None
 
 class GRUEncoder(nn.Module):
-    def __init__(self, in_channels, out_channels, norm_func=None, mode='univariate', dropout=0.0):
+    def __init__(self, in_channels, out_channels, norm_func=None, mode='univariate', dropout=0.0, activation='relu'):
         super().__init__()
         self.mode = mode
         if mode == 'univariate':
@@ -542,6 +542,7 @@ class GRUEncoder(nn.Module):
 
         self.norm = norm_func(out_channels) if norm_func else nn.Identity()
         self.feat_dropout = nn.Dropout(dropout)
+        self.activation = F.relu if activation == 'relu' else lambda x: x
         
     def forward(self, x, h0=None):
         # x: [batch, nodes, window] (univariate) or [batch, window, feats] (multivariate)
@@ -555,8 +556,7 @@ class GRUEncoder(nn.Module):
                 h0 = h0.unsqueeze(0)
             out, h = self.gru(x, h0)
             # h: [1, b*n, out_dim]
-            # Paper: h_j^ti = ReLU(GRU-Cell(x_j^ti, h_j^(ti-1)))
-            h = self.feat_dropout(F.relu(h.squeeze(0))).view(b, n, -1)
+            h = self.feat_dropout(self.activation(h.squeeze(0))).view(b, n, -1)
             if not isinstance(self.norm, nn.Identity):
                 h_flat = h.reshape(b * n, -1)
                 if isinstance(self.norm, GraphNorm):
@@ -571,8 +571,7 @@ class GRUEncoder(nn.Module):
             if h0 is not None:
                 h0 = h0.unsqueeze(0)
             out, h = self.gru(x, h0)
-            # Paper: h_j^ti = ReLU(GRU-Cell(x_j^ti, h_j^(ti-1)))
-            h = self.feat_dropout(F.relu(h.squeeze(0)))
+            h = self.feat_dropout(self.activation(h.squeeze(0)))
             if not isinstance(self.norm, nn.Identity):
                 if isinstance(self.norm, GraphNorm):
                     batch = torch.arange(h.size(0), device=h.device)
@@ -855,6 +854,9 @@ class DySTGAT(nn.Module):
         fuse_mode="concat",  # concat | sum | gated
         divergence_type="js",  # js | kl
         topology_mode="own_error_degree",  # own_error_degree | neighbor_propagation | plain_error
+        node_gru_input="raw",  # raw | filtered (IDCNN-processed)
+        gru_activation="relu",  # relu | none
+        topology_error="l1",  # l1 (abs) | l2 (squared)
         task="reconstruction",  # reconstruction | prediction
         pred_horizon=0,
     ):
@@ -869,6 +871,8 @@ class DySTGAT(nn.Module):
         self.fuse_mode = fuse_mode
         self.divergence_type = divergence_type
         self.topology_mode = topology_mode
+        self.node_gru_input = node_gru_input
+        self.topology_error = topology_error
         self.task = task
         self.pred_horizon = pred_horizon
         self.div_eps = 1e-8
@@ -885,6 +889,7 @@ class DySTGAT(nn.Module):
                 norm_func=NORM_LAYER_DICT[encoder_norm_type] if do_encoder_norm else None,
                 mode='multivariate',
                 dropout=feat_dropout,
+                activation=gru_activation,
             )
             # Backward OC encoder for decoder initialization (paper requirement)
             self.backward_oc_encoder = BackwardOCEncoder(
@@ -905,6 +910,7 @@ class DySTGAT(nn.Module):
             norm_func=NORM_LAYER_DICT[encoder_norm_type] if do_encoder_norm else None,
             mode=node_encoder_mode,
             dropout=feat_dropout,
+            activation=gru_activation,
         )
         self.idcnn = IDCNN(in_channels=1, hidden_channels=16, out_channels=1, kernel_size=3, num_layers=2)
 
@@ -1136,9 +1142,10 @@ class DySTGAT(nn.Module):
         # IDCNN for edge construction only (paper requirement)
         x_idcnn = self.idcnn(x_nodes.view(b * n_nodes, 1, -1)).view(b, n_nodes, -1)
 
-        # Node GRU takes RAW x (paper requirement)
+        # Node GRU input: raw signal (default) or IDCNN-filtered
+        gru_input = x_idcnn if self.node_gru_input == "filtered" else x_nodes
         h_temp = self.node_encoder(
-            x_nodes,
+            gru_input,
             h0=context_expanded if self.aug_control else None,
         )           # [B, N, Dim]
         h_temp = torch.nan_to_num(h_temp, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1432,6 +1439,12 @@ class DySTGAT(nn.Module):
 
         return per_graph.mean(), per_graph.detach()
 
+    def _node_error(self, x_true: torch.Tensor, x_recon: torch.Tensor) -> torch.Tensor:
+        """Compute per-node error using configured metric (l1 or l2)."""
+        if self.topology_error == "l2":
+            return ((x_true - x_recon) ** 2).mean(dim=-1)
+        return (x_true - x_recon).abs().mean(dim=-1)
+
     def _topology_scores_per_graph(
         self,
         x_true: torch.Tensor,
@@ -1457,13 +1470,13 @@ class DySTGAT(nn.Module):
         edge_index: torch.Tensor,
         edge_weight: torch.Tensor,
     ) -> torch.Tensor:
-        """Original: own error / degree (r_j = |x̂_j - x_j| / d_j)"""
+        """Original: own error / degree (r_j = err(x̂_j, x_j) / d_j)"""
         x_true, x_recon = self._align_target_and_recon(x_true, x_recon)
         n = cfg.dataset.n_nodes
         b = x_true.shape[0] // n
         device = x_true.device
 
-        node_err = (x_true - x_recon).abs().mean(dim=-1)  # [B*N]
+        node_err = self._node_error(x_true, x_recon)  # [B*N]
 
         num_nodes = node_err.numel()
         degree = torch.zeros(num_nodes, device=device, dtype=node_err.dtype)
@@ -1488,7 +1501,7 @@ class DySTGAT(nn.Module):
         x_true, x_recon = self._align_target_and_recon(x_true, x_recon)
         n = cfg.dataset.n_nodes
         b = x_true.shape[0] // n
-        node_err = (x_true - x_recon).abs().mean(dim=-1)  # [B*N]
+        node_err = self._node_error(x_true, x_recon)  # [B*N]
 
         num_nodes = node_err.numel()
         weighted_in = torch.zeros(num_nodes, device=node_err.device)
@@ -1507,11 +1520,11 @@ class DySTGAT(nn.Module):
         x_true: torch.Tensor,
         x_recon: torch.Tensor,
     ) -> torch.Tensor:
-        """Plain L1 error without topology weighting."""
+        """Plain error without topology weighting."""
         x_true, x_recon = self._align_target_and_recon(x_true, x_recon)
         n = cfg.dataset.n_nodes
         b = x_true.shape[0] // n
-        node_err = (x_true - x_recon).abs().mean(dim=-1)  # [B*N]
+        node_err = self._node_error(x_true, x_recon)  # [B*N]
         return node_err.view(b, n).mean(dim=1)
 
     def compute_topology_aware_anomaly_score(

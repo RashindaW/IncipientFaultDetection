@@ -141,6 +141,39 @@ def parse_args() -> argparse.Namespace:
         help="Sliding window stride for test (defaults to val-stride)",
     )
 
+    # Data splitting
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        default=None,
+        choices=["temporal", "window_shuffle", "segment_shuffle"],
+        help="Data splitting strategy",
+    )
+    parser.add_argument(
+        "--n-segments",
+        type=int,
+        default=10,
+        help="Number of segments for segment_shuffle mode",
+    )
+    parser.add_argument(
+        "--train-segments",
+        type=str,
+        default=None,
+        help="Comma-separated segment indices for training (e.g. '2,3,4,6,7,8,9')",
+    )
+    parser.add_argument(
+        "--val-segments",
+        type=str,
+        default=None,
+        help="Comma-separated segment indices for validation (e.g. '0,1')",
+    )
+    parser.add_argument(
+        "--test-segments",
+        type=str,
+        default=None,
+        help="Comma-separated segment indices for testing (e.g. '5')",
+    )
+
     # Device
     parser.add_argument(
         "--seed",
@@ -275,36 +308,70 @@ def resolve_device(
 def evaluate_model(
     model: BaselineModel,
     test_loaders: Dict,
-    baseline_scores: np.ndarray,
+    baseline_loader,
+    val_loader,
     device: torch.device,
     verbose: bool = True,
 ) -> Dict[str, Dict[str, float]]:
-    """Evaluate model on test datasets.
+    """Evaluate model on test datasets using unified IQR-normalized scoring.
+
+    Per the DyEdgeGAT paper (Section V.B): all baselines use GDN's scoring
+    function — per-feature residuals normalized by validation median/IQR,
+    then mean-aggregated across features.
 
     Args:
         model: Trained baseline model
         test_loaders: Dict of test data loaders
-        baseline_scores: Anomaly scores for healthy/baseline samples
+        baseline_loader: DataLoader for healthy/baseline samples
+        val_loader: DataLoader for validation set (IQR normalization params)
         device: Computation device
         verbose: Print results
 
     Returns:
         Dict mapping test set names to metrics dicts
     """
+    # Step 1: Compute IQR normalization parameters from validation set
+    val_residuals = model.compute_per_feature_residuals(val_loader, device)
+    val_median = np.median(val_residuals, axis=0)
+    val_iqr = (
+        np.percentile(val_residuals, 75, axis=0)
+        - np.percentile(val_residuals, 25, axis=0)
+    )
+    val_iqr = np.clip(val_iqr, 1e-8, None)  # avoid division by zero
+
+    if verbose:
+        print(f"  IQR normalization: median range [{val_median.min():.4f}, "
+              f"{val_median.max():.4f}], IQR range [{val_iqr.min():.4f}, "
+              f"{val_iqr.max():.4f}]")
+
+    # Step 2: Compute normalized baseline scores
+    base_residuals = model.compute_per_feature_residuals(
+        baseline_loader, device
+    )
+    baseline_scores = BaselineModel.iqr_normalize_scores(
+        base_residuals, val_median, val_iqr
+    )
+
+    if verbose:
+        print(f"  Baseline scores (IQR-norm): mean={baseline_scores.mean():.4f}, "
+              f"std={baseline_scores.std():.4f}")
+
+    # Step 3: Evaluate each fault loader
     all_metrics = {}
 
     for name, loader in test_loaders.items():
         if name == "baseline":
-            continue  # Skip baseline loader
+            continue
 
-        # Compute anomaly scores
-        scores, labels = model.compute_anomaly_scores(
-            loader, device, return_labels=True
+        # Compute normalized fault scores
+        fault_residuals = model.compute_per_feature_residuals(loader, device)
+        fault_scores = BaselineModel.iqr_normalize_scores(
+            fault_residuals, val_median, val_iqr
         )
 
         # Compute metrics
         metrics = compute_all_metrics(
-            baseline_scores, scores, include_tea=True
+            baseline_scores, fault_scores, include_tea=True
         )
 
         all_metrics[name] = metrics
@@ -366,6 +433,35 @@ def main():
     if args.verbose:
         print(f"Dataset: {adapter.description}")
 
+    # Parse segment lists
+    train_segments = (
+        [int(s) for s in args.train_segments.split(",")]
+        if args.train_segments else None
+    )
+    val_segments = (
+        [int(s) for s in args.val_segments.split(",")]
+        if args.val_segments else None
+    )
+    test_segments = (
+        [int(s) for s in args.test_segments.split(",")]
+        if args.test_segments else None
+    )
+
+    # Build extra kwargs for segment-based splitting
+    split_kwargs = {}
+    if args.split_mode:
+        split_kwargs["split_mode"] = args.split_mode
+    if train_segments is not None:
+        split_kwargs["train_segments"] = train_segments
+    if val_segments is not None:
+        split_kwargs["val_segments"] = val_segments
+    if test_segments is not None:
+        split_kwargs["test_segments"] = test_segments
+    if args.n_segments != 10:
+        split_kwargs["n_segments"] = args.n_segments
+    if args.seed is not None:
+        split_kwargs["random_seed"] = args.seed
+
     # Create data loaders
     train_loader, val_loader, test_loaders = adapter.create_dataloaders(
         window_size=args.window_size,
@@ -376,6 +472,7 @@ def main():
         data_dir=adapter.default_data_dir,
         num_workers=args.num_workers,
         baseline_from=args.baseline_from,
+        **split_kwargs,
     )
 
     if args.verbose:
@@ -383,19 +480,31 @@ def main():
         print(f"Val batches: {len(val_loader)}")
         print(f"Test loaders: {list(test_loaders.keys())}")
 
-    # Get number of features from data
+    # Get number of features from data (measurement + control)
     sample_batch = next(iter(train_loader))
     if hasattr(sample_batch, 'x'):
         # PyG format
         batch_size = sample_batch.num_graphs if hasattr(sample_batch, 'num_graphs') else 1
-        n_features = sample_batch.x.shape[0] // batch_size
+        n_measurement = sample_batch.x.shape[0] // batch_size
         window_size = sample_batch.x.shape[1]
+        # Check for control variables
+        n_control = 0
+        if hasattr(sample_batch, 'c') and sample_batch.c is not None:
+            c = sample_batch.c
+            if c.dim() == 2:
+                n_control = c.shape[0] // batch_size
+            elif c.dim() == 3:
+                n_control = c.shape[1]
+        n_features = n_measurement + n_control
     else:
         n_features = sample_batch[0].shape[1]
+        n_measurement = n_features
+        n_control = 0
         window_size = sample_batch[0].shape[2]
 
     if args.verbose:
-        print(f"Features: {n_features}, Window size: {window_size}")
+        print(f"Measurement vars: {n_measurement}, Control vars: {n_control}, "
+              f"Total features: {n_features}, Window size: {window_size}")
 
     # Create model
     method_hyperparams = get_default_hyperparams(args.method)
@@ -405,6 +514,7 @@ def main():
         args.method,
         n_features=n_features,
         window_size=window_size,
+        n_measurement_vars=n_measurement,
         **method_hyperparams,
     )
 
@@ -459,22 +569,13 @@ def main():
             print(f"Evaluation")
             print(f"{'='*50}")
 
-        # Get baseline scores
-        if "baseline" in test_loaders:
-            baseline_scores = model.compute_anomaly_scores(
-                test_loaders["baseline"], device
-            )
-        else:
-            # Use validation as baseline
-            baseline_scores = model.compute_anomaly_scores(val_loader, device)
+        # Get baseline loader
+        baseline_loader = test_loaders.get("baseline", val_loader)
 
-        if args.verbose:
-            print(f"Baseline scores: mean={baseline_scores.mean():.4f}, "
-                  f"std={baseline_scores.std():.4f}")
-
-        # Evaluate on fault datasets
+        # Evaluate on fault datasets with unified IQR-normalized scoring
         all_metrics = evaluate_model(
-            model, test_loaders, baseline_scores, device, verbose=args.verbose
+            model, test_loaders, baseline_loader, val_loader,
+            device, verbose=args.verbose
         )
 
         # Save metrics

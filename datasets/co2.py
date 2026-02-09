@@ -47,6 +47,7 @@ def _create_dataloaders(
     feature_option: str | None = None,
     fault_keys: List[str] | None = None,
     pred_horizon: int | None = None,
+    **kwargs,
 ):
     return create_dataloaders(
         window_size=window_size,

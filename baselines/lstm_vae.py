@@ -158,6 +158,7 @@ class LSTMVAE(BaselineModel):
         num_layers: int = 2,
         dropout: float = 0.1,
         beta: float = 1.0,
+        n_measurement_vars: int = None,
     ):
         """Initialize LSTM-VAE model.
 
@@ -169,11 +170,13 @@ class LSTMVAE(BaselineModel):
             num_layers: Number of LSTM layers
             dropout: Dropout rate
             beta: Weight for KL divergence term (β-VAE)
+            n_measurement_vars: Number of measurement vars for scoring
         """
         super().__init__(
             name="LSTM-VAE",
             n_features=n_features,
             window_size=window_size,
+            n_measurement_vars=n_measurement_vars,
         )
 
         self.hidden_dim = hidden_dim
@@ -310,6 +313,8 @@ class LSTMVAE(BaselineModel):
     def _compute_batch_anomaly_scores(self, x: torch.Tensor) -> torch.Tensor:
         """Compute anomaly scores based on reconstruction probability.
 
+        Scores only on measurement channels (excludes control variables).
+
         Args:
             x: Input tensor [batch, n_features, window_size]
 
@@ -319,8 +324,9 @@ class LSTMVAE(BaselineModel):
         # Forward pass
         recon = self.forward(x)
 
-        # Reconstruction error per sample
-        recon_error = torch.mean((x - recon) ** 2, dim=(1, 2))
+        # Reconstruction error per sample (measurement channels only)
+        n_m = self.n_measurement_vars
+        recon_error = torch.mean((x[:, :n_m] - recon[:, :n_m]) ** 2, dim=(1, 2))
 
         # KL divergence per sample
         kl_per_sample = -0.5 * torch.sum(
@@ -329,7 +335,6 @@ class LSTMVAE(BaselineModel):
         )
 
         # Combined anomaly score (negative log-likelihood proxy)
-        # Higher score = more anomalous
         anomaly_score = recon_error + self.beta * kl_per_sample
 
         return anomaly_score

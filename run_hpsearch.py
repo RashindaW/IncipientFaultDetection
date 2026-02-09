@@ -239,11 +239,21 @@ IMS_RAW_ORIGINAL_CONFIG = {
 PRONTO_BASE_CONFIG = {
     # Dataset
     "dataset-key": "pronto",
+    # Segment-based splitting
+    "split-mode": "segment_shuffle",
+    "n-segments": 10,
+    "split-ratios": "0.7,0.2,0.1",
+    "data-seed": 42,
     # Training
     "epochs": 100,
     "batch-size": 64,
     "learning-rate": 3e-4,
     "weight-decay": 1e-5,
+    "early-stopping": True,
+    "patience": 20,
+    "dropout": 0.0,
+    "grad-clip-norm": 1.0,
+    "lr-scheduler": "none",
     # Window (small for process data)
     "window-size": 15,
     "train-stride": 1,
@@ -260,6 +270,10 @@ PRONTO_BASE_CONFIG = {
     # Loss
     "anomaly-weight": 1.0,
     "lambda-div": 0.2,
+    "loss-type": "l1",
+    "div-fusion-beta": 0.0,
+    # Scoring
+    "topology-mode": "own_error_degree",
     # Task
     "task": "reconstruction",
     # AMP
@@ -885,6 +899,365 @@ def define_experiments(dataset_key: str = "ashrae") -> List[Dict[str, Any]]:
         },
     })
 
+    # =========================================================================
+    # Segment Variations (IDs 41-50) -- PRONTO-focused but applied to all
+    # =========================================================================
+
+    # Data-seed variations (6 different random 7/2/1 segment assignments)
+    for exp_id, seed_val in [(41, 0), (42, 7), (43, 99), (44, 123), (45, 256), (46, 512)]:
+        experiments.append({
+            "id": exp_id,
+            "name": f"seg_seed{seed_val}",
+            "category": "segment",
+            "description": f"Segment shuffle with data-seed={seed_val}",
+            "overrides": {"data-seed": seed_val},
+        })
+
+    # Explicit segment placement (4 positional tests)
+    experiments.append({
+        "id": 47,
+        "name": "seg_early_test",
+        "category": "segment",
+        "description": "Early segment (1) as test set",
+        "overrides": {
+            "train-segments": "2,3,4,5,6,7,8",
+            "val-segments": "0,9",
+            "test-segments": "1",
+        },
+    })
+
+    experiments.append({
+        "id": 48,
+        "name": "seg_mid_test",
+        "category": "segment",
+        "description": "Mid segment (5) as test set",
+        "overrides": {
+            "train-segments": "0,1,2,3,7,8,9",
+            "val-segments": "4,6",
+            "test-segments": "5",
+        },
+    })
+
+    experiments.append({
+        "id": 49,
+        "name": "seg_late_test",
+        "category": "segment",
+        "description": "Late segment (9) as test set",
+        "overrides": {
+            "train-segments": "0,1,2,3,4,5,6",
+            "val-segments": "7,8",
+            "test-segments": "9",
+        },
+    })
+
+    experiments.append({
+        "id": 50,
+        "name": "seg_scattered_val",
+        "category": "segment",
+        "description": "Scattered validation segments (2,8)",
+        "overrides": {
+            "train-segments": "0,1,3,4,6,7,9",
+            "val-segments": "2,8",
+            "test-segments": "5",
+        },
+    })
+
+    # =========================================================================
+    # Regularization (IDs 51-67)
+    # =========================================================================
+    experiments.append({
+        "id": 51,
+        "name": "loss_l2",
+        "category": "regularization",
+        "description": "L2 (MSE) reconstruction loss",
+        "overrides": {"loss-type": "l2"},
+    })
+
+    experiments.append({
+        "id": 52,
+        "name": "sched_cosine",
+        "category": "regularization",
+        "description": "Cosine annealing LR scheduler",
+        "overrides": {"lr-scheduler": "cosine"},
+    })
+
+    experiments.append({
+        "id": 53,
+        "name": "sched_plateau",
+        "category": "regularization",
+        "description": "ReduceLROnPlateau scheduler",
+        "overrides": {"lr-scheduler": "plateau"},
+    })
+
+    experiments.append({
+        "id": 54,
+        "name": "dropout_01",
+        "category": "regularization",
+        "description": "Dropout 0.1",
+        "overrides": {"dropout": 0.1},
+    })
+
+    experiments.append({
+        "id": 55,
+        "name": "dropout_02",
+        "category": "regularization",
+        "description": "Dropout 0.2",
+        "overrides": {"dropout": 0.2},
+    })
+
+    experiments.append({
+        "id": 56,
+        "name": "dropout_03",
+        "category": "regularization",
+        "description": "Dropout 0.3",
+        "overrides": {"dropout": 0.3},
+    })
+
+    experiments.append({
+        "id": 57,
+        "name": "gradclip_0",
+        "category": "regularization",
+        "description": "No gradient clipping",
+        "overrides": {"grad-clip-norm": 0.0},
+    })
+
+    experiments.append({
+        "id": 58,
+        "name": "gradclip_05",
+        "category": "regularization",
+        "description": "Gradient clip norm 0.5",
+        "overrides": {"grad-clip-norm": 0.5},
+    })
+
+    experiments.append({
+        "id": 59,
+        "name": "gradclip_5",
+        "category": "regularization",
+        "description": "Gradient clip norm 5.0",
+        "overrides": {"grad-clip-norm": 5.0},
+    })
+
+    experiments.append({
+        "id": 60,
+        "name": "topo_neighbor",
+        "category": "regularization",
+        "description": "Neighbor-propagation topology scoring",
+        "overrides": {"topology-mode": "neighbor_propagation"},
+    })
+
+    experiments.append({
+        "id": 61,
+        "name": "topo_plain",
+        "category": "regularization",
+        "description": "Plain error topology scoring",
+        "overrides": {"topology-mode": "plain_error"},
+    })
+
+    experiments.append({
+        "id": 62,
+        "name": "divbeta_02",
+        "category": "regularization",
+        "description": "Divergence fusion beta=0.2",
+        "overrides": {"div-fusion-beta": 0.2},
+    })
+
+    experiments.append({
+        "id": 63,
+        "name": "divbeta_05",
+        "category": "regularization",
+        "description": "Divergence fusion beta=0.5",
+        "overrides": {"div-fusion-beta": 0.5},
+    })
+
+    experiments.append({
+        "id": 64,
+        "name": "divbeta_10",
+        "category": "regularization",
+        "description": "Divergence fusion beta=1.0",
+        "overrides": {"div-fusion-beta": 1.0},
+    })
+
+    experiments.append({
+        "id": 65,
+        "name": "patience_10",
+        "category": "regularization",
+        "description": "Early stopping with patience=10",
+        "overrides": {"early-stopping": True, "patience": 10},
+    })
+
+    experiments.append({
+        "id": 66,
+        "name": "patience_30",
+        "category": "regularization",
+        "description": "Early stopping with patience=30",
+        "overrides": {"early-stopping": True, "patience": 30},
+    })
+
+    experiments.append({
+        "id": 67,
+        "name": "no_early_stop",
+        "category": "regularization",
+        "description": "No early stopping (full epochs)",
+        "overrides": {"early-stopping": False},
+    })
+
+    # =========================================================================
+    # Cross-Validation Folds (IDs 68-72)
+    # =========================================================================
+    cv_folds = [
+        (68, "cv_fold1", "0,1,2,3,4,5,6,7", "8", "9"),
+        (69, "cv_fold2", "0,1,2,3,4,5,8,9", "6", "7"),
+        (70, "cv_fold3", "0,1,2,3,6,7,8,9", "4", "5"),
+        (71, "cv_fold4", "0,1,4,5,6,7,8,9", "2", "3"),
+        (72, "cv_fold5", "2,3,4,5,6,7,8,9", "0", "1"),
+    ]
+    for exp_id, name, train_seg, val_seg, test_seg in cv_folds:
+        experiments.append({
+            "id": exp_id,
+            "name": name,
+            "category": "cross_validation",
+            "description": f"CV fold: test={test_seg}, val={val_seg}",
+            "overrides": {
+                "train-segments": train_seg,
+                "val-segments": val_seg,
+                "test-segments": test_seg,
+            },
+        })
+
+    # =========================================================================
+    # Ablation Extras (IDs 73-74)
+    # =========================================================================
+    experiments.append({
+        "id": 73,
+        "name": "share_gnn",
+        "category": "ablation",
+        "description": "Shared GNN weights between temporal and spectral",
+        "overrides": {"share-gnn-weights": True},
+    })
+
+    experiments.append({
+        "id": 74,
+        "name": "no_freq_log",
+        "category": "ablation",
+        "description": "Disable log-frequency scaling",
+        "overrides": {"freq-use-log": False},
+    })
+
+    # =========================================================================
+    # Combination Experiments (IDs 75-80)
+    # =========================================================================
+    experiments.append({
+        "id": 75,
+        "name": "combo_regularized_v2",
+        "category": "combination",
+        "description": "Dropout + cosine + early stopping",
+        "overrides": {
+            "dropout": 0.1,
+            "lr-scheduler": "cosine",
+            "early-stopping": True,
+            "patience": 15,
+        },
+    })
+
+    experiments.append({
+        "id": 76,
+        "name": "combo_l2_plateau",
+        "category": "combination",
+        "description": "L2 loss + plateau scheduler + lr=5e-4",
+        "overrides": {
+            "loss-type": "l2",
+            "lr-scheduler": "plateau",
+            "learning-rate": 5e-4,
+        },
+    })
+
+    experiments.append({
+        "id": 77,
+        "name": "combo_topo_divfuse",
+        "category": "combination",
+        "description": "Neighbor-prop + div-beta=0.3 + anomaly-wt=2.0",
+        "overrides": {
+            "topology-mode": "neighbor_propagation",
+            "div-fusion-beta": 0.3,
+            "anomaly-weight": 2.0,
+        },
+    })
+
+    experiments.append({
+        "id": 78,
+        "name": "combo_gated_spectral",
+        "category": "combination",
+        "description": "Gated fusion + cosine + dropout + embed=32",
+        "overrides": {
+            "fuse-mode": "gated",
+            "lr-scheduler": "cosine",
+            "dropout": 0.1,
+            "freq-embed-dim": 32,
+        },
+    })
+
+    experiments.append({
+        "id": 79,
+        "name": "combo_lean_fast",
+        "category": "combination",
+        "description": "Fast lean model: 50 epochs, lr=8e-4, no spectral",
+        "overrides": {
+            "epochs": epochs_short,
+            "learning-rate": 8e-4,
+            "use-spectral-view": False,
+            "lambda-div": 0.0,
+        },
+    })
+
+    experiments.append({
+        "id": 80,
+        "name": "combo_full_segment",
+        "category": "combination",
+        "description": "15-segment split + dropout + plateau + neighbor-prop",
+        "overrides": {
+            "n-segments": 15,
+            "split-ratios": "0.8,0.1,0.1",
+            "dropout": 0.1,
+            "lr-scheduler": "plateau",
+            "topology-mode": "neighbor_propagation",
+        },
+    })
+
+    # =========================================================================
+    # Segment Sweep (IDs 81-116) — fix test=5, sweep all 36 val pairs
+    # Uses the best-known config from pronto_dual_full_v8
+    # =========================================================================
+    BEST_CONFIG_OVERRIDES = {
+        "epochs": 200,
+        "learning-rate": 5e-5,
+        "weight-decay": 5e-4,
+        "dropout": 0.3,
+        "window-size": 30,
+        "val-stride": 1,
+        "fuse-mode": "gated",
+        "anomaly-weight": 0.5,
+        "lambda-div": 0.1,
+        "div-fusion-beta": 0.3,
+    }
+    remaining = [0, 1, 2, 3, 4, 6, 7, 8, 9]  # segments excluding test=5
+    exp_id = 81
+    for i in range(len(remaining)):
+        for j in range(i + 1, len(remaining)):
+            v1, v2 = remaining[i], remaining[j]
+            train_segs = sorted(s for s in remaining if s != v1 and s != v2)
+            overrides = dict(BEST_CONFIG_OVERRIDES)
+            overrides["train-segments"] = ",".join(str(s) for s in train_segs)
+            overrides["val-segments"] = f"{v1},{v2}"
+            overrides["test-segments"] = "5"
+            experiments.append({
+                "id": exp_id,
+                "name": f"sweep_t5_v{v1}{v2}",
+                "category": "segment_sweep",
+                "description": f"test=5, val={v1},{v2}, train={','.join(str(s) for s in train_segs)}",
+                "overrides": overrides,
+            })
+            exp_id += 1
+
     return experiments
 
 
@@ -908,19 +1281,23 @@ def build_command(
     """Build the training command from config dict."""
     cmd = [CONDA_PYTHON, "train_dystgat.py"]
 
+    # Boolean flags that are store_true (present = True, absent = False)
+    STORE_TRUE_FLAGS = {
+        "use-spectral-view", "freq-use-spectral-features",
+        "early-stopping", "use-amp", "share-gnn-weights",
+    }
+    # Boolean flags with --no- variant
+    NO_VARIANT_FLAGS = {"freq-use-log"}
+
     for key, value in config.items():
         if isinstance(value, bool):
             if value:
-                # Boolean flags that are True
                 cmd.append(f"--{key}")
             else:
-                # For False boolean flags, check if there's a no- variant
-                if key == "use-spectral-view":
+                if key in STORE_TRUE_FLAGS:
                     pass  # Simply omit the flag
-                elif key == "freq-use-spectral-features":
-                    pass  # Simply omit the flag
-                elif key == "freq-use-log":
-                    cmd.append("--no-freq-use-log")
+                elif key in NO_VARIANT_FLAGS:
+                    cmd.append(f"--no-{key}")
         else:
             cmd.extend([f"--{key}", str(value)])
 
@@ -1101,56 +1478,28 @@ def compute_summary_table(results: Dict[str, Any]) -> List[Dict[str, Any]]:
         row["best_val_loss"] = train_metrics.get("best_val_loss", "-")
         row["best_epoch"] = train_metrics.get("best_epoch", "-")
 
-        # Average test metrics across all fault types
+        # Use faults_all metrics (combined aggregate) instead of averaging
         test_metrics = exp.get("test_metrics", {})
-        if test_metrics:
-            aucs = []
-            f1s = []
-            best_f1s = []
-            tea_aucs = []
-            delays = []
-
-            for test_name, metrics in test_metrics.items():
-                if "baseline" in test_name.lower():
-                    continue
-
-                if "auc_roc" in metrics:
-                    try:
-                        aucs.append(float(metrics["auc_roc"]))
-                    except (ValueError, TypeError):
-                        pass
-                if "f1_score" in metrics:
-                    try:
-                        f1s.append(float(metrics["f1_score"]))
-                    except (ValueError, TypeError):
-                        pass
-                if "best_f1" in metrics:
-                    try:
-                        best_f1s.append(float(metrics["best_f1"]))
-                    except (ValueError, TypeError):
-                        pass
-                if "tea_auc" in metrics:
-                    try:
-                        tea_aucs.append(float(metrics["tea_auc"]))
-                    except (ValueError, TypeError):
-                        pass
-                if "delay_best_thr" in metrics:
-                    try:
-                        delays.append(float(metrics["delay_best_thr"]))
-                    except (ValueError, TypeError):
-                        pass
-
-            row["avg_auc"] = f"{np.mean(aucs):.4f}" if aucs else "-"
-            row["avg_f1"] = f"{np.mean(f1s):.4f}" if f1s else "-"
-            row["avg_best_f1"] = f"{np.mean(best_f1s):.4f}" if best_f1s else "-"
-            row["avg_tea_auc"] = f"{np.mean(tea_aucs):.4f}" if tea_aucs else "-"
-            row["avg_delay"] = f"{np.mean(delays):.1f}" if delays else "-"
+        faults_all = test_metrics.get("faults_all", {})
+        if faults_all:
+            def _get(key):
+                try:
+                    return f"{float(faults_all[key]):.4f}"
+                except (KeyError, ValueError, TypeError):
+                    return "-"
+            row["auc"] = _get("auc_roc")
+            row["fused_auc"] = _get("fused_auc")
+            row["f1"] = _get("f1_score")
+            row["best_f1"] = _get("best_f1")
+            row["tea_auc"] = _get("tea_auc")
+            row["delay"] = _get("delay_best_thr")
         else:
-            row["avg_auc"] = "-"
-            row["avg_f1"] = "-"
-            row["avg_best_f1"] = "-"
-            row["avg_tea_auc"] = "-"
-            row["avg_delay"] = "-"
+            row["auc"] = "-"
+            row["fused_auc"] = "-"
+            row["f1"] = "-"
+            row["best_f1"] = "-"
+            row["tea_auc"] = "-"
+            row["delay"] = "-"
 
         summary.append(row)
 
@@ -1183,7 +1532,7 @@ def save_markdown(summary: List[Dict[str, Any]], output_path: Path) -> None:
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
     # Create table header
-    cols = ["ID", "Name", "Category", "Window", "λ-div", "Anom Wt", "AUC", "F1", "F1*", "TEA AUC", "Delay"]
+    cols = ["ID", "Name", "Category", "Window", "λ-div", "Anom Wt", "AUC", "Fused AUC", "F1", "F1*", "TEA AUC", "Delay"]
     header = "| " + " | ".join(cols) + " |"
     separator = "|" + "|".join([":---:" if i > 0 else ":---" for i in range(len(cols))]) + "|"
     lines.append(header)
@@ -1198,11 +1547,12 @@ def save_markdown(summary: List[Dict[str, Any]], output_path: Path) -> None:
             str(row["window"]),
             str(row["lambda_div"]),
             str(row["anomaly_wt"]),
-            str(row["avg_auc"]),
-            str(row["avg_f1"]),
-            str(row["avg_best_f1"]),
-            str(row["avg_tea_auc"]),
-            str(row["avg_delay"]),
+            str(row["auc"]),
+            str(row["fused_auc"]),
+            str(row["f1"]),
+            str(row["best_f1"]),
+            str(row["tea_auc"]),
+            str(row["delay"]),
         ]
         lines.append("| " + " | ".join(values) + " |")
 
@@ -1221,9 +1571,9 @@ def save_latex(summary: List[Dict[str, Any]], output_path: Path, caption: str = 
         r"\small",
         f"\\caption{{{caption}}}",
         r"\label{tab:hpsearch_results}",
-        r"\begin{tabular}{clcccccccc}",
+        r"\begin{tabular}{clccccccccc}",
         r"\toprule",
-        r"ID & Name & Cat. & Win & $\lambda$ & $\alpha$ & AUC & F1 & F1* & TEA \\",
+        r"ID & Name & Cat. & Win & $\lambda$ & $\alpha$ & AUC & Fused & F1 & F1* & TEA \\",
         r"\midrule",
     ]
 
@@ -1233,7 +1583,7 @@ def save_latex(summary: List[Dict[str, Any]], output_path: Path, caption: str = 
         line = (
             f"{row['id']} & {name_escaped} & {cat_short} & "
             f"{row['window']} & {row['lambda_div']} & {row['anomaly_wt']} & "
-            f"{row['avg_auc']} & {row['avg_f1']} & {row['avg_best_f1']} & {row['avg_tea_auc']} \\\\"
+            f"{row['auc']} & {row['fused_auc']} & {row['f1']} & {row['best_f1']} & {row['tea_auc']} \\\\"
         )
         lines.append(line)
 
@@ -1388,6 +1738,204 @@ def check_completed(exp: Dict[str, Any], results_base: Path) -> bool:
 
 
 # =============================================================================
+# Adaptive GPU-Memory-Aware Parallel Execution
+# =============================================================================
+
+def query_gpu_memory(gpu_ids: List[int]) -> Dict[int, Dict[str, int]]:
+    """Query free/total memory (MB) on each GPU via nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.free,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        gpu_mem = {}
+        for line in result.stdout.strip().split("\n"):
+            parts = [x.strip() for x in line.split(",")]
+            idx = int(parts[0])
+            if idx in gpu_ids:
+                gpu_mem[idx] = {"free_mb": int(parts[1]), "total_mb": int(parts[2])}
+        return gpu_mem
+    except Exception:
+        return {g: {"free_mb": 0, "total_mb": 0} for g in gpu_ids}
+
+
+def run_adaptive(
+    experiments: List[Dict[str, Any]],
+    results_base: Path,
+    cuda_devices: List[int],
+    seed: int,
+    base_config: Dict[str, Any],
+    dataset_key: str,
+    reserve_mb: int = 4096,
+    resume: bool = False,
+    poll_interval: float = 15.0,
+) -> Tuple[int, int, int]:
+    """Run experiments with adaptive GPU-memory-aware scheduling.
+
+    Launches experiments in waves:
+      1. Launch one experiment per GPU that has enough free memory.
+      2. Wait for datasets to load and training to begin (memory stabilizes).
+      3. Re-check free memory and launch more if space allows.
+      4. Repeat until all experiments are done.
+
+    Args:
+        reserve_mb: Always keep at least this much memory free per GPU (MB).
+        poll_interval: Seconds between GPU memory checks.
+
+    Returns (completed, failed, skipped) counts.
+    """
+    # Filter out already-completed experiments if resuming
+    to_run = []
+    skipped = 0
+    for exp in experiments:
+        if resume and check_completed(exp, results_base):
+            skipped += 1
+            print(f"  Skipping exp {exp['id']:2d} ({exp['name']}) - already completed")
+        else:
+            to_run.append(exp)
+
+    if not to_run:
+        print("All experiments already completed.")
+        return 0, 0, skipped
+
+    total = len(to_run)
+    pending = list(to_run)
+    completed = 0
+    failed = 0
+
+    # Running experiments: proc -> (exp_id, exp_name, gpu, start_time, ckpt_dir, stdout_fh, stderr_fh)
+    running: Dict[subprocess.Popen, tuple] = {}
+    gpu_running = {g: 0 for g in cuda_devices}
+
+    # Memory tracking: record free memory right after launching, so we know
+    # when the experiment has actually consumed GPU memory (stabilized).
+    # gpu -> free_mb snapshot taken right after last launch
+    gpu_mem_at_launch: Dict[int, int] = {}
+    # GPU is "settling" until free memory drops by at least this much (MB)
+    SETTLE_DROP_MB = 200
+    # Maximum settle wait before we assume the experiment uses negligible memory
+    SETTLE_TIMEOUT_SECS = 90
+
+    gpu_last_launch_time: Dict[int, float] = {g: 0.0 for g in cuda_devices}
+
+    # Initial memory snapshot
+    gpu_mem = query_gpu_memory(cuda_devices)
+    mem_info = " | ".join(
+        f"GPU{g}: {gpu_mem.get(g, {}).get('free_mb', '?')}MB free / "
+        f"{gpu_mem.get(g, {}).get('total_mb', '?')}MB total"
+        for g in cuda_devices
+    )
+    print(f"\nAdaptive scheduler: {total} experiments, reserve={reserve_mb}MB")
+    print(f"  GPUs: {mem_info}")
+    print("=" * 80)
+    sys.stdout.flush()
+
+    while pending or running:
+        # --- Collect finished processes ---
+        done_procs = [p for p in running if p.poll() is not None]
+
+        for proc in done_procs:
+            exp_id, exp_name, gpu, start_time, ckpt_dir, out_fh, err_fh = running.pop(proc)
+            out_fh.close()
+            err_fh.close()
+            gpu_running[gpu] -= 1
+            elapsed = time.time() - start_time
+
+            if proc.returncode == 0:
+                completed += 1
+                tag = "OK"
+                msg = f"completed in {elapsed/60:.1f} min on GPU {gpu}"
+            else:
+                failed += 1
+                tag = "FAIL"
+                msg = f"failed (code {proc.returncode}) on GPU {gpu}"
+
+            done_total = completed + failed
+            cur_mem = query_gpu_memory(cuda_devices)
+            status_parts = []
+            for g in cuda_devices:
+                free = cur_mem.get(g, {}).get("free_mb", 0)
+                status_parts.append(f"GPU{g}: {gpu_running[g]} run, {free}MB free")
+            print(f"  [{done_total}/{total}] Exp {exp_id:3d} ({exp_name}): {tag} - {msg}")
+            print(f"           {' | '.join(status_parts)}")
+            sys.stdout.flush()
+
+        # --- Try to launch pending experiments (one per GPU per cycle) ---
+        launched_this_cycle = False
+        if pending:
+            now = time.time()
+            gpu_mem = query_gpu_memory(cuda_devices)
+
+            # Sort GPUs by most free memory
+            available_gpus = sorted(
+                cuda_devices,
+                key=lambda g: gpu_mem.get(g, {}).get("free_mb", 0),
+                reverse=True,
+            )
+
+            for gpu in available_gpus:
+                if not pending:
+                    break
+
+                free_mb = gpu_mem.get(gpu, {}).get("free_mb", 0)
+
+                # Check if this GPU is still settling from a previous launch
+                if gpu in gpu_mem_at_launch:
+                    mem_at_launch = gpu_mem_at_launch[gpu]
+                    elapsed_since = now - gpu_last_launch_time[gpu]
+                    mem_dropped = mem_at_launch - free_mb
+
+                    if mem_dropped < SETTLE_DROP_MB and elapsed_since < SETTLE_TIMEOUT_SECS:
+                        # Still settling — memory hasn't dropped yet, wait
+                        continue
+                    else:
+                        # Settled (memory consumed or timeout) — clear the flag
+                        del gpu_mem_at_launch[gpu]
+
+                # Check reserve
+                if free_mb <= reserve_mb:
+                    continue
+
+                # Launch ONE experiment on this GPU
+                exp = pending.pop(0)
+                exp_name = exp["name"]
+                exp_id = exp["id"]
+                config = merge_config(base_config, exp.get("overrides", {}))
+                ckpt_dir = results_base / f"exp{exp_id:02d}_{exp_name}"
+                cmd = build_command(config, str(ckpt_dir), gpu, seed)
+
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                (ckpt_dir / "planned_command.txt").write_text(shlex.join(cmd) + "\n")
+
+                out_fh = open(ckpt_dir / "stdout.log", "w")
+                err_fh = open(ckpt_dir / "stderr.log", "w")
+                proc = subprocess.Popen(
+                    cmd, stdout=out_fh, stderr=err_fh,
+                    text=True, cwd=str(Path(__file__).parent),
+                )
+                running[proc] = (exp_id, exp_name, gpu, time.time(), ckpt_dir, out_fh, err_fh)
+                gpu_running[gpu] += 1
+
+                # Record memory snapshot and mark GPU as settling
+                gpu_mem_at_launch[gpu] = free_mb
+                gpu_last_launch_time[gpu] = time.time()
+                launched_this_cycle = True
+
+                queued = len(pending)
+                active = sum(gpu_running.values())
+                print(f"  >> Launched exp {exp_id:3d} ({exp_name}) on GPU {gpu} "
+                      f"({free_mb}MB free) | {active} active, {queued} queued")
+                sys.stdout.flush()
+
+        # Sleep before next poll (shorter if we just launched, to check others)
+        if pending or running:
+            time.sleep(poll_interval if not launched_this_cycle else 5.0)
+
+    return completed, failed, skipped
+
+
+# =============================================================================
 # Main Entry Point
 # =============================================================================
 
@@ -1448,7 +1996,19 @@ Examples:
         "--cuda-device",
         type=int,
         default=0,
-        help="CUDA device index (default: 0)",
+        help="CUDA device index for sequential execution (default: 0)",
+    )
+    parser.add_argument(
+        "--cuda-devices",
+        type=str,
+        default=None,
+        help="Comma-separated GPU IDs for multi-GPU parallel execution (e.g. '1,2')",
+    )
+    parser.add_argument(
+        "--reserve-mb",
+        type=int,
+        default=4096,
+        help="Keep at least this much GPU memory free per device in MB (default: 4096)",
     )
     parser.add_argument(
         "--seed",
@@ -1465,7 +2025,10 @@ Examples:
     parser.add_argument(
         "--category",
         type=str,
-        choices=["reference", "sensitivity", "ablation", "alternative", "combination"],
+        choices=[
+            "reference", "sensitivity", "ablation", "alternative", "combination",
+            "segment", "regularization", "cross_validation", "segment_sweep",
+        ],
         default=None,
         help="Run only experiments in this category",
     )
@@ -1518,7 +2081,7 @@ def main() -> None:
 
     # List mode
     if args.list:
-        print(f"\nAvailable Experiments for {dataset_key.upper()} (40 total):")
+        print(f"\nAvailable Experiments for {dataset_key.upper()} ({len(all_experiments)} total):")
         print("=" * 80)
         for exp in all_experiments:
             print(f"  [{exp['id']:2d}] {exp['name']:20s} ({exp['category']:12s}) - {exp['description']}")
@@ -1593,46 +2156,68 @@ def main() -> None:
         dataset_key=dataset_key,
     )
 
+    # Determine execution mode: adaptive parallel vs sequential
+    cuda_devices = None
+    if args.cuda_devices:
+        cuda_devices = [int(x.strip()) for x in args.cuda_devices.split(",")]
+
+    use_adaptive = cuda_devices is not None and not args.dry_run
+
     # Run experiments
     print("\n" + "=" * 80)
     print(f"HYPERPARAMETER SEARCH - {dataset_key.upper()}")
     print("=" * 80)
 
-    completed = 0
-    failed = 0
-    skipped = 0
-
-    for i, exp in enumerate(experiments, 1):
-        exp_id = exp["id"]
-        exp_name = exp["name"]
-
-        print(f"\n[{i}/{len(experiments)}] Experiment {exp_id}: {exp_name}")
-        print(f"  Category: {exp['category']}")
-        print(f"  Description: {exp['description']}")
-
-        # Check if already completed
-        if args.resume and check_completed(exp, results_base):
-            print("  Skipping (already completed)")
-            skipped += 1
-            continue
-
-        # Run experiment
-        success, message = run_experiment(
-            exp,
+    if use_adaptive:
+        # Adaptive memory-aware parallel execution across GPUs
+        completed, failed, skipped = run_adaptive(
+            experiments,
             results_base,
-            cuda_device=args.cuda_device,
+            cuda_devices=cuda_devices,
             seed=args.seed,
-            dry_run=args.dry_run,
             base_config=base_config,
             dataset_key=dataset_key,
+            reserve_mb=args.reserve_mb,
+            resume=args.resume,
         )
+    else:
+        # Sequential execution (or dry-run)
+        completed = 0
+        failed = 0
+        skipped = 0
+        effective_device = args.cuda_device
 
-        if success:
-            print(f"  OK: {message}")
-            completed += 1
-        else:
-            print(f"  FAIL: {message}")
-            failed += 1
+        for i, exp in enumerate(experiments, 1):
+            exp_id = exp["id"]
+            exp_name = exp["name"]
+
+            print(f"\n[{i}/{len(experiments)}] Experiment {exp_id}: {exp_name}")
+            print(f"  Category: {exp['category']}")
+            print(f"  Description: {exp['description']}")
+
+            # Check if already completed
+            if args.resume and check_completed(exp, results_base):
+                print("  Skipping (already completed)")
+                skipped += 1
+                continue
+
+            # Run experiment
+            success, message = run_experiment(
+                exp,
+                results_base,
+                cuda_device=effective_device,
+                seed=args.seed,
+                dry_run=args.dry_run,
+                base_config=base_config,
+                dataset_key=dataset_key,
+            )
+
+            if success:
+                print(f"  OK: {message}")
+                completed += 1
+            else:
+                print(f"  FAIL: {message}")
+                failed += 1
 
     # Summary
     print("\n" + "=" * 80)
