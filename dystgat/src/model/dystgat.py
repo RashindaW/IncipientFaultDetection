@@ -1452,8 +1452,8 @@ class DySTGAT(nn.Module):
 
     def set_calibration_stats(self, err_mean: torch.Tensor, err_std: torch.Tensor) -> None:
         """Store per-sensor error calibration stats for z-score normalization."""
-        self._cal_err_mean = err_mean.detach()
-        self._cal_err_std = err_std.detach().clamp_min(1e-8)
+        self._cal_err_mean = err_mean.detach().clone()
+        self._cal_err_std = err_std.detach().clone().clamp_min(1e-8)
 
     def _calibrate_node_err(self, node_err: torch.Tensor) -> torch.Tensor:
         """Z-score normalize per-node errors using calibration stats (no-op if not set)."""

@@ -7,6 +7,7 @@ import csv
 import math
 import shlex
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
@@ -1926,5 +1927,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    from datetime import datetime # Import locally to avoid top-level shadowing if needed
     main()
