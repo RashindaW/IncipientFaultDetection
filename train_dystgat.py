@@ -73,6 +73,15 @@ def parse_args() -> argparse.Namespace:
         help="Temporal window size (number of timesteps) for sliding windows.",
     )
     parser.add_argument(
+        "--sub-window-size",
+        type=int,
+        default=1,
+        help="Sub-window size δt for temporal graph snapshots. "
+             "Window is chunked into W/δt snapshots; each snapshot mean-pools δt timesteps. "
+             "1 = process every timestep (current default). "
+             "window-size must be divisible by sub-window-size.",
+    )
+    parser.add_argument(
         "--task",
         type=str,
         choices=["reconstruction", "prediction"],
@@ -477,7 +486,15 @@ def init_model(
     task: str,
     pred_horizon: int,
     model_args: Optional[argparse.Namespace] = None,
+    sub_window_size: int = 1,
 ) -> DySTGAT:
+    if sub_window_size < 1:
+        raise ValueError(f"sub_window_size must be >= 1, got {sub_window_size}")
+    if window_size % sub_window_size != 0:
+        raise ValueError(
+            f"window_size ({window_size}) must be divisible by "
+            f"sub_window_size ({sub_window_size})"
+        )
     cfg.set_dataset_params(
         n_nodes=n_nodes,
         window_size=window_size,
@@ -515,7 +532,7 @@ def init_model(
         infer_temporal_edge=True,
         temp_edge_hid_dim=100,
         temp_edge_embed_dim=1,
-        temporal_window=5,
+        sub_window_size=sub_window_size,
         temporal_kernel=5,
         use_time_encoding=True,
         time_dim=5,
@@ -1530,6 +1547,7 @@ def main() -> None:
             args.task,
             args.pred_horizon,
             model_args=args,
+            sub_window_size=args.sub_window_size,
         )
 
         checkpoint_root = args.checkpoint_dir or os.path.join("checkpoints", adapter.key)

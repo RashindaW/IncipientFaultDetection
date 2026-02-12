@@ -126,11 +126,12 @@ class TemporalFeatureGraph(nn.Module):
     At each ti: use hj[ti], hk[ti] (scalars) + temporal encoding
     e_jk^ti = a^T · LeakyReLU(W · [hj[ti], hk[ti], emb(ti)])
     """
-    def __init__(self, n_nodes, hidden_dim=64, time_dim=5, dropout=0.3, learn_sys=True):
+    def __init__(self, n_nodes, hidden_dim=64, time_dim=5, dropout=0.3, learn_sys=True, sub_window_size=1):
         super().__init__()
         self.n_nodes = n_nodes
         self.dropout = dropout
         self.learn_sys = learn_sys
+        self.sub_window_size = sub_window_size
 
         self.time_encode = TimeEncode(time_dim)
         # Input: [scalar_j, scalar_k, emb(ti)] = 2 + time_dim
@@ -146,17 +147,26 @@ class TemporalFeatureGraph(nn.Module):
         """
         b, n, w = h.shape
         device = h.device
+        dt = self.sub_window_size
 
-        # Time encodings for all timesteps
-        t_idx = torch.arange(w, device=device, dtype=torch.float32)
-        time_emb = self.time_encode(t_idx)  # [W, time_dim]
+        # Sub-window mean-pooling: [B, N, W] → [B, N, num_snapshots]
+        if dt > 1 and w % dt == 0:
+            num_snapshots = w // dt
+            h_snap = h.view(b, n, num_snapshots, dt).mean(dim=-1)
+        else:
+            num_snapshots = w
+            h_snap = h
 
-        # Collect attention over time: [B, N, N, W]
-        alpha_seq = torch.zeros(b, n, n, w, device=device)
+        # Time encodings for all snapshots
+        t_idx = torch.arange(num_snapshots, device=device, dtype=torch.float32)
+        time_emb = self.time_encode(t_idx)  # [num_snapshots, time_dim]
 
-        for ti in range(w):
-            # Node values at timestep ti: [B, N, 1]
-            h_ti = h[:, :, ti:ti+1]
+        # Collect attention over time: [B, N, N, num_snapshots]
+        alpha_seq = torch.zeros(b, n, n, num_snapshots, device=device)
+
+        for ti in range(num_snapshots):
+            # Node values at snapshot ti: [B, N, 1]
+            h_ti = h_snap[:, :, ti:ti+1]
 
             # Pairwise scalars: [B, N, N, 2]
             hj = h_ti.unsqueeze(2).expand(-1, -1, n, -1)  # [B, N, N, 1]
@@ -178,8 +188,8 @@ class TemporalFeatureGraph(nn.Module):
             alpha_seq[:, :, :, ti] = alpha
 
         # EdgeGRU: aggregate attention over time
-        # [B*N*N, W] -> [B*N*N]
-        alpha_flat = alpha_seq.view(b * n * n, w)
+        # [B*N*N, num_snapshots] -> [B*N*N]
+        alpha_flat = alpha_seq.view(b * n * n, num_snapshots)
         edge_weights = self.edge_gru(alpha_flat)
         edge_weights_dense = edge_weights.view(b, n, n)
 
@@ -815,7 +825,7 @@ class DySTGAT(nn.Module):
         infer_temporal_edge=True,
         temp_edge_hid_dim=100,
         temp_edge_embed_dim=1,
-        temporal_window=5,
+        sub_window_size=1,
         temporal_kernel=5,
         use_time_encoding=True,
         time_dim=5,
@@ -923,6 +933,7 @@ class DySTGAT(nn.Module):
             time_dim=time_dim,
             dropout=dropout,
             learn_sys=learn_sys,
+            sub_window_size=sub_window_size,
         )
 
         base_freq_embed_dim = freq_node_embed_dim or temp_node_embed_dim
