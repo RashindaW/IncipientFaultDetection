@@ -1501,6 +1501,7 @@ class DySTGAT(nn.Module):
         if edge_index is not None and edge_weight is not None:
             src, dst = edge_index
             weights = edge_weight.abs().to(device=device, dtype=node_err.dtype)
+            weights = weights.detach()
             degree.index_add_(0, src, weights)
             degree.index_add_(0, dst, weights)
 
@@ -1528,6 +1529,7 @@ class DySTGAT(nn.Module):
         if edge_index is not None and edge_weight is not None:
             src, dst = edge_index
             w = edge_weight.abs().float()
+            w = w.detach()
             weighted_in.index_add_(0, dst, node_err[src].float() * w)
             in_degree.index_add_(0, dst, w)
 
