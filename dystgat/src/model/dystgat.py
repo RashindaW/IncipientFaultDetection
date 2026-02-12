@@ -876,6 +876,8 @@ class DySTGAT(nn.Module):
         self.task = task
         self.pred_horizon = pred_horizon
         self.div_eps = 1e-8
+        self.register_buffer('_cal_err_mean', None)
+        self.register_buffer('_cal_err_std', None)
         self.do_encoder_norm = do_encoder_norm
         self.do_gnn_norm = do_gnn_norm
         self.do_decoder_norm = do_decoder_norm
@@ -1445,6 +1447,21 @@ class DySTGAT(nn.Module):
             return ((x_true - x_recon) ** 2).mean(dim=-1)
         return (x_true - x_recon).abs().mean(dim=-1)
 
+    def set_calibration_stats(self, err_mean: torch.Tensor, err_std: torch.Tensor) -> None:
+        """Store per-sensor error calibration stats for z-score normalization."""
+        self._cal_err_mean = err_mean.detach()
+        self._cal_err_std = err_std.detach().clamp_min(1e-8)
+
+    def _calibrate_node_err(self, node_err: torch.Tensor) -> torch.Tensor:
+        """Z-score normalize per-node errors using calibration stats (no-op if not set)."""
+        if self._cal_err_mean is None or self._cal_err_std is None:
+            return node_err
+        n = cfg.dataset.n_nodes
+        b = node_err.numel() // n
+        err_2d = node_err.view(b, n)
+        err_2d = (err_2d - self._cal_err_mean) / self._cal_err_std
+        return err_2d.view(-1)
+
     def _topology_scores_per_graph(
         self,
         x_true: torch.Tensor,
@@ -1477,6 +1494,7 @@ class DySTGAT(nn.Module):
         device = x_true.device
 
         node_err = self._node_error(x_true, x_recon)  # [B*N]
+        node_err = self._calibrate_node_err(node_err)
 
         num_nodes = node_err.numel()
         degree = torch.zeros(num_nodes, device=device, dtype=node_err.dtype)
@@ -1502,6 +1520,7 @@ class DySTGAT(nn.Module):
         n = cfg.dataset.n_nodes
         b = x_true.shape[0] // n
         node_err = self._node_error(x_true, x_recon)  # [B*N]
+        node_err = self._calibrate_node_err(node_err)
 
         num_nodes = node_err.numel()
         weighted_in = torch.zeros(num_nodes, device=node_err.device)
@@ -1525,6 +1544,7 @@ class DySTGAT(nn.Module):
         n = cfg.dataset.n_nodes
         b = x_true.shape[0] // n
         node_err = self._node_error(x_true, x_recon)  # [B*N]
+        node_err = self._calibrate_node_err(node_err)
         return node_err.view(b, n).mean(dim=1)
 
     def compute_topology_aware_anomaly_score(
