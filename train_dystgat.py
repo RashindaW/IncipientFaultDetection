@@ -177,6 +177,8 @@ def parse_args() -> argparse.Namespace:
         help="Weight for divergence score in fused anomaly score (0=disabled).")
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Optimizer learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-3, help="Weight decay (L2 regularization)")
+    parser.add_argument("--lr-factor", type=float, default=0.5,
+        help="Factor for ReduceLROnPlateau scheduler (default 0.5).")
     parser.add_argument(
         "--dataset-key",
         type=str,
@@ -1603,7 +1605,7 @@ def main() -> None:
         if args.lr_scheduler == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-7)
         elif args.lr_scheduler == "plateau":
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=args.lr_factor)
         else:
             scheduler = None
 
