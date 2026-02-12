@@ -362,6 +362,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topology-error", type=str, default="l1",
         choices=["l1", "l2"],
         help="Error metric for topology scoring: 'l1' (abs) or 'l2' (squared).")
+    parser.add_argument("--diagnostics", action="store_true", default=False,
+        help="Run in-batch diagnostics (sensor error, attention entropy, edge weights, etc.).")
     parser.add_argument("--disable-tea", action="store_true", default=True,
         help="Disable TEA (Temporal Evidence Accumulation) metrics (default: disabled).")
     parser.add_argument("--enable-tea", dest="disable_tea", action="store_false",
@@ -608,6 +610,90 @@ def resolve_target(batch_obj: Batch, recon: torch.Tensor, task: str) -> torch.Te
     else:
         target = batch_obj.x
     return target.reshape_as(recon)
+
+
+@torch.no_grad()
+def run_diagnostics(
+    model: torch.nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    *,
+    amp_enabled: bool = False,
+) -> None:
+    """Run in-batch diagnostics on a single batch from the loader."""
+    model.eval()
+    base_model = unwrap_model(model)
+    task = getattr(cfg.dataset, "task", "reconstruction")
+    n = cfg.dataset.n_nodes
+
+    raw_batch = next(iter(loader))
+    with autocast("cuda", enabled=amp_enabled):
+        outputs, batch_obj = forward_model(model, raw_batch, device, return_graph=True)
+        recon, edge_index, edge_attr, aux = unpack_model_outputs(outputs)
+        if not torch.isfinite(recon).all():
+            recon = torch.nan_to_num(recon, nan=0.0, posinf=1e6, neginf=-1e6)
+        target = resolve_target(batch_obj, recon, task)
+        if not torch.isfinite(target).all():
+            target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    b = target.shape[0] // n
+
+    # --- DIAG 1: Per-sensor error stats ---
+    target_al, recon_al = base_model._align_target_and_recon(target, recon)
+    node_err = base_model._node_error(target_al, recon_al)  # [B*N]
+    err_2d = node_err.view(b, n)
+    per_sensor_mean = err_2d.mean(dim=0)
+    per_sensor_std = err_2d.std(dim=0)
+    ratio = per_sensor_mean.max() / (per_sensor_mean.min() + 1e-8)
+    print(f"  [DIAG 1] Per-sensor error mean: {per_sensor_mean.cpu().numpy().round(4)}")
+    print(f"  [DIAG 1] Per-sensor error std:  {per_sensor_std.cpu().numpy().round(4)}")
+    print(f"  [DIAG 1] Max/min sensor error ratio: {ratio:.1f}x")
+
+    # --- DIAG 2: Temporal attention entropy ---
+    alpha_temp = aux.get("alpha_temp")
+    if alpha_temp is not None:
+        alpha_avg = alpha_temp.mean(dim=-1)  # [B, N, N]
+        n_att = alpha_avg.size(1)
+        diag_mask = torch.eye(n_att, dtype=torch.bool, device=alpha_avg.device)
+        alpha_avg = alpha_avg.masked_fill(diag_mask.unsqueeze(0), 0.0)
+        row_sum = alpha_avg.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        alpha_norm = alpha_avg / row_sum
+        log_alpha = (alpha_norm + 1e-8).log()
+        entropy = -(alpha_norm * log_alpha).sum(dim=-1).mean()
+        max_entropy = math.log(n_att - 1)
+        print(f"  [DIAG 2] Attention entropy: {entropy:.3f} / {max_entropy:.3f} "
+              f"(ratio: {entropy/max_entropy:.2f})")
+    else:
+        print("  [DIAG 2] alpha_temp not available in aux dict")
+
+    # --- DIAG 3: Edge weight distribution ---
+    if edge_attr is not None:
+        ew = edge_attr.detach()
+        top5 = ew.topk(min(5, ew.numel())).values
+        bot5 = ew.topk(min(5, ew.numel()), largest=False).values
+        effective_nonzero = (ew > 0.01).float().mean()
+        print(f"  [DIAG 3] Edge weights: min={ew.min():.4f} mean={ew.mean():.4f} "
+              f"max={ew.max():.4f} std={ew.std():.4f}")
+        print(f"  [DIAG 3] Top-5: {top5.cpu().numpy().round(4)}")
+        print(f"  [DIAG 3] Bot-5: {bot5.cpu().numpy().round(4)}")
+        print(f"  [DIAG 3] Fraction > 0.01: {effective_nonzero:.2%}")
+
+    # --- DIAG 5: GNN message passing ratio ---
+    for i, layer in enumerate(base_model.gnn_layers):
+        aggr = getattr(layer, '_last_aggr_norm', 0.0)
+        self_n = getattr(layer, '_last_self_norm', 1e-8)
+        ratio_gnn = aggr / (self_n + 1e-8)
+        print(f"  [DIAG 5] GNN layer {i}: msg_ratio={ratio_gnn:.4f} "
+              f"(aggr={aggr:.2f}, self={self_n:.2f})")
+
+    # --- DIAG 6: Per-timestep error profile ---
+    per_ts = base_model.compute_anomaly_scores_per_timestep(
+        target, recon, edge_index, edge_attr
+    )  # [B, W]
+    ts_profile = per_ts.mean(dim=0).cpu().numpy()
+    slope = (ts_profile[-1] - ts_profile[0]) / max(len(ts_profile) - 1, 1)
+    print(f"  [DIAG 6] Per-timestep error profile: {ts_profile.round(4)}")
+    print(f"  [DIAG 6] Slope: {slope:.6f}")
 
 
 def compute_recon_loss(

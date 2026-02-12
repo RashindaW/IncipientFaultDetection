@@ -1303,6 +1303,9 @@ class DySTGAT(nn.Module):
         
         if return_graph:
             aux = {}
+            aux["alpha_temp"] = alpha_temp  # [B, N, N, W] dense attention
+            if alpha_freq is not None:
+                aux["alpha_freq"] = alpha_freq  # [B, N, N] dense spectral attention
             if self.use_spectral_view:
                 aux["divergence_loss"] = div_loss
                 if div_score is not None:
