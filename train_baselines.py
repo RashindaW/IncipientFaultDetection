@@ -344,7 +344,13 @@ def evaluate_model(
               f"{val_median.max():.4f}], IQR range [{val_iqr.min():.4f}, "
               f"{val_iqr.max():.4f}]")
 
-    # Step 2: Compute normalized baseline scores
+    # Step 2: Compute normalized validation scores (healthy reference for baseline eval)
+    val_residuals_scores = model.compute_per_feature_residuals(val_loader, device)
+    val_scores = BaselineModel.iqr_normalize_scores(
+        val_residuals_scores, val_median, val_iqr
+    )
+
+    # Step 3: Compute normalized baseline (normal test) scores
     base_residuals = model.compute_per_feature_residuals(
         baseline_loader, device
     )
@@ -353,26 +359,33 @@ def evaluate_model(
     )
 
     if verbose:
+        print(f"  Val scores (IQR-norm): mean={val_scores.mean():.4f}, "
+              f"std={val_scores.std():.4f}")
         print(f"  Baseline scores (IQR-norm): mean={baseline_scores.mean():.4f}, "
               f"std={baseline_scores.std():.4f}")
 
-    # Step 3: Evaluate each fault loader
+    # Step 4: Evaluate each test loader (including baseline)
     all_metrics = {}
 
     for name, loader in test_loaders.items():
-        if name == "baseline":
+        if name == "faults_all":
             continue
 
-        # Compute normalized fault scores
-        fault_residuals = model.compute_per_feature_residuals(loader, device)
-        fault_scores = BaselineModel.iqr_normalize_scores(
-            fault_residuals, val_median, val_iqr
-        )
-
-        # Compute metrics
-        metrics = compute_all_metrics(
-            baseline_scores, fault_scores, include_tea=True
-        )
+        if name == "baseline":
+            # For normal test baseline: use val_scores as healthy reference
+            # AUC ~0.5 means model generalizes well (doesn't flag normal as anomalous)
+            metrics = compute_all_metrics(
+                val_scores, baseline_scores, include_tea=True
+            )
+        else:
+            # For fault test sets: use baseline_scores as healthy reference
+            fault_residuals = model.compute_per_feature_residuals(loader, device)
+            fault_scores = BaselineModel.iqr_normalize_scores(
+                fault_residuals, val_median, val_iqr
+            )
+            metrics = compute_all_metrics(
+                baseline_scores, fault_scores, include_tea=True
+            )
 
         all_metrics[name] = metrics
 
@@ -384,6 +397,44 @@ def evaluate_model(
             if 'tea_auc' in metrics:
                 print(f"  TEA AUC:   {metrics['tea_auc']:.4f}")
                 print(f"  TEA F1:    {metrics['tea_best_f1']:.4f}")
+
+    # Step 5: Compute faults_all metrics (faults only, excluding baseline)
+    if "faults_all" in test_loaders:
+        faults_all_residuals = model.compute_per_feature_residuals(
+            test_loaders["faults_all"], device
+        )
+        faults_all_scores = BaselineModel.iqr_normalize_scores(
+            faults_all_residuals, val_median, val_iqr
+        )
+        all_metrics["faults_all"] = compute_all_metrics(
+            baseline_scores, faults_all_scores, include_tea=True
+        )
+        if verbose:
+            m = all_metrics["faults_all"]
+            print(f"\n[faults_all] Metrics:")
+            print(f"  AUC-ROC:   {m['auc_roc']:.4f}")
+            print(f"  F1:        {m['f1']:.4f}")
+            print(f"  Best F1:   {m['best_f1']:.4f}")
+
+    # Step 6: Compute overall average across all 5 test sets
+    avg_keys = ["baseline", "slugging", "blockage", "leakage", "diverted"]
+    present = [k for k in avg_keys if k in all_metrics]
+    if present:
+        metric_keys = [k for k in all_metrics[present[0]].keys()
+                       if isinstance(all_metrics[present[0]][k], (int, float))]
+        overall = {}
+        for mk in metric_keys:
+            vals = [all_metrics[p][mk] for p in present if mk in all_metrics[p]]
+            overall[mk] = float(np.mean(vals)) if vals else 0.0
+        all_metrics["overall"] = overall
+
+        if verbose:
+            print(f"\n[overall] Average across {len(present)} test sets:")
+            print(f"  AUC-ROC:   {overall.get('auc_roc', 0):.4f}")
+            print(f"  F1:        {overall.get('f1', 0):.4f}")
+            print(f"  Best F1:   {overall.get('best_f1', 0):.4f}")
+            if 'tea_auc' in overall:
+                print(f"  TEA AUC:   {overall['tea_auc']:.4f}")
 
     return all_metrics
 

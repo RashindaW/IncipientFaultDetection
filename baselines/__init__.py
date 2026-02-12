@@ -33,35 +33,69 @@ Usage:
 from typing import Dict, List, Optional, Type, Any
 
 from .base import BaselineModel
+from .ae import AE
+from .fnn import FNN
+from .lstm import LSTM
+from .lstm_ae import LSTMAE
 from .lstm_vae import LSTMVAE
 from .usad import USAD
 from .omnianomaly import OmniAnomaly
 from .gdn import GDN
 from .mtad_gat import MTADGAT
+from .grelen import GRELEN
 from .dyedgegat import DyEdgeGAT
 
 # Registry of baseline methods
 _BASELINE_REGISTRY: Dict[str, Type[BaselineModel]] = {
+    "ae": AE,
+    "fnn": FNN,
+    "lstm": LSTM,
+    "lstm_ae": LSTMAE,
     "lstm_vae": LSTMVAE,
     "usad": USAD,
     "omnianomaly": OmniAnomaly,
     "gdn": GDN,
     "mtad_gat": MTADGAT,
+    "grelen": GRELEN,
     "dyedgegat": DyEdgeGAT,
 }
 
 # Method descriptions
 _BASELINE_DESCRIPTIONS: Dict[str, str] = {
+    "ae": "AE - MLP Autoencoder with bottleneck reconstruction",
+    "fnn": "FNN - Feedforward Neural Network reconstruction",
+    "lstm": "LSTM - Plain LSTM encoder-decoder reconstruction",
+    "lstm_ae": "LSTM-AE - LSTM Autoencoder with deterministic latent bottleneck",
     "lstm_vae": "LSTM-VAE (Park et al. 2018) - LSTM encoder-decoder with VAE regularization",
     "usad": "USAD (Audibert et al. 2020) - Dual autoencoder with adversarial training",
     "omnianomaly": "OmniAnomaly (Su et al. 2019) - Stochastic RNN with normalizing flows",
     "gdn": "GDN (Deng & Hooi 2021) - Graph Deviation Network with attention",
     "mtad_gat": "MTAD-GAT (Zhao et al. 2020) - Multi-scale Temporal + GAT",
+    "grelen": "GRELEN (Zhang et al. 2022) - Graph Relational Learning with DCGRU",
     "dyedgegat": "DyEdgeGAT - DySTGAT without spectral view (temporal-only ablation)",
 }
 
 # Default hyperparameters for each method
 _DEFAULT_HYPERPARAMS: Dict[str, Dict[str, Any]] = {
+    "ae": {
+        "hidden_dims": [20, 20, 10, 10],
+        "latent_dim": 4,
+    },
+    "fnn": {
+        "hidden_dims": [256, 128, 256],
+        "dropout": 0.1,
+    },
+    "lstm": {
+        "hidden_dim": 64,
+        "num_layers": 2,
+        "dropout": 0.1,
+    },
+    "lstm_ae": {
+        "hidden_dim": 64,
+        "latent_dim": 32,
+        "num_layers": 2,
+        "dropout": 0.1,
+    },
     "lstm_vae": {
         "hidden_dim": 64,
         "latent_dim": 32,
@@ -94,6 +128,15 @@ _DEFAULT_HYPERPARAMS: Dict[str, Dict[str, Any]] = {
         "n_temporal_layers": 3,
         "dropout": 0.1,
         "forecast_horizon": 1,
+    },
+    "grelen": {
+        "n_hid": 64,
+        "n_heads": 4,
+        "head_dim": 32,
+        "max_diffusion_step": 2,
+        "temperature": 0.5,
+        "n_rnn_layers": 1,
+        "topo_weight": 0.5,
     },
     "dyedgegat": {
         "node_encoder_hidden": 64,
@@ -219,11 +262,16 @@ __all__ = [
     # Base class
     "BaselineModel",
     # Model classes
+    "AE",
+    "FNN",
+    "LSTM",
+    "LSTMAE",
     "LSTMVAE",
     "USAD",
     "OmniAnomaly",
     "GDN",
     "MTADGAT",
+    "GRELEN",
     "DyEdgeGAT",
     # Factory functions
     "create_baseline",

@@ -528,8 +528,8 @@ class DyEdgeGAT(BaselineModel):
 
     def to(self, device: torch.device) -> "DyEdgeGAT":
         """Move model to device."""
-        if self._model is not None:
-            self._model.to(device)
+        self._init_dystgat(device)
+        self._model.to(device)
         return self
 
     def train(self, mode: bool = True):
@@ -546,9 +546,9 @@ class DyEdgeGAT(BaselineModel):
 
     def parameters(self):
         """Get model parameters."""
-        if self._model is not None:
-            return self._model.parameters()
-        return iter([])
+        if self._model is None:
+            self._init_dystgat(torch.device('cpu'))
+        return self._model.parameters()
 
     def get_model_info(self) -> Dict:
         """Get model information."""

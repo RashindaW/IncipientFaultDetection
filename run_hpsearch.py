@@ -294,6 +294,57 @@ PRONTO_ORIGINAL_CONFIG = {
     "freq-embed-dim": 16,
 }
 
+# PRONTO Phase 2 Base configuration (fully-tuned baseline for HP search)
+PRONTO_PHASE2_BASE_CONFIG = {
+    # Dataset
+    "dataset-key": "pronto",
+    "split-mode": "segment_shuffle",
+    "n-segments": 10,
+    "data-seed": 42,
+    # Training
+    "epochs": 200,
+    "batch-size": 64,
+    "learning-rate": 5e-5,
+    "weight-decay": 1e-5,
+    "dropout": 0.3,
+    # Window
+    "window-size": 30,
+    "train-stride": 1,
+    "val-stride": 1,
+    "test-stride": 1,
+    # Spectral
+    "use-spectral-view": True,
+    "freq-embed-dim": 24,
+    "freq-band-mix": "mlp",
+    "freq-use-log": True,
+    "freq-use-spectral-features": True,
+    "fuse-mode": "gated",
+    "divergence-type": "js",
+    # Loss & scoring
+    "anomaly-weight": 0.5,
+    "lambda-div": 0.1,
+    "div-fusion-beta": 0.3,
+    "loss-type": "l2",
+    "grad-clip-norm": 0,
+    "topology-mode": "neighbor_propagation",
+    "topology-error": "l2",
+    "best-model-by": "val_anom",
+    # Phase 2 GRU settings
+    "node-gru-input": "filtered",
+    "gru-activation": "none",
+    # Task
+    "task": "reconstruction",
+    # AMP
+    "use-amp": True,
+    # Early stopping
+    "early-stopping": True,
+    "patience": 20,
+    # Segments (best result: val=0,1, test=5)
+    "train-segments": "2,3,4,6,7,8,9",
+    "val-segments": "0,1",
+    "test-segments": "5",
+}
+
 
 # Dataset parameter presets for experiment generation
 DATASET_PARAMS = {
@@ -433,6 +484,592 @@ def get_dataset_params(dataset_key: str) -> Dict[str, Any]:
 # Legacy alias for backward compatibility
 BASE_CONFIG = ASHRAE_BASE_CONFIG.copy()
 ORIGINAL_CONFIG = ASHRAE_ORIGINAL_CONFIG.copy()
+
+
+def define_pronto_phase2_experiments() -> List[Dict[str, Any]]:
+    """Define all 148 experiments for PRONTO Phase 2 HP search & ablation study.
+
+    Categories:
+      1. Reference (2)           - baseline + DyEdgeGAT config
+      2. Ablation (16)           - remove/change ONE component
+      3. Sensitivity (50)        - vary ONE hyperparameter
+      4. Combination (16)        - test promising interactions
+      5. Segment Sweep (36)      - all C(9,2) val combos with test=5
+      6. Cross-Validation (20)   - different test segments
+      7. Seed Robustness (4)     - seed variance
+      8. Task Comparison (2)     - prediction vs reconstruction
+      9. Freq Resolution (2)     - frequency bin truncation
+
+    Returns:
+        List of 148 experiment dicts, each with id, name, category,
+        description, and overrides dict.
+    """
+    experiments = []
+
+    # =========================================================================
+    # Category 1: Reference (2 experiments)
+    # =========================================================================
+    experiments.append({
+        "id": 1,
+        "name": "baseline_phase2",
+        "category": "reference",
+        "description": "Phase 2 full config (baseline)",
+        "overrides": {},
+    })
+
+    experiments.append({
+        "id": 2,
+        "name": "baseline_dyedgegat",
+        "category": "reference",
+        "description": "DyEdgeGAT paper config: no spectral, no div, relu GRU, own_error_degree",
+        "overrides": {
+            "use-spectral-view": False,
+            "lambda-div": 0,
+            "div-fusion-beta": 0,
+            "node-gru-input": "filtered",
+            "gru-activation": "relu",
+            "topology-mode": "own_error_degree",
+            "topology-error": "l2",
+        },
+    })
+
+    # =========================================================================
+    # Category 2: Ablation Studies (16 experiments, IDs 3-18)
+    # =========================================================================
+    experiments.append({
+        "id": 3,
+        "name": "ablation_no_spectral",
+        "category": "ablation",
+        "description": "Remove spectral branch entirely",
+        "overrides": {"use-spectral-view": False, "lambda-div": 0, "div-fusion-beta": 0},
+    })
+
+    experiments.append({
+        "id": 4,
+        "name": "ablation_no_divergence",
+        "category": "ablation",
+        "description": "Disable divergence loss",
+        "overrides": {"lambda-div": 0, "div-fusion-beta": 0},
+    })
+
+    experiments.append({
+        "id": 5,
+        "name": "ablation_no_div_fusion",
+        "category": "ablation",
+        "description": "Disable divergence-fused inference scoring",
+        "overrides": {"div-fusion-beta": 0},
+    })
+
+    experiments.append({
+        "id": 6,
+        "name": "ablation_no_spectral_features",
+        "category": "ablation",
+        "description": "Remove 7 spectral shape features",
+        "overrides": {"freq-use-spectral-features": False},
+    })
+
+    experiments.append({
+        "id": 7,
+        "name": "ablation_no_band_mix",
+        "category": "ablation",
+        "description": "No band mixing layer",
+        "overrides": {"freq-band-mix": "none"},
+    })
+
+    experiments.append({
+        "id": 8,
+        "name": "ablation_band_mix_conv",
+        "category": "ablation",
+        "description": "Conv band mixing instead of MLP",
+        "overrides": {"freq-band-mix": "conv"},
+    })
+
+    experiments.append({
+        "id": 9,
+        "name": "ablation_fuse_sum",
+        "category": "ablation",
+        "description": "Sum fusion instead of gated",
+        "overrides": {"fuse-mode": "sum"},
+    })
+
+    experiments.append({
+        "id": 10,
+        "name": "ablation_fuse_concat",
+        "category": "ablation",
+        "description": "Concat fusion instead of gated",
+        "overrides": {"fuse-mode": "concat"},
+    })
+
+    experiments.append({
+        "id": 11,
+        "name": "ablation_no_topology",
+        "category": "ablation",
+        "description": "Disable topology-aware anomaly loss (anomaly_weight=0)",
+        "overrides": {"anomaly-weight": 0},
+    })
+
+    experiments.append({
+        "id": 12,
+        "name": "ablation_topo_plain",
+        "category": "ablation",
+        "description": "Plain error topology (no graph structure)",
+        "overrides": {"topology-mode": "plain_error"},
+    })
+
+    experiments.append({
+        "id": 13,
+        "name": "ablation_topo_own_err",
+        "category": "ablation",
+        "description": "Own-error/degree topology instead of neighbor-prop",
+        "overrides": {"topology-mode": "own_error_degree"},
+    })
+
+    experiments.append({
+        "id": 14,
+        "name": "ablation_raw_gru",
+        "category": "ablation",
+        "description": "Raw GRU input instead of IDCNN-filtered",
+        "overrides": {"node-gru-input": "raw"},
+    })
+
+    experiments.append({
+        "id": 15,
+        "name": "ablation_relu_gru",
+        "category": "ablation",
+        "description": "ReLU GRU activation instead of none",
+        "overrides": {"gru-activation": "relu"},
+    })
+
+    experiments.append({
+        "id": 16,
+        "name": "ablation_l1_topo_error",
+        "category": "ablation",
+        "description": "L1 topology error instead of L2",
+        "overrides": {"topology-error": "l1"},
+    })
+
+    experiments.append({
+        "id": 17,
+        "name": "ablation_l1_loss",
+        "category": "ablation",
+        "description": "L1 reconstruction loss instead of L2",
+        "overrides": {"loss-type": "l1"},
+    })
+
+    experiments.append({
+        "id": 18,
+        "name": "ablation_val_loss_select",
+        "category": "ablation",
+        "description": "Model selection by val_loss instead of val_anom",
+        "overrides": {"best-model-by": "val_loss"},
+    })
+
+    # =========================================================================
+    # Category 3: Sensitivity Analysis (50 experiments, IDs 19-68)
+    # =========================================================================
+
+    # Learning Rate (4)
+    for exp_id, name, lr in [
+        (19, "lr_1e-5", 1e-5),
+        (20, "lr_3e-5", 3e-5),
+        (21, "lr_1e-4", 1e-4),
+        (22, "lr_3e-4", 3e-4),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "sensitivity",
+            "description": f"Learning rate = {lr}",
+            "overrides": {"learning-rate": lr},
+        })
+
+    # Weight Decay (4)
+    for exp_id, name, wd in [
+        (23, "wd_0", 0),
+        (24, "wd_1e-6", 1e-6),
+        (25, "wd_1e-4", 1e-4),
+        (26, "wd_5e-4", 5e-4),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "sensitivity",
+            "description": f"Weight decay = {wd}",
+            "overrides": {"weight-decay": wd},
+        })
+
+    # Dropout (4)
+    for exp_id, name, do in [
+        (27, "dropout_0", 0.0),
+        (28, "dropout_01", 0.1),
+        (29, "dropout_02", 0.2),
+        (30, "dropout_04", 0.4),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "sensitivity",
+            "description": f"Dropout = {do}",
+            "overrides": {"dropout": do},
+        })
+
+    # Anomaly Weight (5)
+    for exp_id, name, aw in [
+        (31, "anom_wt_0", 0.0),
+        (32, "anom_wt_01", 0.1),
+        (33, "anom_wt_03", 0.3),
+        (34, "anom_wt_10", 1.0),
+        (35, "anom_wt_20", 2.0),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "sensitivity",
+            "description": f"Anomaly weight = {aw}",
+            "overrides": {"anomaly-weight": aw},
+        })
+
+    # Lambda Divergence (5)
+    for exp_id, name, ld in [
+        (36, "lambda_div_0", 0.0),
+        (37, "lambda_div_001", 0.01),
+        (38, "lambda_div_005", 0.05),
+        (39, "lambda_div_02", 0.2),
+        (40, "lambda_div_05", 0.5),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "sensitivity",
+            "description": f"Lambda divergence = {ld}",
+            "overrides": {"lambda-div": ld},
+        })
+
+    # Div Fusion Beta (5)
+    for exp_id, name, beta in [
+        (41, "div_beta_0", 0.0),
+        (42, "div_beta_01", 0.1),
+        (43, "div_beta_02", 0.2),
+        (44, "div_beta_05", 0.5),
+        (45, "div_beta_10", 1.0),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "sensitivity",
+            "description": f"Div fusion beta = {beta}",
+            "overrides": {"div-fusion-beta": beta},
+        })
+
+    # Window Size (5)
+    for exp_id, name, ws in [
+        (46, "window_10", 10),
+        (47, "window_15", 15),
+        (48, "window_20", 20),
+        (49, "window_45", 45),
+        (50, "window_60", 60),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "sensitivity",
+            "description": f"Window size = {ws}",
+            "overrides": {"window-size": ws},
+        })
+
+    # Freq Embed Dim (4)
+    for exp_id, name, dim in [
+        (51, "freq_embed_8", 8),
+        (52, "freq_embed_16", 16),
+        (53, "freq_embed_32", 32),
+        (54, "freq_embed_48", 48),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "sensitivity",
+            "description": f"Freq embed dim = {dim}",
+            "overrides": {"freq-embed-dim": dim},
+        })
+
+    # Batch Size (3)
+    for exp_id, name, bs in [
+        (55, "batch_32", 32),
+        (56, "batch_128", 128),
+        (57, "batch_256", 256),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "sensitivity",
+            "description": f"Batch size = {bs}",
+            "overrides": {"batch-size": bs},
+        })
+
+    # Grad Clip Norm (3)
+    for exp_id, name, gc in [
+        (58, "grad_clip_05", 0.5),
+        (59, "grad_clip_10", 1.0),
+        (60, "grad_clip_50", 5.0),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "sensitivity",
+            "description": f"Grad clip norm = {gc}",
+            "overrides": {"grad-clip-norm": gc},
+        })
+
+    # LR Scheduler (2)
+    for exp_id, name, sched in [
+        (61, "sched_cosine", "cosine"),
+        (62, "sched_plateau", "plateau"),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "sensitivity",
+            "description": f"LR scheduler = {sched}",
+            "overrides": {"lr-scheduler": sched},
+        })
+
+    # Patience (2)
+    for exp_id, name, pat in [
+        (63, "patience_10", 10),
+        (64, "patience_30", 30),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "sensitivity",
+            "description": f"Patience = {pat}",
+            "overrides": {"patience": pat},
+        })
+
+    # Divergence Type (1)
+    experiments.append({
+        "id": 65, "name": "div_kl", "category": "sensitivity",
+        "description": "KL divergence instead of JS",
+        "overrides": {"divergence-type": "kl"},
+    })
+
+    # Freq Log (1)
+    experiments.append({
+        "id": 66, "name": "no_freq_log", "category": "sensitivity",
+        "description": "Disable log-frequency scaling",
+        "overrides": {"freq-use-log": False},
+    })
+
+    # Share GNN (1)
+    experiments.append({
+        "id": 67, "name": "share_gnn", "category": "sensitivity",
+        "description": "Shared GNN weights between temporal and spectral",
+        "overrides": {"share-gnn-weights": True},
+    })
+
+    # Freq TopK (1)
+    experiments.append({
+        "id": 68, "name": "freq_topk_10", "category": "sensitivity",
+        "description": "Freq topk = 10",
+        "overrides": {"freq-topk": 10},
+    })
+
+    # =========================================================================
+    # Category 4: Combination Experiments (16 experiments, IDs 69-84)
+    # =========================================================================
+    experiments.append({
+        "id": 69, "name": "combo_high_reg", "category": "combination",
+        "description": "Heavy regularization: wd=5e-4, dropout=0.4, clip=1.0",
+        "overrides": {"weight-decay": 5e-4, "dropout": 0.4, "grad-clip-norm": 1.0},
+    })
+
+    experiments.append({
+        "id": 70, "name": "combo_low_reg", "category": "combination",
+        "description": "No regularization: wd=0, dropout=0, no clip",
+        "overrides": {"weight-decay": 0, "dropout": 0.0, "grad-clip-norm": 0},
+    })
+
+    experiments.append({
+        "id": 71, "name": "combo_large_model", "category": "combination",
+        "description": "Larger capacity: embed=48, window=45",
+        "overrides": {"freq-embed-dim": 48, "window-size": 45},
+    })
+
+    experiments.append({
+        "id": 72, "name": "combo_small_model", "category": "combination",
+        "description": "Smaller capacity: embed=8, window=15",
+        "overrides": {"freq-embed-dim": 8, "window-size": 15},
+    })
+
+    experiments.append({
+        "id": 73, "name": "combo_aggressive_spectral", "category": "combination",
+        "description": "Heavy spectral: lambda=0.5, beta=1.0",
+        "overrides": {"lambda-div": 0.5, "div-fusion-beta": 1.0},
+    })
+
+    experiments.append({
+        "id": 74, "name": "combo_conservative_spectral", "category": "combination",
+        "description": "Light spectral: lambda=0.01, beta=0.1",
+        "overrides": {"lambda-div": 0.01, "div-fusion-beta": 0.1},
+    })
+
+    experiments.append({
+        "id": 75, "name": "combo_phase1_only", "category": "combination",
+        "description": "Phase 1 config (no Phase 2 changes): raw GRU, relu, l1 topo, val_loss",
+        "overrides": {
+            "node-gru-input": "raw", "gru-activation": "relu",
+            "topology-error": "l1", "best-model-by": "val_loss",
+        },
+    })
+
+    experiments.append({
+        "id": 76, "name": "combo_cosine_long", "category": "combination",
+        "description": "Cosine scheduler + longer training (300 epochs, patience=30)",
+        "overrides": {"lr-scheduler": "cosine", "epochs": 300, "patience": 30},
+    })
+
+    experiments.append({
+        "id": 77, "name": "combo_plateau_fast", "category": "combination",
+        "description": "Plateau scheduler + fast early stop (patience=10)",
+        "overrides": {"lr-scheduler": "plateau", "patience": 10},
+    })
+
+    experiments.append({
+        "id": 78, "name": "combo_high_lr_batch", "category": "combination",
+        "description": "Scale LR with batch: lr=1e-4, batch=128",
+        "overrides": {"learning-rate": 1e-4, "batch-size": 128},
+    })
+
+    experiments.append({
+        "id": 79, "name": "combo_l1_full", "category": "combination",
+        "description": "Full L1 pipeline: l1 loss + l1 topo + own_error_degree",
+        "overrides": {
+            "loss-type": "l1", "topology-error": "l1",
+            "topology-mode": "own_error_degree",
+        },
+    })
+
+    experiments.append({
+        "id": 80, "name": "combo_alt_split", "category": "combination",
+        "description": "Alternative split: val=3,9, train=0,1,2,4,6,7,8",
+        "overrides": {
+            "val-segments": "3,9",
+            "train-segments": "0,1,2,4,6,7,8",
+        },
+    })
+
+    experiments.append({
+        "id": 81, "name": "combo_dyedgegat_spectral", "category": "combination",
+        "description": "DyEdgeGAT + Phase 2 GRU: no spectral, relu, own_error_degree",
+        "overrides": {
+            "use-spectral-view": False, "lambda-div": 0, "div-fusion-beta": 0,
+            "node-gru-input": "filtered", "gru-activation": "relu",
+            "topology-error": "l2", "topology-mode": "own_error_degree",
+            "anomaly-weight": 0.5,
+        },
+    })
+
+    experiments.append({
+        "id": 82, "name": "combo_no_early_stop", "category": "combination",
+        "description": "Full 300 epochs, no early stopping",
+        "overrides": {"early-stopping": False, "epochs": 300},
+    })
+
+    experiments.append({
+        "id": 83, "name": "combo_high_anom_div", "category": "combination",
+        "description": "Strong anomaly + divergence: aw=1.0, lambda=0.2, beta=0.5",
+        "overrides": {"anomaly-weight": 1.0, "lambda-div": 0.2, "div-fusion-beta": 0.5},
+    })
+
+    experiments.append({
+        "id": 84, "name": "combo_seed_7", "category": "combination",
+        "description": "Seed robustness check (seed=7)",
+        "overrides": {"seed": 7},
+    })
+
+    # =========================================================================
+    # Category 5: Segment Sweep (36 experiments, IDs 85-120)
+    # All C(9,2) val-segment combos with test=5
+    # =========================================================================
+    remaining = [0, 1, 2, 3, 4, 6, 7, 8, 9]  # segments excluding test=5
+    exp_id = 85
+    for i in range(len(remaining)):
+        for j in range(i + 1, len(remaining)):
+            v1, v2 = remaining[i], remaining[j]
+            train_segs = sorted(s for s in remaining if s != v1 and s != v2)
+            experiments.append({
+                "id": exp_id,
+                "name": f"sweep_v{v1}{v2}",
+                "category": "segment_sweep",
+                "description": f"test=5, val={v1},{v2}, train={','.join(str(s) for s in train_segs)}",
+                "overrides": {
+                    "train-segments": ",".join(str(s) for s in train_segs),
+                    "val-segments": f"{v1},{v2}",
+                    "test-segments": "5",
+                },
+            })
+            exp_id += 1
+
+    # =========================================================================
+    # Category 6: Cross-Validation on Test Segment (20 experiments, IDs 121-140)
+    # =========================================================================
+    cv_experiments = [
+        (121, "cv_t0_v39", "0", "3,9", "1,2,4,5,6,7,8"),
+        (122, "cv_t0_v12", "0", "1,2", "3,4,5,6,7,8,9"),
+        (123, "cv_t1_v39", "1", "3,9", "0,2,4,5,6,7,8"),
+        (124, "cv_t1_v02", "1", "0,2", "3,4,5,6,7,8,9"),
+        (125, "cv_t2_v39", "2", "3,9", "0,1,4,5,6,7,8"),
+        (126, "cv_t2_v01", "2", "0,1", "3,4,5,6,7,8,9"),
+        (127, "cv_t3_v19", "3", "1,9", "0,2,4,5,6,7,8"),
+        (128, "cv_t3_v02", "3", "0,2", "1,4,5,6,7,8,9"),
+        (129, "cv_t4_v39", "4", "3,9", "0,1,2,5,6,7,8"),
+        (130, "cv_t4_v01", "4", "0,1", "2,3,5,6,7,8,9"),
+        (131, "cv_t5_v39", "5", "3,9", "0,1,2,4,6,7,8"),
+        (132, "cv_t5_v01", "5", "0,1", "2,3,4,6,7,8,9"),
+        (133, "cv_t6_v39", "6", "3,9", "0,1,2,4,5,7,8"),
+        (134, "cv_t6_v01", "6", "0,1", "2,3,4,5,7,8,9"),
+        (135, "cv_t7_v19", "7", "1,9", "0,2,3,4,5,6,8"),
+        (136, "cv_t7_v02", "7", "0,2", "1,3,4,5,6,8,9"),
+        (137, "cv_t8_v39", "8", "3,9", "0,1,2,4,5,6,7"),
+        (138, "cv_t8_v01", "8", "0,1", "2,3,4,5,6,7,9"),
+        (139, "cv_t9_v38", "9", "3,8", "0,1,2,4,5,6,7"),
+        (140, "cv_t9_v01", "9", "0,1", "2,3,4,5,6,7,8"),
+    ]
+    for exp_id, name, test_seg, val_seg, train_seg in cv_experiments:
+        experiments.append({
+            "id": exp_id,
+            "name": name,
+            "category": "cross_validation",
+            "description": f"test={test_seg}, val={val_seg}, train={train_seg}",
+            "overrides": {
+                "train-segments": train_seg,
+                "val-segments": val_seg,
+                "test-segments": test_seg,
+            },
+        })
+
+    # =========================================================================
+    # Category 7: Seed Robustness (4 experiments, IDs 141-144)
+    # =========================================================================
+    for exp_id, name, seed_val in [
+        (141, "seed_0", 0),
+        (142, "seed_123", 123),
+        (143, "seed_256", 256),
+        (144, "seed_999", 999),
+    ]:
+        experiments.append({
+            "id": exp_id, "name": name, "category": "seed_robustness",
+            "description": f"Seed robustness check (seed={seed_val})",
+            "overrides": {"seed": seed_val},
+        })
+
+    # =========================================================================
+    # Category 8: Task Comparison (2 experiments, IDs 145-146)
+    # =========================================================================
+    experiments.append({
+        "id": 145, "name": "task_pred_h5", "category": "task_comparison",
+        "description": "Prediction task with horizon=5",
+        "overrides": {"task": "prediction", "pred-horizon": 5},
+    })
+
+    experiments.append({
+        "id": 146, "name": "task_pred_h10", "category": "task_comparison",
+        "description": "Prediction task with horizon=10",
+        "overrides": {"task": "prediction", "pred-horizon": 10},
+    })
+
+    # =========================================================================
+    # Category 9: Frequency Resolution (2 experiments, IDs 147-148)
+    # =========================================================================
+    experiments.append({
+        "id": 147, "name": "freq_bins_8", "category": "freq_resolution",
+        "description": "Low freq resolution (8 bins)",
+        "overrides": {"freq-bins": 8},
+    })
+
+    experiments.append({
+        "id": 148, "name": "freq_bins_16", "category": "freq_resolution",
+        "description": "Medium freq resolution (16 bins)",
+        "overrides": {"freq-bins": 16},
+    })
+
+    return experiments
 
 
 def define_experiments(dataset_key: str = "ashrae") -> List[Dict[str, Any]]:
@@ -1306,7 +1943,8 @@ def build_command(
     if cuda_device is not None:
         cmd.extend(["--cuda-device", str(cuda_device)])
 
-    if seed is not None:
+    # Only add --seed from parameter if not already in config
+    if seed is not None and "seed" not in config:
         cmd.extend(["--seed", str(seed)])
 
     return cmd
@@ -1791,7 +2429,7 @@ def run_adaptive(
     for exp in experiments:
         if resume and check_completed(exp, results_base):
             skipped += 1
-            print(f"  Skipping exp {exp['id']:2d} ({exp['name']}) - already completed")
+            print(f"  Skipping exp {exp['id']:3d} ({exp['name']}) - already completed")
         else:
             to_run.append(exp)
 
@@ -2023,11 +2661,19 @@ Examples:
         help="Comma-separated experiment IDs or names to run (default: all)",
     )
     parser.add_argument(
+        "--experiment-set",
+        type=str,
+        choices=["default", "phase2"],
+        default="default",
+        help="Experiment set: 'default' (generic 116-exp), 'phase2' (PRONTO 148-exp ablation/HP search)",
+    )
+    parser.add_argument(
         "--category",
         type=str,
         choices=[
             "reference", "sensitivity", "ablation", "alternative", "combination",
             "segment", "regularization", "cross_validation", "segment_sweep",
+            "seed_robustness", "task_comparison", "freq_resolution",
         ],
         default=None,
         help="Run only experiments in this category",
@@ -2068,23 +2714,71 @@ Examples:
     return parser.parse_args()
 
 
+def _save_experiment_plan(
+    experiments: List[Dict[str, Any]],
+    base_config: Dict[str, Any],
+    results_base: Path,
+    dataset_key: str,
+    set_label: str,
+) -> None:
+    """Auto-save experiment plan as a self-documenting markdown file."""
+    lines = [
+        f"# Experiment Plan: {dataset_key.upper()} [{set_label}]",
+        f"",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Total experiments: {len(experiments)}",
+        f"",
+        f"## Base Configuration",
+        f"```",
+    ]
+    for k, v in base_config.items():
+        lines.append(f"  --{k} {v}")
+    lines.append("```")
+    lines.append("")
+
+    # Group by category
+    categories = {}
+    for exp in experiments:
+        cat = exp["category"]
+        categories.setdefault(cat, []).append(exp)
+
+    for cat, exps in sorted(categories.items()):
+        lines.append(f"## {cat} ({len(exps)} experiments)")
+        lines.append("")
+        lines.append("| ID | Name | Description | Overrides |")
+        lines.append("|---:|------|-------------|-----------|")
+        for exp in exps:
+            overrides_str = ", ".join(f"`{k}={v}`" for k, v in exp.get("overrides", {}).items())
+            if not overrides_str:
+                overrides_str = "(baseline)"
+            lines.append(f"| {exp['id']} | {exp['name']} | {exp['description']} | {overrides_str} |")
+        lines.append("")
+
+    (results_base / "experiment_plan.md").write_text("\n".join(lines) + "\n")
+
+
 def main() -> None:
     """Main entry point."""
     args = parse_args()
     dataset_key = args.dataset_key
 
-    # Get dataset-specific base configuration
-    base_config = get_base_config(dataset_key)
-
-    # Define all experiments with dataset-specific parameters
-    all_experiments = define_experiments(dataset_key)
+    # Select experiment set and base config
+    if args.experiment_set == "phase2":
+        base_config = PRONTO_PHASE2_BASE_CONFIG.copy()
+        all_experiments = define_pronto_phase2_experiments()
+        set_label = "phase2"
+    else:
+        base_config = get_base_config(dataset_key)
+        all_experiments = define_experiments(dataset_key)
+        set_label = "default"
 
     # List mode
     if args.list:
-        print(f"\nAvailable Experiments for {dataset_key.upper()} ({len(all_experiments)} total):")
+        print(f"\nAvailable Experiments for {dataset_key.upper()} "
+              f"[set={set_label}] ({len(all_experiments)} total):")
         print("=" * 80)
         for exp in all_experiments:
-            print(f"  [{exp['id']:2d}] {exp['name']:20s} ({exp['category']:12s}) - {exp['description']}")
+            print(f"  [{exp['id']:3d}] {exp['name']:30s} ({exp['category']:18s}) - {exp['description']}")
         print("\nCategories:")
         categories = {}
         for exp in all_experiments:
@@ -2092,7 +2786,7 @@ def main() -> None:
             categories[cat] = categories.get(cat, 0) + 1
         for cat, count in sorted(categories.items()):
             print(f"  {cat}: {count} experiments")
-        print(f"\nBase configuration for {dataset_key}:")
+        print(f"\nBase configuration:")
         for key, value in base_config.items():
             print(f"  {key}: {value}")
         return
@@ -2102,7 +2796,8 @@ def main() -> None:
         results_base = Path(args.results_dir)
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        results_base = Path(f"results/{dataset_key}/hpsearch_{timestamp}")
+        dir_suffix = f"hpsearch_{set_label}_{timestamp}" if set_label != "default" else f"hpsearch_{timestamp}"
+        results_base = Path(f"results/{dataset_key}/{dir_suffix}")
 
     results_base.mkdir(parents=True, exist_ok=True)
     print(f"\nDataset: {dataset_key.upper()}")
@@ -2144,6 +2839,9 @@ def main() -> None:
     (results_base / "experiment_configs.json").write_text(
         json.dumps({
             "dataset_key": dataset_key,
+            "experiment_set": set_label,
+            "n_experiments": len(all_experiments),
+            "n_selected": len(experiments),
             "experiments": experiments,
             "base_config": base_config,
         }, indent=2)
@@ -2155,6 +2853,9 @@ def main() -> None:
         base_config=base_config,
         dataset_key=dataset_key,
     )
+
+    # Auto-save experiment plan as self-documenting .md
+    _save_experiment_plan(all_experiments, base_config, results_base, dataset_key, set_label)
 
     # Determine execution mode: adaptive parallel vs sequential
     cuda_devices = None

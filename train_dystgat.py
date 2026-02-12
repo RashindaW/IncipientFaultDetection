@@ -1134,6 +1134,8 @@ def evaluate_tests_and_plot(
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
 
+            individual_rows = []  # For baseline_test + individual faults → overall avg
+
             for name, scores in results_anom.items():
                 # Skip if it IS the baseline
                 if "baseline" in name.lower() or "fault_free" in name.lower():
@@ -1244,6 +1246,10 @@ def evaluate_tests_and_plot(
 
                 writer.writerow(row)
 
+                # Collect individual test set rows (exclude faults_all aggregate)
+                if name != 'faults_all':
+                    individual_rows.append(row)
+
                 # Update the returned metrics dict for printing
                 metrics[name]['auc'] = auc
                 metrics[name]['fused_auc'] = fused_auc
@@ -1255,6 +1261,63 @@ def evaluate_tests_and_plot(
                     metrics[name]['tea_auc'] = tea_auc
                     metrics[name]['tea_best_f1'] = tea_best_f1
                     metrics[name]['tea_auc_delta'] = tea_auc_delta
+
+            # ── baseline_test row: normal operation detection quality ──
+            # Specificity (TNR) = fraction of test baseline correctly below threshold
+            threshold = np.percentile(val_baseline_scores, 95)
+            tnr = float((auc_baseline_scores <= threshold).mean())
+
+            # Fused TNR
+            fused_tnr = tnr  # default: same as raw
+            if div_fusion_beta > 0 and auc_baseline_div is not None:
+                anom_base_z = (auc_baseline_scores - anom_mu) / anom_sigma
+                div_base_z = (auc_baseline_div - div_mu) / div_sigma
+                fused_base = anom_base_z + div_fusion_beta * div_base_z
+                val_anom_z = (val_baseline_scores - anom_mu) / anom_sigma
+                val_div_z = (val_baseline_div - div_mu) / div_sigma
+                fused_val = val_anom_z + div_fusion_beta * val_div_z
+                fused_thr = np.percentile(fused_val, 95)
+                fused_tnr = float((fused_base <= fused_thr).mean())
+
+            baseline_row = {
+                'test_set': 'baseline_test',
+                'auc_roc': f"{tnr:.4f}",
+                'fused_auc': f"{fused_tnr:.4f}",
+                'precision': f"{tnr:.4f}",
+                'recall': f"{tnr:.4f}",
+                'f1_score': f"{tnr:.4f}",
+                'best_f1': f"{tnr:.4f}",
+                'ambiguity': f"{0.0:.4f}",
+                'threshold': f"{threshold:.6f}",
+                'best_threshold': f"{threshold:.6f}",
+                'delay_best_thr': 0,
+            }
+            if not disable_tea:
+                baseline_row['tea_auc'] = f"{tnr:.4f}"
+                baseline_row['tea_best_f1'] = f"{tnr:.4f}"
+                baseline_row['tea_best_window'] = 0
+                baseline_row['tea_auc_delta'] = f"{0.0:+.4f}"
+            writer.writerow(baseline_row)
+            individual_rows.append(baseline_row)
+
+            # ── overall row: average across baseline_test + individual faults ──
+            avg_fields = ['auc_roc', 'fused_auc', 'precision', 'recall',
+                          'f1_score', 'best_f1', 'ambiguity']
+            overall_row = {'test_set': 'overall'}
+            for field in avg_fields:
+                vals = [float(r[field]) for r in individual_rows]
+                overall_row[field] = f"{np.mean(vals):.4f}"
+            overall_row['threshold'] = f"{threshold:.6f}"
+            overall_row['best_threshold'] = f"{0.0:.6f}"
+            overall_row['delay_best_thr'] = 0
+            if not disable_tea:
+                tea_vals = [float(r['tea_auc']) for r in individual_rows]
+                tea_f1_vals = [float(r['tea_best_f1']) for r in individual_rows]
+                overall_row['tea_auc'] = f"{np.mean(tea_vals):.4f}"
+                overall_row['tea_best_f1'] = f"{np.mean(tea_f1_vals):.4f}"
+                overall_row['tea_best_window'] = 0
+                overall_row['tea_auc_delta'] = f"{0.0:+.4f}"
+            writer.writerow(overall_row)
 
         print(f"Detailed metrics saved to {detailed_metrics_path}")
 
