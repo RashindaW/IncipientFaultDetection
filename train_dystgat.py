@@ -1846,6 +1846,16 @@ def main() -> None:
                 f"anomaly_score={val_summary_score:.6f} div={val_summary_div:.6f}"
             )
 
+        # Calibrate per-sensor error stats from validation baseline
+        compute_calibration_stats(model, val_loader, device, amp_enabled=amp_enabled)
+
+        # Run in-batch diagnostics if requested
+        if args.diagnostics:
+            print("\n" + "=" * 60)
+            print("DIAGNOSTICS (single batch from validation baseline)")
+            print("=" * 60)
+            run_diagnostics(model, val_loader, device, amp_enabled=amp_enabled)
+
         if args.skip_test:
             if is_main_process:
                 print("\nSkipping test evaluation (--skip-test).")
@@ -1893,6 +1903,7 @@ def main() -> None:
                 amp_enabled=amp_enabled,
                 div_fusion_beta=args.div_fusion_beta,
                 disable_tea=args.disable_tea,
+                diagnostics=args.diagnostics,
             )
 
             for name, metrics in test_scores.items():
