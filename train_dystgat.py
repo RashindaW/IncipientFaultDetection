@@ -613,6 +613,51 @@ def resolve_target(batch_obj: Batch, recon: torch.Tensor, task: str) -> torch.Te
 
 
 @torch.no_grad()
+def compute_calibration_stats(
+    model: torch.nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    *,
+    amp_enabled: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-sensor error calibration stats from validation baseline."""
+    model.eval()
+    base_model = unwrap_model(model)
+    task = getattr(cfg.dataset, "task", "reconstruction")
+    n = cfg.dataset.n_nodes
+    all_node_err = []
+
+    for raw_batch in loader:
+        with autocast("cuda", enabled=amp_enabled):
+            outputs, batch_obj = forward_model(model, raw_batch, device, return_graph=True)
+            recon, edge_index, edge_attr, aux = unpack_model_outputs(outputs)
+            if not torch.isfinite(recon).all():
+                recon = torch.nan_to_num(recon, nan=0.0, posinf=1e6, neginf=-1e6)
+            target = resolve_target(batch_obj, recon, task)
+            if not torch.isfinite(target).all():
+                target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        b = target.shape[0] // n
+        target_al, recon_al = base_model._align_target_and_recon(target, recon)
+        node_err = base_model._node_error(
+            target_al.view(b * n, -1), recon_al.view(b * n, -1)
+        )  # [B*N]
+        all_node_err.append(node_err.view(b, n))
+
+    all_node_err = torch.cat(all_node_err, dim=0)  # [total_samples, N]
+    cal_mean = all_node_err.mean(dim=0)  # [N]
+    cal_std = all_node_err.std(dim=0)    # [N]
+
+    base_model.set_calibration_stats(cal_mean, cal_std)
+    ratio = cal_mean.max() / (cal_mean.min() + 1e-8)
+    print(f"\n[Calibration] Per-sensor error mean: {cal_mean.cpu().numpy().round(4)}")
+    print(f"[Calibration] Per-sensor error std:  {cal_std.cpu().numpy().round(4)}")
+    print(f"[Calibration] Max/min ratio: {ratio:.1f}x")
+
+    return cal_mean, cal_std
+
+
+@torch.no_grad()
 def run_diagnostics(
     model: torch.nn.Module,
     loader: torch.utils.data.DataLoader,
@@ -1034,6 +1079,7 @@ def evaluate_tests_and_plot(
     amp_enabled: bool = False,
     div_fusion_beta: float = 0.0,
     disable_tea: bool = True,
+    diagnostics: bool = False,
 ) -> Dict[str, Dict[str, float]]:
     metrics: Dict[str, Dict[str, float]] = {}
     os.makedirs(output_dir, exist_ok=True)
@@ -1087,6 +1133,21 @@ def evaluate_tests_and_plot(
                     else:
                         test_baseline_scores = np.concatenate([test_baseline_scores, anom_arr])
                         test_baseline_div = np.concatenate([test_baseline_div, div_arr if div_arr is not None else np.zeros_like(anom_arr)])
+
+    # Diagnostic 4: Score separation (z-gap)
+    if diagnostics and val_baseline_scores is not None:
+        print("\n[DIAG 4] Score Separation (z-gap):")
+        for name, scores in results_anom.items():
+            name_lower = name.lower()
+            if "baseline" in name_lower or "fault_free" in name_lower or "val" in name_lower:
+                continue
+            gap = scores.mean() - val_baseline_scores.mean()
+            z_gap = gap / (val_baseline_scores.std() + 1e-8)
+            overlap = np.mean(scores < np.percentile(val_baseline_scores, 95))
+            print(f"  {name}:")
+            print(f"    Raw gap: {gap:.4f}")
+            print(f"    Z-gap: {z_gap:.2f}")
+            print(f"    Overlap: {overlap:.1%} of fault below baseline 95th pct")
 
     # Save raw scores
     if results_anom:
