@@ -7,7 +7,7 @@ import torch
 from torch_geometric.loader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from dystgat.src.data.ashrae_column_config import (
+from dualstage.src.data.ashrae_column_config import (
     FAULT_FILES,
     MEASUREMENT_VARS,
     BENCHMARK_DIR,
@@ -15,7 +15,7 @@ from dystgat.src.data.ashrae_column_config import (
     BASELINE_UNIT_STATUS_WHITELIST,
     get_measurement_vars,
 )
-from dystgat.src.data.ashrae_dataset import (
+from dualstage.src.data.ashrae_dataset import (
     ASHRAEDataset, 
     ASHRAEFaultDataset,
     get_ashrae_control_variable_names,

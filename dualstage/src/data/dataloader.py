@@ -1,5 +1,5 @@
 """
-DataLoader creation utilities for DySTGAT.
+DataLoader creation utilities for DualSTAGE.
 
 Creates PyTorch Geometric DataLoaders with proper batching for training and evaluation.
 """

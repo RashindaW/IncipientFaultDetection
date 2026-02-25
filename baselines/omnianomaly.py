@@ -304,11 +304,13 @@ class OmniAnomaly(BaselineModel):
         recon_mus, recon_logvars, kl_losses = self.forward_with_distribution(x)
 
         # Gaussian NLL reconstruction loss (Bug fix #4: ELBO with learned variance)
+        # Loss on measurement channels only
+        n_m = self.n_measurement_vars
         nll_total = 0.0
         for t in range(x_seq.shape[1]):
-            x_t = x_seq[:, t, :]
-            mu_t = recon_mus[t]
-            logvar_t = recon_logvars[t]
+            x_t = x_seq[:, t, :n_m]
+            mu_t = recon_mus[t][:, :n_m]
+            logvar_t = recon_logvars[t][:, :n_m]
 
             # Negative log-likelihood of Gaussian
             nll_t = 0.5 * (logvar_t + (x_t - mu_t) ** 2 / (torch.exp(logvar_t) + 1e-8))

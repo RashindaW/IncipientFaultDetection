@@ -403,13 +403,23 @@ class PRONTODataset(Dataset):
 
                 all_assigned = set(train_seg_indices) | set(val_seg_indices) | set(test_seg_indices)
                 all_segments = set(range(self.n_segments))
-                if all_assigned != all_segments:
-                    missing = all_segments - all_assigned
-                    extra = all_assigned - all_segments
+                extra = all_assigned - all_segments
+                if extra:
                     raise ValueError(
-                        f"Segment assignment mismatch. Missing: {missing}, Extra: {extra}. "
-                        f"Expected segments 0-{self.n_segments-1}"
+                        f"Segment indices out of range: {extra}. "
+                        f"Valid segments are 0-{self.n_segments-1}"
                     )
+                overlap_tv = set(train_seg_indices) & set(val_seg_indices)
+                overlap_tt = set(train_seg_indices) & set(test_seg_indices)
+                overlap_vt = set(val_seg_indices) & set(test_seg_indices)
+                if overlap_tv or overlap_tt or overlap_vt:
+                    raise ValueError(
+                        f"Segment overlap detected. "
+                        f"Train∩Val: {overlap_tv}, Train∩Test: {overlap_tt}, Val∩Test: {overlap_vt}"
+                    )
+                unused = all_segments - all_assigned
+                if unused:
+                    print(f"  Note: segments {sorted(unused)} not assigned (excluded from CV)")
                 print(f"  Segment shuffle (explicit, n_segments={self.n_segments}):")
             else:
                 rng = np.random.RandomState(self.random_seed)

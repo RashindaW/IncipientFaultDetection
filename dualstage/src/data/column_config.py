@@ -9,7 +9,7 @@ variables (control inputs + external factors) to provide operating context.
 
 # ============================================================================
 # MEASUREMENT VARIABLES (System-dependent sensors that can fault)
-# These form the nodes in the temporal graph for DySTGAT
+# These form the nodes in the temporal graph for DualSTAGE
 # ============================================================================
 
 MEASUREMENT_VARS = [

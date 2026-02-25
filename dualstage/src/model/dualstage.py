@@ -794,7 +794,7 @@ class ReconstructionModel(nn.Module):
         
         recon = recon.squeeze(-1) # [b*n, window]
         # Do NOT reshape to (b, n, window) here unless caller expects it
-        # The caller DySTGAT.forward reshapes it anyway: recon.view(-1, cfg.dataset.window_size)
+        # The caller DualSTAGE.forward reshapes it anyway: recon.view(-1, cfg.dataset.window_size)
         # But if we return [b*n, window], that view is redundant but safe.
         
         if flip_output:
@@ -807,7 +807,7 @@ ENCODER_DICT = {
 }
 
 
-class DySTGAT(nn.Module):
+class DualSTAGE(nn.Module):
     """
     Dynamic Spectral-Temporal Graph Attention Network for Anomaly Detection.
 
@@ -867,16 +867,18 @@ class DySTGAT(nn.Module):
         node_gru_input="raw",  # raw | filtered (IDCNN-processed)
         gru_activation="relu",  # relu | none
         topology_error="l1",  # l1 (abs) | l2 (squared)
+        spectral_only=False,  # Use only spectral branch output (skip temporal GNN in fusion)
         task="reconstruction",  # reconstruction | prediction
         pred_horizon=0,
     ):
-        super(DySTGAT, self).__init__()
+        super(DualSTAGE, self).__init__()
         self.infer_temporal_edge = infer_temporal_edge
         self.infer_graph = infer_static_graph
         self.edge_aggr = edge_aggr
         self.aug_control = aug_control
         self.flip_output = flip_output
         self.use_spectral_view = use_spectral_view
+        self.spectral_only = spectral_only
         self.share_gnn_weights = share_gnn_weights
         self.fuse_mode = fuse_mode
         self.divergence_type = divergence_type
@@ -1036,7 +1038,7 @@ class DySTGAT(nn.Module):
                 self.fusion_layer = nn.Identity()
             else: # sum
                 self.fusion_layer = nn.Identity()
-                
+
         self.decoder = ReconstructionModel(
             in_channels=gnn_embed_dim, # Input is fused Z
             out_channels=feat_target_node,
@@ -1261,18 +1263,10 @@ class DySTGAT(nn.Module):
         z_fused = z_temp
         gate_values = None  # For monitoring gated fusion
 
-        if self.use_spectral_view:
-            # Compute Divergence Loss (JS/KL between attn_temp and attn_freq)
-            # attn are [E] weights. Structure might differ if KNN differs?
-            # If topk is same, edges might correspond?
-            # No, KNN selects different neighbors.
-            # Divergence requires comparable distributions.
-            # Usually dense adjacency or intersection.
-            # If we use 'none' (dense), we can compare directly.
-            # If KNN, it's harder.
-            # Paper uses "dense attention matrix" for divergence?
-            # Or just alignment?
-
+        if self.spectral_only and z_freq is not None:
+            # Spectral-only ablation: bypass temporal GNN, use spectral output directly
+            z_fused = z_freq
+        elif self.use_spectral_view:
             # Fusion
             if self.fuse_mode == "concat":
                 z_cat = torch.cat([z_temp, z_freq], dim=-1)

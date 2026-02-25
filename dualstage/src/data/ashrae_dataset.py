@@ -2,7 +2,7 @@
 PyTorch Geometric Dataset for ASHRAE refrigeration system data.
 
 This module handles loading, preprocessing, and creating temporal graph data
-for the DySTGAT model using cleaned CSV files.
+for the DualSTAGE model using cleaned CSV files.
 """
 
 import os
@@ -28,7 +28,7 @@ class ASHRAEDataset(Dataset):
     """
     Dataset for ASHRAE 1043-RP refrigeration system time series data.
     
-    Creates sliding window samples for temporal graph learning with DySTGAT.
+    Creates sliding window samples for temporal graph learning with DualSTAGE.
     Handles CSV files.
     
     Args:

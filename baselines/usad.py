@@ -15,6 +15,7 @@ Architecture:
 """
 
 from typing import Dict, Tuple
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -102,8 +103,10 @@ class USAD(BaselineModel):
         self.beta = beta
         self.hidden_dims = hidden_dims
 
-        # Input dimension is flattened window
+        # Input dimension is flattened window (all features for encoder)
         input_dim = n_features * window_size
+        # Measurement-only slice indices for loss computation
+        self._meas_dim = self.n_measurement_vars * window_size
 
         # Shared encoder
         self.encoder = USADEncoder(input_dim, hidden_dims, latent_dim)
@@ -167,8 +170,10 @@ class USAD(BaselineModel):
 
         n = 1.0 / max(self._epoch, 1)
 
-        loss_ae1 = n * F.mse_loss(ae1_out, x_flat) + (1 - n) * F.mse_loss(ae2_ae1_out, x_flat)
-        loss_ae2 = n * F.mse_loss(ae2_out, x_flat) - (1 - n) * F.mse_loss(ae2_ae1_out, x_flat)
+        # Loss on measurement channels only
+        md = self._meas_dim
+        loss_ae1 = n * F.mse_loss(ae1_out[:, :md], x_flat[:, :md]) + (1 - n) * F.mse_loss(ae2_ae1_out[:, :md], x_flat[:, :md])
+        loss_ae2 = n * F.mse_loss(ae2_out[:, :md], x_flat[:, :md]) - (1 - n) * F.mse_loss(ae2_ae1_out[:, :md], x_flat[:, :md])
 
         total_loss = loss_ae1 + loss_ae2
 
@@ -202,6 +207,39 @@ class USAD(BaselineModel):
         anomaly_score = self.alpha * error_ae1 + self.beta * error_ae2
         return anomaly_score
 
+    def compute_per_feature_residuals(
+        self,
+        data_loader: DataLoader,
+        device: torch.device,
+    ) -> np.ndarray:
+        """Compute per-feature dual-AE residuals for USAD.
+
+        Overrides base class to use α·|x-AE1(x)| + β·|x-AE2(AE1(x))| per
+        feature, preserving the adversarial signal (paper Section V.A).
+        """
+        self.eval()
+        all_residuals = []
+        with torch.no_grad():
+            for batch in data_loader:
+                x = self._extract_batch(batch, device)
+                batch_size = x.shape[0]
+                x_flat = x.view(batch_size, -1)
+
+                ae1_out = self.forward_ae1(x_flat)
+                ae2_ae1_out = self.forward_ae2_ae1(x_flat)
+
+                ae1_recon = ae1_out.view(batch_size, self.n_features, self.window_size)
+                ae2_ae1_recon = ae2_ae1_out.view(batch_size, self.n_features, self.window_size)
+
+                n_m = self.n_measurement_vars
+                # Per-feature MAE averaged over time: [batch, n_meas]
+                error_ae1 = torch.mean(torch.abs(x[:, :n_m] - ae1_recon[:, :n_m]), dim=2)
+                error_ae2 = torch.mean(torch.abs(x[:, :n_m] - ae2_ae1_recon[:, :n_m]), dim=2)
+
+                residuals = self.alpha * error_ae1 + self.beta * error_ae2
+                all_residuals.append(residuals.cpu().numpy())
+        return np.concatenate(all_residuals, axis=0)
+
     def fit(
         self,
         train_loader: DataLoader,
@@ -211,6 +249,7 @@ class USAD(BaselineModel):
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-5,
         early_stopping_patience: int = 10,
+        es_warmup: int = 0,
         verbose: bool = True
     ) -> "USAD":
         """Train USAD with two-optimizer adversarial training.
@@ -236,6 +275,12 @@ class USAD(BaselineModel):
             lr=learning_rate,
             weight_decay=weight_decay
         )
+        sched1 = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt1, mode='min', factor=0.9, patience=10
+        )
+        sched2 = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt2, mode='min', factor=0.9, patience=10
+        )
 
         best_val_loss = float('inf')
         best_state = None
@@ -255,6 +300,9 @@ class USAD(BaselineModel):
             # Validation
             val_loss = self._evaluate_usad(val_loader, device)
 
+            sched1.step(val_loss)
+            sched2.step(val_loss)
+
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_state = {k: v.cpu().clone() for k, v in self.state_dict().items()}
@@ -268,7 +316,7 @@ class USAD(BaselineModel):
                     f"Train Loss={train_loss:.6f}, Val Loss={val_loss:.6f}"
                 )
 
-            if patience_counter >= early_stopping_patience:
+            if epoch >= es_warmup and patience_counter >= early_stopping_patience:
                 if verbose:
                     print(f"Early stopping at epoch {epoch}")
                 break
@@ -312,8 +360,10 @@ class USAD(BaselineModel):
             ae2_ae1_out = self.forward_ae2_ae1(x_flat)
 
             # L_AE1 = (1/n)||W - AE1(W)|| + (1-1/n)||W - AE2(AE1(W))||
-            loss_ae1 = (n * F.mse_loss(ae1_out, x_flat)
-                        + (1 - n) * F.mse_loss(ae2_ae1_out, x_flat))
+            # Loss on measurement channels only
+            md = self._meas_dim
+            loss_ae1 = (n * F.mse_loss(ae1_out[:, :md], x_flat[:, :md])
+                        + (1 - n) * F.mse_loss(ae2_ae1_out[:, :md], x_flat[:, :md]))
 
             loss_ae1.backward()
             opt1.step()
@@ -326,9 +376,9 @@ class USAD(BaselineModel):
             ae2_ae1_out = self.forward_ae2_ae1(x_flat)
 
             # L_AE2 = (1/n)||W - AE2(W)|| - (1-1/n)||W - AE2(AE1(W))||
-            # Bug fix #3: minus sign
-            loss_ae2 = (n * F.mse_loss(ae2_out, x_flat)
-                        - (1 - n) * F.mse_loss(ae2_ae1_out, x_flat))
+            # Bug fix #3: minus sign; loss on measurement channels only
+            loss_ae2 = (n * F.mse_loss(ae2_out[:, :md], x_flat[:, :md])
+                        - (1 - n) * F.mse_loss(ae2_ae1_out[:, :md], x_flat[:, :md]))
 
             loss_ae2.backward()
             opt2.step()
@@ -353,8 +403,9 @@ class USAD(BaselineModel):
                 ae1_out = self.forward_ae1(x_flat)
                 ae2_ae1_out = self.forward_ae2_ae1(x_flat)
 
-                # Validation loss: reconstruction quality
-                loss = F.mse_loss(ae1_out, x_flat) + F.mse_loss(ae2_ae1_out, x_flat)
+                # Validation loss: reconstruction quality (measurement channels only)
+                md = self._meas_dim
+                loss = F.mse_loss(ae1_out[:, :md], x_flat[:, :md]) + F.mse_loss(ae2_ae1_out[:, :md], x_flat[:, :md])
 
                 total_loss += loss.item()
                 n_batches += 1

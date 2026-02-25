@@ -1,8 +1,8 @@
-"""DyEdgeGAT: Temporal-only DySTGAT baseline (without spectral view).
+"""DyEdgeGAT: Temporal-only DualSTAGE baseline (without spectral view).
 
-This is a wrapper around DySTGAT that disables the spectral view,
+This is a wrapper around DualSTAGE that disables the spectral view,
 serving as an ablation study to isolate the contribution of the
-spectral branch in DySTGAT.
+spectral branch in DualSTAGE.
 
 The DyEdgeGAT baseline uses:
 - Dynamic temporal edge inference
@@ -24,19 +24,19 @@ from .base import BaselineModel
 
 
 class DyEdgeGAT(BaselineModel):
-    """DyEdgeGAT: Temporal-only variant of DySTGAT.
+    """DyEdgeGAT: Temporal-only variant of DualSTAGE.
 
-    This is a convenience wrapper that initializes DySTGAT
+    This is a convenience wrapper that initializes DualSTAGE
     with use_spectral_view=False.
 
-    Note: This requires the full DySTGAT codebase to be available.
+    Note: This requires the full DualSTAGE codebase to be available.
     """
 
     def __init__(
         self,
         n_features: int,
         window_size: int,
-        # DySTGAT temporal parameters
+        # DualSTAGE temporal parameters
         node_encoder_hidden: int = 64,
         gnn_embed_dim: int = 40,
         num_gnn_layers: int = 2,
@@ -89,18 +89,18 @@ class DyEdgeGAT(BaselineModel):
         self.dropout = dropout
         self.ocvar_dim = ocvar_dim
 
-        # Lazy initialization of DySTGAT
+        # Lazy initialization of DualSTAGE
         self._model = None
         self._cfg_initialized = False
 
-    def _init_dystgat(self, device: torch.device):
-        """Lazily initialize the DySTGAT model."""
+    def _init_dualstage(self, device: torch.device):
+        """Lazily initialize the DualSTAGE model."""
         if self._model is not None:
             return
 
         try:
-            from dystgat.src.config import cfg
-            from dystgat.src.model.dystgat import DySTGAT as DySTGATModel
+            from dualstage.src.config import cfg
+            from dualstage.src.model.dualstage import DualSTAGE as DualSTAGEModel
 
             # Set config
             cfg.set_dataset_params(
@@ -113,8 +113,8 @@ class DyEdgeGAT(BaselineModel):
             cfg.device = str(device)
             cfg.validate()
 
-            # Initialize DySTGAT without spectral view
-            self._model = DySTGATModel(
+            # Initialize DualSTAGE without spectral view
+            self._model = DualSTAGEModel(
                 # Input/output dimensions
                 feat_input_node=1,
                 feat_target_node=1,
@@ -127,7 +127,7 @@ class DyEdgeGAT(BaselineModel):
                 infer_temporal_edge=True,
                 temp_edge_hid_dim=self.temp_edge_hid_dim,
                 temp_edge_embed_dim=1,
-                temporal_window=5,
+                sub_window_size=5,
                 temporal_kernel=5,
                 # Node embeddings
                 temp_node_embed_dim=self.temp_node_embed_dim,
@@ -167,12 +167,12 @@ class DyEdgeGAT(BaselineModel):
 
         except ImportError as e:
             raise ImportError(
-                "DyEdgeGAT requires the DySTGAT model to be available. "
+                "DyEdgeGAT requires the DualSTAGE model to be available. "
                 f"Import error: {e}"
             )
 
     def forward(self, x: torch.Tensor, control: torch.Tensor = None) -> torch.Tensor:
-        """Forward pass through DySTGAT (temporal only).
+        """Forward pass through DualSTAGE (temporal only).
 
         Args:
             x: Input [batch, n_features, window_size] (measurement vars only)
@@ -181,11 +181,11 @@ class DyEdgeGAT(BaselineModel):
         Returns:
             Reconstruction [batch, n_features, window_size]
         """
-        self._init_dystgat(x.device)
+        self._init_dualstage(x.device)
 
         batch_size = x.shape[0]
 
-        # Reshape to DySTGAT format: [batch*n_features, window_size]
+        # Reshape to DualSTAGE format: [batch*n_features, window_size]
         x_flat = x.view(batch_size * self.n_features, self.window_size)
 
         # Create batch tensor for PyG
@@ -193,14 +193,14 @@ class DyEdgeGAT(BaselineModel):
             self.n_features
         )
 
-        # Build control tensor for DySTGAT: [batch*ocvar_dim, window_size]
+        # Build control tensor for DualSTAGE: [batch*ocvar_dim, window_size]
         if self.ocvar_dim > 0 and control is not None:
             # control: [batch, ocvar_dim, window_size]
             ctrl_flat = control.reshape(batch_size * self.ocvar_dim, self.window_size)
         else:
             ctrl_flat = torch.zeros(batch_size, 0, device=x.device)
 
-        # Construct PyG Data object expected by DySTGAT.forward()
+        # Construct PyG Data object expected by DualSTAGE.forward()
         data = Data(
             x=x_flat,
             c=ctrl_flat,
@@ -208,7 +208,7 @@ class DyEdgeGAT(BaselineModel):
             batch=batch_tensor,
         )
 
-        # Forward through DySTGAT
+        # Forward through DualSTAGE
         recon_flat = self._model(
             data,
             return_graph=False,
@@ -287,7 +287,7 @@ class DyEdgeGAT(BaselineModel):
     def _compute_batch_anomaly_scores_with_ctrl(
         self, x: torch.Tensor, control: torch.Tensor = None
     ) -> torch.Tensor:
-        """Compute anomaly scores using DySTGAT's topology-aware scoring.
+        """Compute anomaly scores using DualSTAGE's topology-aware scoring.
 
         Args:
             x: Measurement input [batch, n_features, window_size]
@@ -296,23 +296,23 @@ class DyEdgeGAT(BaselineModel):
         Returns:
             Anomaly scores [batch]
         """
-        self._init_dystgat(x.device)
+        self._init_dualstage(x.device)
 
         batch_size = x.shape[0]
 
-        # Reshape for DySTGAT
+        # Reshape for DualSTAGE
         x_flat = x.reshape(batch_size * self.n_features, self.window_size)
         batch_tensor = torch.arange(batch_size, device=x.device).repeat_interleave(
             self.n_features
         )
 
-        # Build control tensor for DySTGAT: [batch*ocvar_dim, window_size]
+        # Build control tensor for DualSTAGE: [batch*ocvar_dim, window_size]
         if self.ocvar_dim > 0 and control is not None:
             ctrl_flat = control.reshape(batch_size * self.ocvar_dim, self.window_size)
         else:
             ctrl_flat = torch.zeros(batch_size, 0, device=x.device)
 
-        # Construct PyG Data object expected by DySTGAT.forward()
+        # Construct PyG Data object expected by DualSTAGE.forward()
         data = Data(
             x=x_flat,
             c=ctrl_flat,
@@ -352,12 +352,13 @@ class DyEdgeGAT(BaselineModel):
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-5,
         early_stopping_patience: int = 20,
+        es_warmup: int = 0,
         verbose: bool = True
     ) -> "DyEdgeGAT":
         """Train the DyEdgeGAT model.
 
         Note: For proper training, it's recommended to use the
-        train_dystgat.py script with --use-spectral-view flag omitted.
+        train_dualstage.py script with --use-spectral-view flag omitted.
 
         Args:
             train_loader: Training data
@@ -367,18 +368,22 @@ class DyEdgeGAT(BaselineModel):
             learning_rate: Learning rate
             weight_decay: L2 regularization
             early_stopping_patience: Early stopping patience
+            es_warmup: Epoch before which early stopping is disabled
             verbose: Print progress
 
         Returns:
             Self
         """
-        self._init_dystgat(device)
+        self._init_dualstage(device)
         self.to(device)
 
         optimizer = torch.optim.Adam(
             self._model.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.9, patience=10
         )
 
         best_val_loss = float('inf')
@@ -387,10 +392,12 @@ class DyEdgeGAT(BaselineModel):
 
         for epoch in range(1, epochs + 1):
             # Training
-            train_loss = self._train_epoch_dystgat(train_loader, optimizer, device)
+            train_loss = self._train_epoch_dualstage(train_loader, optimizer, device)
 
             # Validation
-            val_loss = self._evaluate_dystgat(val_loader, device)
+            val_loss = self._evaluate_dualstage(val_loader, device)
+
+            scheduler.step(val_loss)
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -405,7 +412,7 @@ class DyEdgeGAT(BaselineModel):
                     f"Train Loss={train_loss:.6f}, Val Loss={val_loss:.6f}"
                 )
 
-            if patience_counter >= early_stopping_patience:
+            if epoch >= es_warmup and patience_counter >= early_stopping_patience:
                 if verbose:
                     print(f"Early stopping at epoch {epoch}")
                 break
@@ -439,7 +446,7 @@ class DyEdgeGAT(BaselineModel):
             return x.view(batch_size, n_nodes, -1)
         return batch[0].to(device)
 
-    def _train_epoch_dystgat(
+    def _train_epoch_dualstage(
         self,
         train_loader: DataLoader,
         optimizer: torch.optim.Optimizer,
@@ -467,7 +474,7 @@ class DyEdgeGAT(BaselineModel):
 
         return total_loss / n_batches
 
-    def _evaluate_dystgat(self, data_loader: DataLoader, device: torch.device) -> float:
+    def _evaluate_dualstage(self, data_loader: DataLoader, device: torch.device) -> float:
         """Evaluation for DyEdgeGAT."""
         self._model.eval()
         total_loss = 0.0
@@ -518,7 +525,7 @@ class DyEdgeGAT(BaselineModel):
 
         # Initialize model if needed
         if device is not None:
-            self._init_dystgat(device)
+            self._init_dualstage(device)
 
         self._model.load_state_dict(checkpoint['state_dict'])
         self._is_fitted = checkpoint.get('is_fitted', True)
@@ -528,7 +535,7 @@ class DyEdgeGAT(BaselineModel):
 
     def to(self, device: torch.device) -> "DyEdgeGAT":
         """Move model to device."""
-        self._init_dystgat(device)
+        self._init_dualstage(device)
         self._model.to(device)
         return self
 
@@ -547,7 +554,7 @@ class DyEdgeGAT(BaselineModel):
     def parameters(self):
         """Get model parameters."""
         if self._model is None:
-            self._init_dystgat(torch.device('cpu'))
+            self._init_dualstage(torch.device('cpu'))
         return self._model.parameters()
 
     def get_model_info(self) -> Dict:
@@ -558,6 +565,6 @@ class DyEdgeGAT(BaselineModel):
             'num_gnn_layers': self.num_gnn_layers,
             'gnn_type': self.gnn_type,
             'topk': self.topk,
-            'spectral_view': False,  # Key difference from DySTGAT
+            'spectral_view': False,  # Key difference from DualSTAGE
         })
         return info

@@ -1,4 +1,4 @@
-"""Utility modules for DySTGAT."""
+"""Utility modules for DualSTAGE."""
 
 from .checkpoint import EpochCheckpointManager
 from .init import init_weights

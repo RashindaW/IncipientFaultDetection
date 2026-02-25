@@ -291,8 +291,9 @@ class LSTMVAE(BaselineModel):
         Returns:
             Tuple of (total_loss, loss_components)
         """
-        # Reconstruction loss (MSE)
-        recon_loss = F.mse_loss(recon, x, reduction='mean')
+        # Reconstruction loss (MSE) on measurement channels only
+        n_m = self.n_measurement_vars
+        recon_loss = F.mse_loss(recon[:, :n_m], x[:, :n_m], reduction='mean')
 
         # KL divergence: -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
         kl_loss = -0.5 * torch.mean(

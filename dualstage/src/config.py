@@ -1,5 +1,5 @@
 """
-Configuration module for DySTGAT (Dynamic Spectral-Temporal Graph Attention).
+Configuration module for DualSTAGE (Dynamic Spectral-Temporal Graph Attention).
 
 This module provides a global configuration object that can be accessed
 throughout the codebase. It should be initialized with dataset-specific
@@ -24,11 +24,11 @@ class DatasetConfig:
 class ModelConfig:
     """Model-specific configuration."""
     def __init__(self):
-        self.dystgat = DySTGATConfig()
+        self.dualstage = DualSTAGEConfig()
 
 
-class DySTGATConfig:
-    """DySTGAT-specific configuration."""
+class DualSTAGEConfig:
+    """DualSTAGE-specific configuration."""
     def __init__(self):
         self.add_self_loop = True  # Whether to add self-loops in feature graph attention
 
@@ -73,6 +73,6 @@ cfg = Config()
 
 
 # Example usage:
-# from dystgat.src.config import cfg
+# from dualstage.src.config import cfg
 # cfg.set_dataset_params(n_nodes=17, window_size=15, ocvar_dim=4)
 # cfg.device = 'cuda'

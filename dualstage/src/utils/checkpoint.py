@@ -12,7 +12,7 @@ class EpochCheckpointManager:
     Creates a timestamped run directory under the provided root directory.
     """
 
-    def __init__(self, root_dir: str, prefix: str = "dystgat", run_name: Optional[str] = None):
+    def __init__(self, root_dir: str, prefix: str = "dualstage", run_name: Optional[str] = None):
         self.root_path = Path(root_dir).expanduser().resolve()
         self.root_path.mkdir(parents=True, exist_ok=True)
 

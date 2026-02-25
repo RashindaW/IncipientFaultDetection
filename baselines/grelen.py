@@ -296,8 +296,9 @@ class GRELEN(BaselineModel):
         recon: torch.Tensor,
         **kwargs
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """MSE reconstruction loss."""
-        loss = F.mse_loss(recon, x)
+        """MSE reconstruction loss (measurement channels only)."""
+        n_m = self.n_measurement_vars
+        loss = F.mse_loss(recon[:, :n_m], x[:, :n_m])
         return loss, {'recon_loss': loss}
 
     def _compute_batch_anomaly_scores(self, x: torch.Tensor) -> torch.Tensor:
@@ -351,14 +352,15 @@ class GRELEN(BaselineModel):
 
     def fit(self, train_loader, val_loader, epochs, device,
             learning_rate=1e-3, weight_decay=1e-5,
-            early_stopping_patience=10, verbose=True):
+            early_stopping_patience=10, es_warmup=0, verbose=True):
         """Train and compute normal adjacency after training."""
         self._A_accum = []
 
         # Standard training
         result = super().fit(
             train_loader, val_loader, epochs, device,
-            learning_rate, weight_decay, early_stopping_patience, verbose
+            learning_rate, weight_decay, early_stopping_patience,
+            es_warmup, verbose
         )
 
         # Compute mean normal adjacency from training

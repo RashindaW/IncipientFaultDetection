@@ -2,7 +2,7 @@
 PyTorch Geometric Dataset for refrigeration system data.
 
 This module handles loading, preprocessing, and creating temporal graph data
-for the DySTGAT model.
+for the DualSTAGE model.
 """
 
 import os
@@ -52,7 +52,7 @@ class RefrigerationDataset(Dataset):
     """
     Dataset for refrigeration system time series data.
     
-    Creates sliding window samples for temporal graph learning with DySTGAT.
+    Creates sliding window samples for temporal graph learning with DualSTAGE.
     
     Args:
         data_files: List of CSV file paths to load

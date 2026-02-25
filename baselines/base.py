@@ -211,8 +211,8 @@ class BaselineModel(ABC, nn.Module):
     ) -> np.ndarray:
         """Normalize per-feature residuals using validation IQR and aggregate.
 
-        Per-feature normalization followed by mean aggregation, matching
-        the unified scoring in DyEdgeGAT paper (Section V.B).
+        Per-feature normalization followed by mean aggregation across features
+        (paper Section V.A).  Mean reflects the system-wide anomaly level.
 
         Args:
             residuals: Per-feature residuals [N, n_meas]
@@ -235,6 +235,7 @@ class BaselineModel(ABC, nn.Module):
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-5,
         early_stopping_patience: int = 10,
+        es_warmup: int = 0,
         verbose: bool = True
     ) -> "BaselineModel":
         """Train the model.
@@ -247,6 +248,7 @@ class BaselineModel(ABC, nn.Module):
             learning_rate: Optimizer learning rate
             weight_decay: L2 regularization weight
             early_stopping_patience: Epochs to wait before early stopping
+            es_warmup: Epoch before which early stopping is disabled
             verbose: Whether to print training progress
 
         Returns:
@@ -257,6 +259,9 @@ class BaselineModel(ABC, nn.Module):
             self.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.9, patience=10
         )
 
         best_val_loss = float('inf')
@@ -272,6 +277,8 @@ class BaselineModel(ABC, nn.Module):
             # Validation
             val_loss, val_metrics = self._evaluate(val_loader, device)
 
+            scheduler.step(val_loss)
+
             # Early stopping
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -286,7 +293,7 @@ class BaselineModel(ABC, nn.Module):
                     f"Train Loss={train_loss:.6f}, Val Loss={val_loss:.6f}"
                 )
 
-            if patience_counter >= early_stopping_patience:
+            if epoch >= es_warmup and patience_counter >= early_stopping_patience:
                 if verbose:
                     print(f"Early stopping at epoch {epoch}")
                 break

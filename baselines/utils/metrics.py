@@ -1,10 +1,11 @@
 """Shared evaluation metrics for baseline anomaly detection models.
 
-These metrics are consistent with those used in train_dystgat.py for fair comparison.
+These metrics are consistent with those used in train_dualstage.py for fair comparison.
 """
 
 from typing import Dict, Optional, Tuple
 import numpy as np
+from scipy.stats import genpareto
 from sklearn.metrics import (
     roc_auc_score,
     precision_recall_curve,
@@ -12,6 +13,23 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
+
+
+def threshold_evt_pot(val_scores, false_alarm_rate=0.05, initial_percentile=90):
+    """EVT Peaks-Over-Threshold with GPD tail fit.
+
+    Uses only validation baseline scores — no test data leakage.
+    Ref: Siffer et al. (2017) "Anomaly Detection in Streams with EVT" KDD.
+    """
+    u = np.percentile(val_scores, initial_percentile)
+    exceedances = val_scores[val_scores > u] - u
+    n_total, n_exceed = len(val_scores), len(exceedances)
+    if n_exceed < 10:
+        return np.percentile(val_scores, 100 * (1 - false_alarm_rate))
+    shape, _, scale = genpareto.fit(exceedances, floc=0)
+    if abs(shape) < 1e-8:
+        return u + scale * np.log(n_exceed / (n_total * false_alarm_rate))
+    return u + (scale / shape) * ((n_exceed / (n_total * false_alarm_rate)) ** shape - 1)
 
 
 def compute_auc_roc(

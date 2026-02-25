@@ -1,8 +1,8 @@
 """
-Weight initialization utilities for DySTGAT.
+Weight initialization utilities for DualSTAGE.
 
 This module provides standard weight initialization schemes for various
-neural network layers used in the DySTGAT model.
+neural network layers used in the DualSTAGE model.
 """
 
 import torch.nn as nn

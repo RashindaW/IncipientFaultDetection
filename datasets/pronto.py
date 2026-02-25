@@ -13,9 +13,9 @@ from torch.utils.data import ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 from typing import Dict, List, Tuple, Optional
 
-from dystgat.src.data.pronto_column_config import MEASUREMENT_VARS, CONTROL_VARS
-from dystgat.src.data.pronto_dataset import PRONTODataset, PRONTODatasetLegacy
-from dystgat.src.data.pronto_raw_loader import DATA_SPLITS
+from dualstage.src.data.pronto_column_config import MEASUREMENT_VARS, CONTROL_VARS
+from dualstage.src.data.pronto_dataset import PRONTODataset, PRONTODatasetLegacy
+from dualstage.src.data.pronto_raw_loader import DATA_SPLITS
 from .registry import DatasetAdapter, register_adapter
 
 
@@ -67,6 +67,7 @@ def _create_dataloaders(
     train_segments: List[int] | None = None,
     val_segments: List[int] | None = None,
     test_segments: List[int] | None = None,
+    shuffle_train: bool = True,
     **kwargs,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, DataLoader]]:
     """
@@ -284,7 +285,7 @@ def _create_dataloaders(
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=(train_sampler is None),
+        shuffle=(shuffle_train and train_sampler is None),
         sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory

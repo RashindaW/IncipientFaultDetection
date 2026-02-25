@@ -204,10 +204,11 @@ class GDN(BaselineModel):
             x: Full input [batch, n_features, window_size] (target = last step)
             pred: Predicted output [batch, n_features, 1]
         """
-        # Target is last timestep
-        target = x[:, :, -1:]  # [batch, n_features, 1]
+        # Target is last timestep (measurement channels only)
+        n_m = self.n_measurement_vars
+        target = x[:, :n_m, -1:]  # [batch, n_meas, 1]
 
-        mse_loss = F.mse_loss(pred, target, reduction='mean')
+        mse_loss = F.mse_loss(pred[:, :n_m], target, reduction='mean')
 
         # Graph regularization
         if self._adj is not None:
@@ -302,6 +303,7 @@ class GDN(BaselineModel):
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-5,
         early_stopping_patience: int = 10,
+        es_warmup: int = 0,
         verbose: bool = True
     ) -> "GDN":
         """Train GDN and compute validation normalization statistics."""
@@ -312,6 +314,9 @@ class GDN(BaselineModel):
             lr=learning_rate,
             weight_decay=weight_decay
         )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.9, patience=10
+        )
 
         best_val_loss = float('inf')
         best_state = None
@@ -320,6 +325,8 @@ class GDN(BaselineModel):
         for epoch in range(1, epochs + 1):
             train_loss, _ = self._train_epoch(train_loader, optimizer, device)
             val_loss, _ = self._evaluate(val_loader, device)
+
+            scheduler.step(val_loss)
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -334,7 +341,7 @@ class GDN(BaselineModel):
                     f"Train Loss={train_loss:.6f}, Val Loss={val_loss:.6f}"
                 )
 
-            if patience_counter >= early_stopping_patience:
+            if epoch >= es_warmup and patience_counter >= early_stopping_patience:
                 if verbose:
                     print(f"Early stopping at epoch {epoch}")
                 break

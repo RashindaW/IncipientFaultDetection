@@ -1,4 +1,4 @@
-"""Baseline anomaly detection methods for DySTGAT comparison.
+"""Baseline anomaly detection methods for DualSTAGE comparison.
 
 This package provides implementations of several baseline methods from
 the multivariate time series anomaly detection literature:
@@ -8,7 +8,7 @@ the multivariate time series anomaly detection literature:
 - OmniAnomaly: Stochastic RNN with normalizing flows (Su et al. 2019)
 - GDN: Graph Deviation Network (Deng & Hooi 2021)
 - MTAD-GAT: Multi-scale Temporal Anomaly Detection with GAT (Zhao et al. 2020)
-- DyEdgeGAT: Temporal-only DySTGAT (ablation baseline)
+- DyEdgeGAT: Temporal-only DualSTAGE (ablation baseline)
 
 Usage:
     from baselines import create_baseline, list_baselines
@@ -72,7 +72,7 @@ _BASELINE_DESCRIPTIONS: Dict[str, str] = {
     "gdn": "GDN (Deng & Hooi 2021) - Graph Deviation Network with attention",
     "mtad_gat": "MTAD-GAT (Zhao et al. 2020) - Multi-scale Temporal + GAT",
     "grelen": "GRELEN (Zhang et al. 2022) - Graph Relational Learning with DCGRU",
-    "dyedgegat": "DyEdgeGAT - DySTGAT without spectral view (temporal-only ablation)",
+    "dyedgegat": "DyEdgeGAT - DualSTAGE without spectral view (temporal-only ablation)",
 }
 
 # Default hyperparameters for each method

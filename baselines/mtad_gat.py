@@ -374,12 +374,13 @@ class MTADGAT(BaselineModel):
         """
         recon, forecast = self.forward_full(x)
 
-        # Reconstruction loss
-        recon_loss = F.mse_loss(recon, x, reduction='mean')
+        # Reconstruction loss (measurement channels only)
+        n_m = self.n_measurement_vars
+        recon_loss = F.mse_loss(recon[:, :n_m], x[:, :n_m], reduction='mean')
 
-        # Forecasting loss: predict last timestep (Bug fix #4)
-        forecast_target = x[:, :, -self.forecast_horizon:]
-        forecast_loss = F.mse_loss(forecast, forecast_target, reduction='mean')
+        # Forecasting loss: predict last timestep (Bug fix #4, measurement only)
+        forecast_target = x[:, :n_m, -self.forecast_horizon:]
+        forecast_loss = F.mse_loss(forecast[:, :n_m], forecast_target, reduction='mean')
 
         total_loss = (
             self.recon_weight * recon_loss +
