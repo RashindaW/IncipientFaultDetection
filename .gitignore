@@ -6,6 +6,11 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/1
+*.sh
+*.bak
+*.json
+*.md
+!README.md
 
 # Jupyter and notebooks
 .ipynb_checkpoints/
@@ -90,7 +95,26 @@ dist/
 *.egg-info/
 *.egg
 
+# LaTeX build artifacts
+*.aux
+*.out
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+
+# Temporary scripts
+_tmp_*
+
 # Text and LaTeX files
 *.txt
 !requirements.txt
 *.tex
+
+# Experiment orchestration scripts (not core library)
+evaluation/
+
+# Experiment and utility directories
+runs/
+scripts/
+analysis/
+freq_analysis/

@@ -98,6 +98,7 @@ class IDCNN(nn.Module):
             layers.append(nn.ReLU())
         if num_layers > 1:
             layers.append(nn.Conv1d(hidden_channels, out_channels, kernel_size, padding=kernel_size//2))
+            layers.append(nn.ReLU())
         self.conv = nn.Sequential(*layers)
 
     def forward(self, x):
